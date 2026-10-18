@@ -37,9 +37,9 @@ function update_script() {
   # download, verify, switch, health check, automatic rollback.
   msg_info "Updating ${APP}"
   if crosswatch-update; then
-    msg_ok "$(jq -r '.message' /var/lib/crosswatch/.update/status.json)"
+    msg_ok "$(jq -r '.message' /config/.update/status.json)"
   else
-    msg_error "$(jq -r '.message' /var/lib/crosswatch/.update/status.json)"
+    msg_error "$(jq -r '.message' /config/.update/status.json)"
   fi
   exit
 }
@@ -51,4 +51,4 @@ description
 msg_ok "Completed Successfully!\n"
 echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
 echo -e "${INFO}${YW}Open this one-time setup link to create the admin account:${CL}"
-echo -e "${GATEWAY}${BGN}http://${IP}:8787/?setup=$(pct exec "$CTID" -- cat /var/lib/crosswatch/.setup_token)${CL}"
+echo -e "${GATEWAY}${BGN}http://${IP}:8787/?setup=$(pct exec "$CTID" -- cat /config/.setup_token)${CL}"

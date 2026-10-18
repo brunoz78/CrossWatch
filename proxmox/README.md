@@ -12,7 +12,7 @@ COMMUNITY_SCRIPTS_URL=https://raw.githubusercontent.com/brunoz78/ProxmoxVED/main
 ```
 
 Am Ende erscheint ein **Einrichtungslink** (`http://<IP>:8787/?setup=…`). Nur über diesen Link
-lässt sich das Admin-Konto anlegen. Der Code steht auch in `/var/lib/crosswatch/.setup_token`.
+lässt sich das Admin-Konto anlegen. Der Code steht auch in `/config/.setup_token`.
 
 ## Aufbau im Container
 
@@ -20,7 +20,7 @@ lässt sich das Admin-Konto anlegen. Der Code steht auch in `/var/lib/crosswatch
 |---|---|
 | `/opt/crosswatch` | Programm mit eigener Python-Umgebung (`.venv`) |
 | `/opt/crosswatch.old` | vorherige Version, für die automatische Rückkehr |
-| `/var/lib/crosswatch` | Daten: `config.json`, Datenbanken, Snapshots |
+| `/config` | Daten: `config.json`, Datenbanken, Snapshots |
 | `/var/backups/crosswatch` | Datensicherung vor jedem Update (die letzten 5) |
 | `/usr/local/bin/crosswatch-update` | Installation und Update |
 
