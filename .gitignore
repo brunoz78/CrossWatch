@@ -114,3 +114,6 @@ playwright/.auth/
 
 # build-time version stamp (written by Dockerfile)
 VERSION
+
+# fork: one-time setup code
+.setup_token
