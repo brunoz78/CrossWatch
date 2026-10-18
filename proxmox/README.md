@@ -8,8 +8,11 @@ unprivilegierten Debian-13-Container. Die Skripte folgen dem Aufbau von communit
 Auf der Shell des Proxmox-Hosts:
 
 ```bash
-COMMUNITY_SCRIPTS_URL=https://raw.githubusercontent.com/brunoz78/ProxmoxVED/main bash -c "$(curl -fsSL https://raw.githubusercontent.com/brunoz78/ProxmoxVED/main/ct/crosswatch.sh)"
+COMMUNITY_SCRIPTS_URL=https://raw.githubusercontent.com/brunoz78/CrossWatch/main/proxmox bash -c "$(curl -fsSL https://raw.githubusercontent.com/brunoz78/CrossWatch/main/proxmox/ct/crosswatch.sh)"
 ```
+
+Vorgaben lassen sich voranstellen, zum Beispiel `var_ctid=311 var_hostname=pm-crosswatch
+var_net=10.0.1.57/24 var_gateway=10.0.1.1 var_tags="10.0.1.57;crosswatch"`.
 
 Am Ende erscheint ein **Einrichtungslink** (`http://<IP>:8787/?setup=…`). Nur über diesen Link
 lässt sich das Admin-Konto anlegen. Der Code steht auch in `/config/.setup_token`.
