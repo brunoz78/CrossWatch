@@ -1,0 +1,363 @@
+# cw_platform/url_validation.py
+# Server URL validation helpers (SSRF guard).
+# Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
+# Taken from the jabrown93/CrossWatch fork (security hardening, AGPL-3.0).
+from __future__ import annotations
+
+import ipaddress
+import socket
+from typing import Any
+from urllib.parse import unquote, urljoin, urlparse
+
+# Cloud metadata hostnames that should never be contacted by a media-server URL.
+# Checked as a literal-hostname match; IP-literal and DNS-resolved cases are
+# additionally covered by _is_dangerous_ip() below (link-local + explicit IPs).
+_METADATA_HOSTS = frozenset({
+    "169.254.169.254",
+    "metadata.google.internal",
+})
+
+# Cloud metadata IPs that are not in the standard link-local range and so
+# wouldn't be caught by ipaddress.is_link_local alone.
+_METADATA_IPS = frozenset({
+    "100.100.100.200",   # Alibaba Cloud
+    "fd00:ec2::254",      # AWS IMDSv2 (IPv6)
+})
+
+
+def _is_dangerous_ip(host: str) -> bool:
+    """True if *host* (a literal IP string) is a cloud-metadata or link-local address."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # Unwrap IPv4-mapped IPv6 literals (e.g. ::ffff:100.100.100.200) so they're
+    # checked against the same blocklist/link-local rules as their IPv4 form.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if str(ip) in _METADATA_IPS:
+        return True
+    # Covers 169.254.0.0/16 (incl. 169.254.169.254) and fe80::/10.
+    return bool(ip.is_link_local)
+
+
+def _resolves_to_dangerous_ip(hostname: str) -> bool:
+    """Resolve *hostname* and check every returned address against the
+    metadata/link-local blocklist. Resolution failures are treated as
+    "not dangerous" (not a finding) — a transient DNS hiccup at config-save
+    time shouldn't be conflated with an actual SSRF target, and other checks
+    (scheme, traversal) still apply regardless.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        addr = sockaddr[0]
+        if _is_dangerous_ip(addr):
+            return True
+    return False
+
+
+def validate_server_url(url: str, field_name: str = "server_url") -> list[str]:
+    """Return a list of warning strings for *url*.
+
+    Does NOT reject private/RFC-1918 IPs — those are the normal case for
+    local media servers.  Only flags clearly suspicious patterns: bad scheme,
+    missing hostname, path traversal, and cloud-metadata/link-local targets
+    (checked both as a literal IP/hostname and via DNS resolution, so a
+    hostname that merely resolves to a metadata address is also caught).
+    """
+    warnings: list[str] = []
+    raw = (url or "").strip()
+    if not raw:
+        return warnings
+
+    parsed = urlparse(raw)
+
+    if parsed.scheme not in ("http", "https"):
+        warnings.append(f"{field_name}: scheme '{parsed.scheme}' is not http or https")
+
+    if not parsed.hostname:
+        warnings.append(f"{field_name}: no hostname found in URL")
+
+    host = parsed.hostname or ""
+    host_norm = host.lower().rstrip(".")
+    if host_norm in _METADATA_HOSTS:
+        warnings.append(
+            f"{field_name}: URL points to a cloud metadata endpoint ({parsed.hostname}) "
+            "— this is almost certainly unintended"
+        )
+    elif host and _is_dangerous_ip(host.strip("[]")):
+        warnings.append(
+            f"{field_name}: URL points to a link-local/cloud-metadata address ({parsed.hostname}) "
+            "— this is almost certainly unintended"
+        )
+    elif host and _resolves_to_dangerous_ip(host):
+        warnings.append(
+            f"{field_name}: hostname ({parsed.hostname}) resolves to a link-local/cloud-metadata "
+            "address — this is almost certainly unintended"
+        )
+
+    if parsed.path:
+        if ".." in unquote(parsed.path):
+            warnings.append(f"{field_name}: URL path contains '..' (path traversal)")
+
+    return warnings
+
+
+def assert_server_url_safe(url: str, field_name: str = "server_url") -> None:
+    """Raise ValueError if *url* fails validate_server_url(). Use this at
+    config-save time to actually reject a dangerous URL instead of merely
+    warning about it.
+    """
+    warnings = validate_server_url(url, field_name)
+    if warnings:
+        raise ValueError("; ".join(warnings))
+
+
+def _is_public_ip(host: str) -> bool:
+    """True if *host* (a literal IP string) is globally routable."""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_global)
+
+
+def assert_public_https_url(url: str, field_name: str = "url") -> None:
+    """Raise ValueError unless *url* is https and every address it resolves to
+    is globally routable.
+
+    Deliberately stricter than assert_server_url_safe, which permits RFC1918 and
+    loopback because that is exactly where a media server lives. For a URL that
+    an untrusted party supplies (an IdP profile claim, say), a private or
+    loopback target is the attack rather than the normal case, so the whole
+    non-public range is refused instead of just link-local/metadata. Resolution
+    failure is refused too: this guards a live fetch, not a config-save warning.
+    """
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme != "https":
+        raise ValueError(f"{field_name}: must be https, got '{parsed.scheme}'")
+    host = (parsed.hostname or "").strip("[]")
+    if not host:
+        raise ValueError(f"{field_name}: no hostname found in URL")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError) as e:
+        raise ValueError(f"{field_name}: hostname ({host}) does not resolve") from e
+    addrs = [info[4][0] for info in infos if info[4]]
+    if not addrs or not all(_is_public_ip(str(a)) for a in addrs):
+        raise ValueError(f"{field_name}: hostname ({host}) resolves to a non-public address")
+
+
+def _assert_peer_is_public(resp: Any, field_name: str) -> None:
+    """Check the address actually connected to, not the one we resolved earlier.
+
+    assert_public_https_url resolves the hostname, then requests resolves it
+    again when opening the socket. An attacker serving a short-TTL record can
+    answer public the first time and loopback/RFC1918 the second (DNS
+    rebinding), so validation alone proves nothing about the live connection.
+    Reads the peer off the open socket and refuses if it is not public. Requires
+    stream=True, which is the only mode this runs under; an unavailable peer is
+    refused rather than assumed good.
+    """
+    raw = getattr(resp, "raw", None)
+    conn = getattr(raw, "connection", None) or getattr(raw, "_connection", None)
+    sock = getattr(conn, "sock", None)
+    peer = None
+    if sock is not None:
+        try:
+            peer = sock.getpeername()
+        except OSError:
+            peer = None
+    addr = str(peer[0]) if peer else ""
+    if not addr or not _is_public_ip(addr):
+        raise ValueError(
+            f"{field_name}: connected to a non-public address ({addr or 'peer unavailable'})"
+        )
+
+
+def _redirect_stays_on_host(current: str, target: str) -> bool:
+    """True if *target* is the same host as *current* and doesn't downgrade
+    https to http.
+
+    Callers attach credentials to every hop — Jellyfin/Emby send the user's
+    password in the request body, Tautulli sends its apikey as a query param,
+    and both send provider tokens as headers. requests' own redirect handling
+    only strips the Authorization header, which covers none of those, so any
+    hop off the user's configured host is refused rather than sanitised. Port
+    changes are allowed (same machine); an https->http downgrade is not, since
+    it would put those credentials on the wire in the clear.
+    """
+    cur = urlparse(current)
+    nxt = urlparse(target)
+    cur_host = (cur.hostname or "").lower().rstrip(".")
+    nxt_host = (nxt.hostname or "").lower().rstrip(".")
+    if not nxt_host or nxt_host != cur_host:
+        return False
+    return not (cur.scheme == "https" and nxt.scheme != "https")
+
+
+def _rebuild_redirect(method: str, kwargs: dict[str, Any], status: int) -> tuple[str, dict[str, Any]]:
+    """Apply requests' own method/body redirect semantics to a hop.
+
+    guarded_request drives redirects by hand, so requests.Session's
+    rebuild_method()/resolve_redirects() never run and their behaviour has to
+    be reproduced here: 302/303 turn any non-HEAD request into a GET, 301
+    turns a POST into a GET, and anything other than 307/308 drops the body.
+    """
+    if status in (301, 302, 303) and method != "HEAD":
+        # 302/303 rewrite any method; 301 only rewrites POST (browser behaviour).
+        if status != 301 or method == "POST":
+            method = "GET"
+    if status not in (307, 308):
+        kwargs = {k: v for k, v in kwargs.items() if k not in ("json", "data", "files")}
+        headers = kwargs.get("headers")
+        if isinstance(headers, dict):
+            dropped = ("content-length", "content-type", "transfer-encoding")
+            kwargs["headers"] = {k: v for k, v in headers.items() if k.lower() not in dropped}
+    return method, kwargs
+
+
+# Anything that could authenticate the caller to the *new* host. Dropped before
+# an allow_cross_host hop so a redirect cannot walk credentials somewhere else.
+_CREDENTIAL_HEADERS = frozenset(
+    {"authorization", "cookie", "x-plex-token", "x-emby-token", "x-mediabrowser-token", "x-api-key"}
+)
+
+
+def _strip_credentials(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop credential-bearing kwargs/headers before leaving the current host."""
+    out = {k: v for k, v in kwargs.items() if k not in ("params", "auth")}
+    headers = out.get("headers")
+    if isinstance(headers, dict):
+        out["headers"] = {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADERS}
+    return out
+
+
+def guarded_request(
+    method: str,
+    url: str,
+    *,
+    field_name: str = "server_url",
+    max_redirects: int = 5,
+    allow_cross_host: bool = False,
+    require_public: bool = False,
+    **kwargs: Any,
+):
+    """requests.request() wrapper that re-validates the target host on every
+    redirect hop, not just the initial URL.
+
+    A URL that passes assert_server_url_safe() once (e.g. at login/save time)
+    can still be turned into an SSRF: requests follows redirects by default
+    and never re-checks the new Location, so a server that looks safe at
+    validation time can 302 the actual request to a metadata/link-local
+    address. This disables automatic redirect-following and instead
+    validates + follows each hop manually, raising ValueError (like
+    assert_server_url_safe) if any hop is unsafe, leaves the configured host
+    (see _redirect_stays_on_host), or the chain is too long.
+
+    allow_cross_host is for fetches that carry no credentials and legitimately
+    redirect off-host, such as an avatar image served from a CDN. Every hop is
+    still validated by assert_server_url_safe; only the same-host requirement
+    is lifted, and credentials are stripped before the hop regardless. Leave it
+    False for anything that authenticates to the configured server.
+
+    require_public additionally demands https and a globally routable address on
+    every hop. Pair it with allow_cross_host whenever the URL came from an
+    untrusted party: lifting the same-host rule on its own would otherwise let a
+    redirect reach loopback or RFC1918, which assert_server_url_safe permits by
+    design because that is where media servers live.
+    """
+    import requests
+
+    def _send(method_: str, url_: str, **kw: Any):
+        if not require_public:
+            return requests.request(method_, url_, allow_redirects=False, **kw)
+        # An environment proxy would put the proxy on the other end of the
+        # socket, so the peer check would vet the proxy instead of the origin:
+        # a private corporate proxy blocks every avatar, and a public one passes
+        # while resolving the origin itself, leaving the boundary unchecked.
+        # requests.request() builds a trust_env session per call; do the same
+        # with env proxies off so the peer really is the origin.
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.request(method_, url_, allow_redirects=False, **kw)
+
+    current_method = method
+    current_url = url
+    body_kwargs = dict(kwargs)
+    body_kwargs.pop("allow_redirects", None)
+    for _ in range(max_redirects + 1):
+        assert_server_url_safe(current_url, field_name)
+        if require_public:
+            assert_public_https_url(current_url, field_name)
+        resp = _send(current_method, current_url, **body_kwargs)
+        if require_public:
+            try:
+                _assert_peer_is_public(resp, field_name)
+            except ValueError:
+                resp.close()
+                raise
+        if not resp.is_redirect:
+            return resp
+        location = resp.headers.get("Location")
+        if not location:
+            return resp
+        next_url = urljoin(current_url, location)
+        # A stream=True hop holds its connection until read or closed, and this
+        # response is discarded either way from here on.
+        resp.close()
+        if not _redirect_stays_on_host(current_url, next_url):
+            if not allow_cross_host:
+                raise ValueError(
+                    f"{field_name}: refusing to follow a redirect off the configured host "
+                    f"({urlparse(current_url).hostname} -> {urlparse(next_url).hostname or location}) "
+                    "— this request carries credentials"
+                )
+            body_kwargs = _strip_credentials(body_kwargs)
+        current_method, body_kwargs = _rebuild_redirect(current_method, body_kwargs, resp.status_code)
+        current_url = next_url
+    raise ValueError(f"{field_name}: exceeded {max_redirects} redirects while validating target host")
+
+
+# Server URL fields per provider: the default block and every named instance.
+_SERVER_URL_FIELDS = (
+    ("plex", "server_url"),
+    ("jellyfin", "server"),
+    ("emby", "server"),
+    ("tautulli", "server_url"),
+    ("kodi", "server"),
+)
+
+
+def config_server_url_error(cfg: dict[str, Any]) -> str | None:
+    """Return an error for the first dangerous server URL in *cfg*, else None.
+
+    Used when the config is saved so a metadata or link-local target is
+    rejected instead of stored. LAN addresses stay allowed.
+    """
+    for provider, field in _SERVER_URL_FIELDS:
+        blk = cfg.get(provider) if isinstance(cfg, dict) else None
+        if not isinstance(blk, dict):
+            continue
+        checks = [(blk.get(field, ""), f"{provider}.{field}")]
+        insts = blk.get("instances")
+        if isinstance(insts, dict):
+            for inst_id, inst_blk in insts.items():
+                if isinstance(inst_blk, dict):
+                    checks.append((inst_blk.get(field, ""), f"{provider}.instances.{inst_id}.{field}"))
+        for value, name in checks:
+            try:
+                assert_server_url_safe(str(value or ""), name)
+            except ValueError as e:
+                return str(e)
+    return None
