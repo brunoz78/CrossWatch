@@ -1,0 +1,156 @@
+# Weekly: merge cenodude/CrossWatch, translate new UI strings, publish a release.
+# Fork addition; the original workflows of the project are manual-only and unused here.
+name: Fork sync and release
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Monday 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Publish a release even without changes"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/cenodude/CrossWatch.git
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A token with workflow scope is only needed when upstream changes its workflows.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream main
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" = "0" ]; then echo "Up to date with upstream"; exit 0; fi
+          if ! git merge --no-edit -m "Original eingespielt ($BEHIND Commits)" upstream/main; then
+            FILES=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            git merge --abort
+            gh issue create --title "Abgleich mit dem Original: Merge-Konflikt" \
+              --body "Der wöchentliche Abgleich mit cenodude/CrossWatch ($BEHIND neue Commits) ist an Konflikten gescheitert:
+
+          $FILES
+
+          Bitte von Hand zusammenführen." || true
+            exit 1
+          fi
+
+      - name: Translate new UI strings
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MISSING=$(python tools/i18n/extract.py --missing de 2>&1 >/dev/null | grep -o '^[0-9]*')
+          echo "Missing translations: $MISSING"
+          if [ "$MISSING" != "0" ]; then
+            if [ -n "$ANTHROPIC_API_KEY" ]; then
+              pip install --quiet anthropic
+              python tools/i18n/translate.py de
+            else
+              python tools/i18n/extract.py --missing de > missing.txt 2>/dev/null
+              gh issue create --title "Übersetzung: $MISSING neue Texte" \
+                --body "Ohne ANTHROPIC_API_KEY konnten diese Texte nicht automatisch übersetzt werden:
+
+          \`\`\`
+          $(head -c 60000 missing.txt)
+          \`\`\`" || true
+            fi
+          fi
+          python tools/i18n/extract.py
+          git add assets/i18n tools/i18n
+          git diff --cached --quiet || git commit -q -m "Übersetzung: neue Texte ergänzt"
+
+      - name: Smoke test
+        run: |
+          pip install --quiet -r requirements.txt
+          export CONFIG_BASE=$(mktemp -d)
+          python - <<'EOF'
+          from fastapi.testclient import TestClient
+          import crosswatch
+          c = TestClient(crosswatch.app)
+          r = c.get("/", headers={"accept-language": "de"})
+          assert r.status_code == 200 and "/assets/i18n/i18n.js" in r.text, r.status_code
+          assert c.get("/assets/i18n/de.js").status_code == 200
+          print("smoke test ok")
+          EOF
+
+      - name: Push
+        run: git push origin HEAD:main
+
+      - name: Decide on a release
+        id: decide
+        run: |
+          LAST=$(git describe --tags --abbrev=0 --match 'v*.post*' 2>/dev/null || echo "")
+          if [ -z "$LAST" ] || [ -n "$(git log --oneline "$LAST"..HEAD)" ] || [ "${{ inputs.force_release }}" = "true" ]; then
+            echo "release=yes" >> "$GITHUB_OUTPUT"
+          fi
+          echo "last=$LAST" >> "$GITHUB_OUTPUT"
+
+      - name: Build release archive
+        if: steps.decide.outputs.release == 'yes'
+        id: build
+        run: |
+          BASE=$(python -c "import re;print(re.search(r'FALLBACK_VERSION = \"v?([^\"]+)\"', open('cw_platform/app_version.py').read()).group(1))")
+          TAG="v${BASE}.post$(date -u +%Y%m%d%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          pip install --quiet uv
+          uv pip compile requirements.txt --generate-hashes --python-version "$PYTHON_VERSION" \
+            --python-platform x86_64-manylinux_2_28 --quiet -o requirements.lock
+          mkdir -p dist
+          git archive --format=tar --prefix="crosswatch-$TAG/" HEAD > "dist/crosswatch-$TAG.tar"
+          mkdir -p "stage/crosswatch-$TAG"
+          printf '%s' "$TAG" > "stage/crosswatch-$TAG/VERSION"
+          cp requirements.lock "stage/crosswatch-$TAG/"
+          tar -rf "dist/crosswatch-$TAG.tar" -C stage "crosswatch-$TAG/VERSION" "crosswatch-$TAG/requirements.lock"
+          gzip -9 "dist/crosswatch-$TAG.tar"
+          (cd dist && sha256sum "crosswatch-$TAG.tar.gz" > "crosswatch-$TAG.tar.gz.sha256")
+
+      - name: Publish release
+        if: steps.decide.outputs.release == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.build.outputs.tag }}
+          LAST: ${{ steps.decide.outputs.last }}
+        run: |
+          RANGE=${LAST:+$LAST..}HEAD
+          {
+            echo "Wöchentlicher Stand: Original cenodude/CrossWatch mit deutscher Oberfläche und Sicherheits-Ergänzungen."
+            echo
+            echo "**Aktualisieren:** Glocke in CrossWatch → «Jetzt aktualisieren», oder \`update\` in der Konsole des Containers."
+            echo
+            echo "### Neue Änderungen im Original"
+            git log --no-merges --format='- %s' "$RANGE" --author='^(?!github-actions).*$' --perl-regexp | head -80
+          } > notes.md
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" dist/* --title "CrossWatch $TAG" --notes-file notes.md
