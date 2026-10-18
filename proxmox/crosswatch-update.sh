@@ -96,7 +96,7 @@ fi
 
 systemctl start crosswatch
 for _ in $(seq 1 60); do
-  if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/healthz" || curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/api/health"; then
+  if curl -fs -o /dev/null "http://127.0.0.1:${PORT}/healthz" || curl -fs -o /dev/null "http://127.0.0.1:${PORT}/api/health"; then
     log "Updated to ${LATEST}"
     status done "Updated to ${LATEST}" "$LATEST"
     exit 0
