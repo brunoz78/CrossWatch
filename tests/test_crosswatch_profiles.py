@@ -989,17 +989,20 @@ def test_linked_profile_avatar_is_cached_after_first_proxy_fetch(monkeypatch, tm
         def __exit__(self, *_args):
             return False
 
-        def read(self, _size=-1):
-            return png
+        class raw:  # noqa: N801 - mimics requests' Response.raw
+            @staticmethod
+            def read(_size=-1, decode_content=False):
+                return png
 
-    def fake_urlopen(_request, timeout=0):
+    def fake_guarded_request(_method, _url, timeout=0, require_public=False, **_kw):
         nonlocal calls
         calls += 1
-        assert timeout == 8
+        assert timeout == 8 and require_public
         return FakeAvatarResponse()
 
     monkeypatch.setattr(profile_api, "CONFIG_DIR", tmp_path)
-    monkeypatch.setattr(profile_api.urllib.request, "urlopen", fake_urlopen)
+    import cw_platform.url_validation as url_validation
+    monkeypatch.setattr(url_validation, "guarded_request", fake_guarded_request)
 
     raw = {
         "plex_sso": {
