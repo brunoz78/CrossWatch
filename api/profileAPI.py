@@ -248,11 +248,13 @@ def _avatar_response(raw: dict[str, Any]) -> Response:
             if cached is not None:
                 return FileResponse(cached, media_type=_avatar_media_type_for_path(cached), headers=AVATAR_CACHE_HEADERS)
             try:
-                req = urllib.request.Request(linked_url, headers={"User-Agent": http_user_agent()})
-                with urllib.request.urlopen(req, timeout=8) as res:
+                # The URL comes from the identity provider: every redirect hop must stay public https.
+                from cw_platform.url_validation import guarded_request
+                with guarded_request("GET", linked_url, field_name="avatar", allow_cross_host=True, require_public=True,
+                                     headers={"User-Agent": http_user_agent()}, timeout=8, stream=True) as res:
                     content_type = str(res.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
                     if content_type in AVATAR_TYPES:
-                        data = res.read(MAX_AVATAR_BYTES + 1)
+                        data = res.raw.read(MAX_AVATAR_BYTES + 1, decode_content=True)
                         if len(data) <= MAX_AVATAR_BYTES:
                             cached = _linked_avatar_cache_path(linked_url, version, content_type)
                             if cached is not None and _write_linked_avatar_cache(cached, data):

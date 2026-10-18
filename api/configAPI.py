@@ -574,6 +574,12 @@ def api_config_save(request: Request, payload: dict[str, Any] = Body(...)) -> di
 
     cfg: dict[str, Any] = dict(merged or {})
 
+    # SSRF guard: refuse server URLs that point at metadata or link-local addresses
+    from cw_platform.url_validation import config_server_url_error
+    url_error = config_server_url_error(cfg)
+    if url_error:
+        return JSONResponse({"ok": False, "error": url_error}, status_code=400)
+
 
     sc = cfg.setdefault("scrobble", {})
     sc_enabled = bool(sc.get("enabled", False))
