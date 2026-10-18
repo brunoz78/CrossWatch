@@ -56,7 +56,7 @@ jobs:
           if ! git merge --no-edit -m "Original eingespielt ($BEHIND Commits)" upstream/main; then
             FILES=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
             git merge --abort
-            gh issue create --title "Abgleich mit dem Original: Merge-Konflikt" \
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Abgleich mit dem Original: Merge-Konflikt" \
               --body "Der wöchentliche Abgleich mit cenodude/CrossWatch ($BEHIND neue Commits) ist an Konflikten gescheitert:
 
           $FILES
@@ -78,7 +78,7 @@ jobs:
               python tools/i18n/translate.py de
             else
               python tools/i18n/extract.py --missing de > missing.txt 2>/dev/null
-              gh issue create --title "Übersetzung: $MISSING neue Texte" \
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "Übersetzung: $MISSING neue Texte" \
                 --body "Ohne ANTHROPIC_API_KEY konnten diese Texte nicht automatisch übersetzt werden:
 
           \`\`\`
@@ -155,4 +155,4 @@ jobs:
           } > notes.md
           git tag "$TAG"
           git push origin "$TAG"
-          gh release create "$TAG" dist/* --title "CrossWatch $TAG" --notes-file notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" dist/* --title "CrossWatch $TAG" --notes-file notes.md
