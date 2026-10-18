@@ -94,7 +94,7 @@ from ui_frontend import (
     register_assets_and_favicons,
     register_ui_root,
 )
-from i18n_frontend import install_i18n
+from fork_addons import install_fork_addons
 from services.scheduling import SyncScheduler
 from services.statistics import Stats
 
@@ -718,7 +718,7 @@ async def app_auth_gate(request: Request, call_next):
 if not _cli_only_mode():
     register_assets_and_favicons(app, ROOT)
     register_ui_root(app)
-    install_i18n(app)
+install_fork_addons(app)
 register_app_auth(app)
 register_api_tokens(app)
 

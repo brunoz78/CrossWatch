@@ -268,6 +268,7 @@
  "mybox.local, crosswatch.local",
  "ovr wl-status {0}{1}",
  "page-loader: missing key",
+ "position:fixed;inset:0;z-index:99999;display:grid;place-items:center;background:rgba(5,8,14,.78);color:#eef5ff;font:600 16px system-ui,sans-serif;text-align:center;padding:24px",
  "position:fixed;left:-9999px",
  "repeat({0}, 92px)",
  "repeat({0}, 92px) auto",
