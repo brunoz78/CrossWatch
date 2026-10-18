@@ -21,7 +21,7 @@
     {
       "type": "default",
       "script": "ct/crosswatch.sh",
-      "config_path": "/var/lib/crosswatch/config.json",
+      "config_path": "/config/config.json",
       "resources": {
         "cpu": 2,
         "ram": 1024,
@@ -37,7 +37,7 @@
   },
   "notes": [
     {
-      "text": "The admin account is created in the browser. Only the one-time setup link shown at the end of the installation can do that; it is also in `/var/lib/crosswatch/.setup_token` and in `journalctl -u crosswatch`.",
+      "text": "The admin account is created in the browser. Only the one-time setup link shown at the end of the installation can do that; it is also in `/config/.setup_token` and in `journalctl -u crosswatch`.",
       "type": "info"
     },
     {

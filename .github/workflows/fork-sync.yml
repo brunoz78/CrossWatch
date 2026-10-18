@@ -93,7 +93,9 @@ jobs:
       - name: Smoke test
         run: |
           pip install --quiet -r requirements.txt httpx2
-          export CONFIG_BASE=$(mktemp -d)
+          # The app writes provider state below /config, as in its Docker image.
+          sudo install -d -o "$USER" /config
+          export CONFIG_BASE=/config
           python - <<'EOF'
           from fastapi.testclient import TestClient
           import crosswatch

@@ -18,8 +18,8 @@ $STD apt install -y python3 python3-venv jq curl ca-certificates tzdata
 msg_ok "Installed Dependencies"
 
 msg_info "Installing CrossWatch"
-mkdir -p /var/lib/crosswatch
-chmod 700 /var/lib/crosswatch
+mkdir -p /config
+chmod 700 /config
 curl -fsSL -o /usr/local/bin/crosswatch-update \
   "https://raw.githubusercontent.com/brunoz78/CrossWatch/main/proxmox/crosswatch-update.sh"
 chmod 755 /usr/local/bin/crosswatch-update
@@ -36,7 +36,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/crosswatch
-Environment=CONFIG_BASE=/var/lib/crosswatch
+Environment=CONFIG_BASE=/config
 Environment=WEB_PORT=8787
 Environment=TZ=Europe/Zurich
 Environment=CW_UI_LANG=de
@@ -52,7 +52,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/crosswatch
+ReadWritePaths=/config
 
 [Install]
 WantedBy=multi-user.target
@@ -64,7 +64,7 @@ cat <<SVC >/etc/systemd/system/crosswatch-update.path
 Description=Watch for CrossWatch update requests
 
 [Path]
-PathExists=/var/lib/crosswatch/.update/request
+PathExists=/config/.update/request
 MakeDirectory=yes
 
 [Install]
@@ -84,7 +84,7 @@ msg_ok "Created Services"
 
 msg_info "Waiting for first start"
 for _ in $(seq 1 60); do
-  [[ -s /var/lib/crosswatch/.setup_token ]] && break
+  [[ -s /config/.setup_token ]] && break
   sleep 2
 done
 msg_ok "CrossWatch is running"

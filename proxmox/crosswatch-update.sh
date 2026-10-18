@@ -13,7 +13,7 @@ set -Eeuo pipefail
 
 REPO="${CW_REPO:-brunoz78/CrossWatch}"
 APP_DIR="/opt/crosswatch"
-DATA_DIR="/var/lib/crosswatch"
+DATA_DIR="/config"   # the app expects /config (as in the Docker image)
 BACKUP_DIR="/var/backups/crosswatch"
 UPD_DIR="${DATA_DIR}/.update"
 STATUS="${UPD_DIR}/status.json"
