@@ -144,14 +144,19 @@ jobs:
           TAG: ${{ steps.build.outputs.tag }}
           LAST: ${{ steps.decide.outputs.last }}
         run: |
-          RANGE=${LAST:+$LAST..}HEAD
+          SINCE=${LAST:+^$LAST}
           {
             echo "Wöchentlicher Stand: Original cenodude/CrossWatch mit deutscher Oberfläche und Sicherheits-Ergänzungen."
             echo
             echo "**Aktualisieren:** Glocke in CrossWatch → «Jetzt aktualisieren», oder \`update\` in der Konsole des Containers."
+            if [ -n "$LAST" ]; then
+              echo
+              echo "### Neu im Original"
+              git log --no-merges --format='- %s ([%h](https://github.com/cenodude/CrossWatch/commit/%H))' upstream/main $SINCE | head -80
+            fi
             echo
-            echo "### Neue Änderungen im Original"
-            git log --no-merges --format='- %s' "$RANGE" --author='^(?!github-actions).*$' --perl-regexp | head -80
+            echo "### Neu im Fork"
+            git log --no-merges --format='- %s' HEAD $SINCE ^upstream/main | head -40
           } > notes.md
           git tag "$TAG"
           git push origin "$TAG"
