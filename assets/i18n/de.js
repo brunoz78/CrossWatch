@@ -1,6 +1,100 @@
 /* assets/i18n/de.js - German UI strings. Maintained with tools/i18n (extract.py, translate.py). */
 window.CW_I18N_DICT = {
  "lang": "de",
+ "rules": [
+  [
+   "(\\d+)\\s?s ago",
+   "vor $1 s"
+  ],
+  [
+   "(\\d+)\\s?(?:m|min|mins) ago",
+   "vor $1 Min."
+  ],
+  [
+   "(\\d+)\\s?(?:h|hr|hrs) ago",
+   "vor $1 h"
+  ],
+  [
+   "(\\d+)\\s?d ago",
+   "vor $1 T."
+  ],
+  [
+   "(\\d+)\\s?w ago",
+   "vor $1 Wo."
+  ],
+  [
+   "1 seconds? ago",
+   "vor 1 Sekunde"
+  ],
+  [
+   "(\\d+) seconds ago",
+   "vor $1 Sekunden"
+  ],
+  [
+   "1 minutes? ago",
+   "vor 1 Minute"
+  ],
+  [
+   "(\\d+) minutes ago",
+   "vor $1 Minuten"
+  ],
+  [
+   "1 hours? ago",
+   "vor 1 Stunde"
+  ],
+  [
+   "(\\d+) hours ago",
+   "vor $1 Stunden"
+  ],
+  [
+   "1 days? ago",
+   "vor 1 Tag"
+  ],
+  [
+   "(\\d+) days ago",
+   "vor $1 Tagen"
+  ],
+  [
+   "1 weeks? ago",
+   "vor 1 Woche"
+  ],
+  [
+   "(\\d+) weeks ago",
+   "vor $1 Wochen"
+  ],
+  [
+   "1 months? ago",
+   "vor 1 Monat"
+  ],
+  [
+   "(\\d+) months ago",
+   "vor $1 Monaten"
+  ],
+  [
+   "1 years? ago",
+   "vor 1 Jahr"
+  ],
+  [
+   "(\\d+) years ago",
+   "vor $1 Jahren"
+  ],
+  [
+   "in (\\d+)\\s?s",
+   "in $1 s"
+  ],
+  [
+   "in (\\d+)\\s?(?:m|min)",
+   "in $1 Min."
+  ],
+  [
+   "in (\\d+)\\s?h",
+   "in $1 h"
+  ],
+  [
+   "in (\\d+)\\s?d",
+   "in $1 T."
+  ]
+ ],
  "strings": {
   "(built in)": "(eingebaut)",
   "(code {0})": "(Code {0})",
@@ -2310,6 +2404,8 @@ window.CW_I18N_DICT = {
   "Jellyfin: Watchlist mode Jellyfin has no native Watchlist. CrossWatch maps it to: • Favorites: sets the Favorite flag • Playlist: writes to a named playlist (episodes only; no shows) • Collections: writes to a named collection Changing mode does not move existing items. Tip: Favorites or Collections are the most compatible.": "Jellyfin: Watchlist-Modus. Jellyfin hat keine eigene Watchlist. CrossWatch bildet sie ab auf: • Favoriten: setzt die Favoriten-Markierung • Playlist: schreibt in eine benannte Playlist (nur Episoden, keine Serien) • Sammlungen: schreibt in eine benannte Sammlung. Ein Moduswechsel verschiebt bestehende Elemente nicht. Tipp: Favoriten oder Sammlungen sind am verträglichsten.",
   "Jobs and automation": "Aufgaben und Automatisierung",
   "Join the discussions and get help from the community.": "Nimm an den Diskussionen teil und hol dir Hilfe aus der Community.",
+  "Just now": "Gerade eben",
+  "just now": "gerade eben",
   "Keep a copy of this report": "Eine Kopie dieses Berichts behalten",
   "Keep at most": "Höchstens behalten",
   "Keep captures for days": "Erfassungen behalten für Tage",
@@ -2799,6 +2895,7 @@ window.CW_I18N_DICT = {
   "Needs the CrossWatch provider to be connected.": "Setzt einen verbundenen CrossWatch-Anbieter voraus.",
   "Needs your key": "Braucht deinen Schlüssel",
   "Never": "Nie",
+  "never": "nie",
   "New": "Neu",
   "New access key": "Neuer Zugriffsschlüssel",
   "New backup codes created": "Neue Ersatzcodes erstellt",

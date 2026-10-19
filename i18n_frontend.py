@@ -51,6 +51,7 @@ def _tags(lang: str) -> bytes:
         tags.append(f'<script src="/assets/i18n/{lang}.js?v={_version(lang + ".js")}"></script>')
     tags.append(f'<script src="/assets/i18n/i18n.js?v={_version("i18n.js")}"></script>')
     tags.append(f'<script src="/assets/fork/update.js?v={_version("../fork/update.js")}" defer></script>')
+    tags.append(f'<link rel="stylesheet" href="/assets/fork/fork.css?v={_version("../fork/fork.css")}">')
     return "".join(tags).encode()
 
 

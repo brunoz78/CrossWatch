@@ -1,0 +1,14 @@
+/* assets/fork/fork.css */
+/* CrossWatch - layout tweaks for translated text (fork addition) */
+/* German words are longer than the English originals; give fixed-width labels room.
+   Selectors repeat the original scope so they win over its ID-based rules. */
+
+/* Library whitelist: column headers such as BEWERTUNGEN / FORTSCHRITT */
+html:not([lang="en"]) :is(#page-settings #auth-providers,.scrm-modal) .cw-wl { --wl-col: 100px; }
+html:not([lang="en"]) :is(#page-settings #auth-providers,.scrm-modal) .cw-wl-colhead {
+  letter-spacing: 0.02em; white-space: normal; line-height: 1.15; text-align: center; overflow-wrap: anywhere;
+}
+@media (max-width: 720px) {
+  html:not([lang="en"]) :is(#page-settings #auth-providers,.scrm-modal) .cw-wl { --wl-col: 64px; }
+  html:not([lang="en"]) :is(#page-settings #auth-providers,.scrm-modal) .cw-wl-colhead { font-size: 0.56rem; }
+}

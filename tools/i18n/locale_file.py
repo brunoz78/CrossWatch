@@ -16,17 +16,22 @@ def path_for(lang: str) -> Path:
     return LOCALE_DIR / f"{lang}.js"
 
 
-def load(lang: str) -> dict[str, str]:
+def _load_all(lang: str) -> dict:
     p = path_for(lang)
     if not p.exists():
         return {}
     src = p.read_text(encoding="utf-8")
-    body = src[src.index("{", src.index("=")): src.rindex("}") + 1]
-    return dict(json.loads(body).get("strings") or {})
+    return json.loads(src[src.index("{", src.index("=")): src.rindex("}") + 1])
+
+
+def load(lang: str) -> dict[str, str]:
+    return dict(_load_all(lang).get("strings") or {})
 
 
 def save(lang: str, strings: dict[str, str]) -> None:
-    data = {"lang": lang, "strings": dict(sorted(strings.items(), key=lambda kv: (kv[0].lower(), kv[0])))}
+    # "rules" (regular expressions for numbers such as "30s ago") are maintained by hand
+    rules = _load_all(lang).get("rules") or []
+    data = {"lang": lang, "rules": rules, "strings": dict(sorted(strings.items(), key=lambda kv: (kv[0].lower(), kv[0])))}
     text = HEADER.format(lang=lang, name=NAMES.get(lang, lang)) + "window.CW_I18N_DICT = " + json.dumps(data, ensure_ascii=False, indent=1) + ";\n"
     path_for(lang).write_text(text, encoding="utf-8", newline="\n")
 
