@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from cw_platform.collection_media import punchplay_format
 from cw_platform.id_map import canonical_key, minimal as id_minimal
 
 from ._common import (
@@ -57,9 +58,9 @@ def _kind_of(item: Mapping[str, Any]) -> str:
 
 
 def _format_value(adapter: Any, item: Mapping[str, Any]) -> str:
-    raw = str(item.get("format") or item.get("edition_format") or "").strip().lower()
-    if raw in VALID_FORMATS:
-        return raw
+    fmt = punchplay_format(item)
+    if fmt in VALID_FORMATS:
+        return fmt
     cfg = cfg_section(adapter)
     raw_cfg = str(cfg.get("collection_default_format") or "digital").strip().lower()
     return raw_cfg if raw_cfg in VALID_FORMATS else "digital"

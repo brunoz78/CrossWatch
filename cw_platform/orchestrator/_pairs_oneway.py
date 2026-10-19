@@ -219,6 +219,7 @@ def select_baseline_keys(success_keys, result) -> list:
 
 from ..provider_instances import normalize_instance_id
 
+from ..collection_media import media_update as _collection_media_update
 from ..id_map import migrate_media_index, minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids, _norm_type, part_fragment as _part_fragment
 from ..history_events import has_history_watch, history_sync_key, minimal_history_item
 from ..anime_mapping.service import (
@@ -253,6 +254,7 @@ from ._tombstones import clear_items_for_feature, media_tombstone_tokens
 from ._pairs_utils import (
     ratings_step_for,
     ratings_zero_for,
+    collection_media_updates_for,
     config_with_pair_libraries as _config_with_pair_libraries,
     _supports_feature,
     _resolve_flags,
@@ -268,6 +270,7 @@ from ._pairs_utils import (
 from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_delete
 from ._pairs_blocklist import apply_blocklist
 from ._specials import filter_specials_index, specials_excluded
+from ._dropped import apply_dropped_tags, matches_dropped_show as _matches_dropped_show, preview_dropped_tags, provider_dropped_mode, reads_dropped, tags_dropped, with_written
 from .. import library_presence as _library_presence
 from ._history_rewatches import (
     collapse_history_latest,
@@ -358,14 +361,11 @@ def _rekey_index_to_match_other_keys(
 
 
 def _provider_ignore_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
-    try:
-        blk = cfg.get(str(provider_key or "").strip().lower()) or {}
-        if not isinstance(blk, Mapping):
-            return False
-        key = f"{str(feature or '').strip().lower()}_ignore_dropped_shows"
-        return bool(blk.get(key, False))
-    except Exception:
-        return False
+    return provider_dropped_mode(cfg, provider_key, feature) == "ignore"
+
+
+def _provider_tag_dropped_enabled(cfg: Mapping[str, Any], provider_key: str, feature: str) -> bool:
+    return provider_dropped_mode(cfg, provider_key, feature) == "tag"
 
 
 def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
@@ -381,37 +381,6 @@ def _load_provider_dropped_tokens(ops: Any, cfg: Mapping[str, Any]) -> set[str]:
         return set()
     except Exception:
         return set()
-
-
-def _show_level_tokens(item: Mapping[str, Any]) -> set[str]:
-    ids = item.get("show_ids") if isinstance(item.get("show_ids"), Mapping) else None
-    if not ids:
-        ids = item.get("ids") if isinstance(item.get("ids"), Mapping) else None
-    out: set[str] = set()
-    try:
-        if str(item.get("type") or "").lower() == "show":
-            ck = _ck(item)
-            if ck:
-                out.add(str(ck))
-    except Exception:
-        pass
-    if isinstance(ids, Mapping):
-        for k, v in ids.items():
-            if v is None:
-                continue
-            sv = str(v).strip()
-            if not sv:
-                continue
-            out.add(f"{str(k).lower()}:{sv.lower()}")
-    return out
-
-
-def _matches_dropped_show(item: Mapping[str, Any], dropped_tokens: set[str]) -> bool:
-    if not dropped_tokens or not isinstance(item, Mapping):
-        return False
-    if str(item.get("type") or "").strip().lower() in ("movie", "movies"):
-        return False
-    return bool(_show_level_tokens(item) & dropped_tokens)
 
 
 def _filter_index_for_dropped_shows(idx: dict[str, Any], dropped_tokens: set[str]) -> tuple[dict[str, Any], int]:
@@ -1273,7 +1242,10 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     src_dropped_tokens: set[str] = set()
     dst_dropped_tokens: set[str] = set()
-    if src in ("TRAKT", "MDBLIST", "SIMKL") and _provider_ignore_dropped_enabled(src_cfg, src, feature):
+    src_tags_dropped = reads_dropped(src_ops) and tags_dropped(dst_ops) and _provider_tag_dropped_enabled(src_cfg, src, feature)
+    if src_tags_dropped:
+        src_dropped_tokens = _load_provider_dropped_tokens(src_ops, src_cfg)
+    elif reads_dropped(src_ops) and _provider_ignore_dropped_enabled(src_cfg, src, feature):
         src_dropped_tokens = _load_provider_dropped_tokens(src_ops, src_cfg)
         if src_dropped_tokens:
             prev_src, prev_filtered = _filter_index_for_dropped_shows(prev_src, src_dropped_tokens)
@@ -1282,7 +1254,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             if prev_filtered or cur_filtered or eff_filtered:
                 emit("debug", msg="provider.dropped.filtered", provider=src, feature=feature, scope="source", prev=prev_filtered, current=cur_filtered, effective=eff_filtered)
 
-    if dst in ("TRAKT", "MDBLIST", "SIMKL") and _provider_ignore_dropped_enabled(dst_cfg, dst, feature):
+    if reads_dropped(dst_ops) and _provider_ignore_dropped_enabled(dst_cfg, dst, feature):
         dst_dropped_tokens = _load_provider_dropped_tokens(dst_ops, dst_cfg)
 
     dst_sem = _index_semantics(dst_ops, feature, cfg=dst_cfg, provider=dst)
@@ -1595,6 +1567,17 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 dbg("anime_mapping.coord_pruned", feature=feature, src=src, dst=dst, adds=coord_pruned)
             adds = pruned
 
+    if feature == "collection" and bool((fcfg or {}).get("media_updates")) and collection_media_updates_for(dst_ops):
+        for sv in (src_idx or {}).values():
+            if not isinstance(sv, Mapping) or not (sv.get("media_info") or sv.get("format")):
+                continue
+            dv = _find_in_idx(dst_full, dst_alias, sv)
+            upd = _collection_media_update(sv, dv) if dv else None
+            if upd:
+                updates.append(upd)
+        if updates:
+            dbg("collection.media_updates", src=src, dst=dst, count=len(updates))
+
     removes: list[dict[str, Any]] = []
 
     def _observed_source_removes() -> list[dict[str, Any]]:
@@ -1802,12 +1785,23 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     review = getattr(ctx, "interactive", None)
     if review is not None:
+        planned_adds = list(adds)
         review_args = dict(source=src, source_instance=src_inst, before=dst_full, down=dst_down)
         review.excluded(feature, dst, dst_inst, "add", library_skipped, **review_args)
         adds = review.filter(feature, dst, dst_inst, "add", adds, **review_args)
         updates = review.filter(feature, dst, dst_inst, "update", updates, **review_args)
         removes = review.filter(feature, dst, dst_inst, "remove", removes, **review_args)
         if review.preview:
+            if src_tags_dropped and not src_down:
+                planned_target = dict(groups.restore(1, dst_full))
+                for n, it in enumerate(planned_adds):
+                    planned_target.setdefault(_sync_key(it) or f"planned:{n}", it)
+                preview_dropped_tags(
+                    review=review, src=src, src_inst=src_inst, dst=dst, dst_inst=dst_inst, src_cfg=src_cfg,
+                    dst_ops=dst_ops, feature=feature, source=groups.restore(0, src_idx), source_tokens=src_dropped_tokens,
+                    target=planned_target, down=dst_down,
+                    target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
+                )
             return {"blocked": blocked_total, "manual_excluded": int(manual_blocked),
                     "library_skipped": len(library_skipped), "cancelled": cancelled}
 
@@ -2257,6 +2251,14 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         emit("post_apply_refresh:done", provider=dst, instance=dst_inst, feature=feature,
              refreshed_count=len(refreshed or {}), first_keys=list(refreshed or {})[:10],
              contains_trace_key=contains_trace, baseline_update_count=base_update)
+
+    if src_tags_dropped and not (cancelled or src_down or dst_down):
+        apply_dropped_tags(
+            src=src, dst=dst, src_cfg=src_cfg, dst_ops=dst_ops, dst_cfg=dst_cfg, feature=feature,
+            source=src_idx, source_tokens=src_dropped_tokens, target=with_written(dst_full, adds, post_apply_add_res, _sync_key),
+            target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
+            dry_run=dry_run_flag, emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst,
+        )
 
     if (not cancelled) and getattr(ctx, "write_state_json", True):
         try:

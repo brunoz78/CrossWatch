@@ -37,9 +37,7 @@ export const HELP_TEXT = {
   "cx-hs-remove": "History: Remove\nRemoving history is discouraged (destructive and only for very specific needs).",
   "cx-hs-rewatches": "History: Rewatches\nSync separate play events when both providers support it. SIMKL requires Pro/VIP.",
   "cx-tr-hs-col": "Trakt: Add to library\nAlso add items to your Trakt library when writing history (if enabled).",
-  "cx-tr-hs-ignore-dropped": "Trakt: Ignore dropped shows\nWhen enabled, shows marked as dropped on Trakt are skipped during history sync.\nThis suppresses sync for those shows; it does not remove them elsewhere.",
-  "cx-md-hs-ignore-dropped": "MDBList: Ignore dropped shows\nWhen enabled, shows marked as dropped on MDBList are skipped during history sync.\nThis suppresses sync for those shows; it does not remove them elsewhere.",
-  "cx-sm-hs-ignore-dropped": "Simkl: Ignore dropped shows\nWhen enabled, shows marked as dropped on Simkl are skipped during history sync.\nThis suppresses sync for those shows; it does not remove them elsewhere.",
+  "cx-hs-dropped": "Dropped shows\nSync normally: dropped shows sync like any other show.\nIgnore dropped: shows dropped on either provider are skipped during history sync. Nothing is removed elsewhere.\nSync + tag dropped: plays of dropped shows still sync, and the show is marked dropped on the other provider. One-way copies the source status to the target, two-way works both ways. SIMKL and WeTrakr keep completed shows as completed. Dropping a show on FlickList also clears its resume points. Un-dropping is not synced.",
 
   "cx-pr-enable": "Progress: Enable\nSync resume position (where you left off) between providers.",
   "cx-pr-add": "Progress: Add / Update\nWrite resume position to the target.",
@@ -53,6 +51,8 @@ export const HELP_TEXT = {
   "cx-pr-library-only": "Progress: Only items in destination library\nSkip resume positions for movies and episodes that are not in the media server library.\nTitles the server already has a position for are always synced.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
   "cx-hs-specials": "History: Specials (Season 0)\nInclude Season 0 / specials episodes. Disable to skip them on both sides of this pair.",
   "cx-hs-library-only": "History: Only items in destination library\nSkip movies and episodes that are not in the media server library.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
+  "cx-co-media": "Collections: Read from media server\nReads resolution, HDR and audio from the media server and sends them with new collection items.\nAdds some extra load on the media server while reading the library.",
+  "cx-co-media-upd": "Collections: Update existing items\nWhen the media info of an item changes on the source (for example 1080p to 4K, or a new Atmos track), the item on the destination is updated too.\nOnly fills in or changes values, never clears them. Physical copies on the destination are left alone.\nThe first sync can update many items.",
   "cx-rt-specials": "Ratings: Specials (Season 0)\nInclude Season 0 / specials seasons and episodes. Disable to skip them on both sides of this pair.",
   "cx-rt-library-only": "Ratings: Only items in destination library\nSkip new ratings for movies and episodes that are not in the media server library.\nRating changes for titles you already rated are always synced.\nMatches on IDs only, so titles stored under a different ID are skipped too.",
 

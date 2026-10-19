@@ -8,11 +8,12 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from cw_platform.app_version import user_agent as http_user_agent
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 from cw_platform.anime_mapping.service import mapped_or_default_media_type
+from cw_platform.run_control import cancel_requested
 
 from .._mod_common import request_with_retries
 from .._log import log as cw_log
@@ -416,6 +417,45 @@ def load_dropped_show_tokens(adapter: Any) -> set[str]:
     return tokens
 
 
+def tag_dropped_shows(adapter: Any, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    shows: list[dict[str, Any]] = []
+    skipped = 0
+    for item in items:
+        ids = ids_for_trakt({"type": "show", "ids": dict(item.get("ids") or {})})
+        if ids:
+            shows.append({"ids": ids})
+        else:
+            skipped += 1
+    confirmed = 0
+    not_found = 0
+    errors = 0
+    for start in range(0, len(shows), 100):
+        if cancel_requested():
+            break
+        part = shows[start:start + 100]
+        try:
+            r = adapter.client.post("https://api.trakt.tv/users/hidden/dropped", json={"shows": part})
+        except Exception as e:
+            cw_log("TRAKT", "history", "warn", "dropped_tag_failed", count=len(part), error=str(e))
+            errors += len(part)
+            continue
+        if not (200 <= r.status_code < 300):
+            cw_log("TRAKT", "history", "warn", "dropped_tag_http", count=len(part), status=r.status_code)
+            errors += len(part)
+            continue
+        try:
+            body = r.json() if (r.text or "").strip() else {}
+        except Exception:
+            body = {}
+        added = body.get("added") if isinstance(body, Mapping) else None
+        missing = body.get("not_found") if isinstance(body, Mapping) else None
+        confirmed += int((added or {}).get("shows") or 0) if isinstance(added, Mapping) else 0
+        not_found += len((missing or {}).get("shows") or []) if isinstance(missing, Mapping) else 0
+    cw_log("TRAKT", "history", "info", "dropped_tagged", attempted=len(shows), confirmed=confirmed,
+           skipped=skipped, not_found=not_found, errors=errors)
+    return {"attempted": len(shows), "confirmed": confirmed, "skipped": skipped, "not_found": not_found, "errors": errors}
+
+
 def build_headers(arg1: Any, access_token: str | None = None) -> dict[str, str]:
     client_id = ""
     token = ""
@@ -600,7 +640,7 @@ def pick_trakt_kind(item: Mapping[str, Any]) -> str:
     return "movies"
 
 
-def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str | None = None) -> dict[str, Any]:
+def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str | None = None, item_fields: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {}
     nested_shows: dict[str, dict[str, Any]] = {}
 
@@ -627,6 +667,11 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str 
                 obj[date_field] = str(value)
         return obj
 
+    def with_fields(obj: dict[str, Any], it: Mapping[str, Any]) -> dict[str, Any]:
+        if item_fields:
+            obj.update(item_fields(it))
+        return with_date(obj, it)
+
     def nested_show_obj(entry: Mapping[str, Any]) -> dict[str, Any]:
         obj: dict[str, Any] = {"ids": entry["ids"]}
         if entry.get("seasons"):
@@ -640,7 +685,7 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str 
         ids = ids_for_trakt(it)
         if kind == "movies":
             if ids:
-                push("movies", with_date({"ids": ids}, it))
+                push("movies", with_fields({"ids": ids}, it))
             continue
 
         if kind == "shows":
@@ -684,7 +729,7 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str 
 
             # Prefer show-scoped season/episode when weak episode IDs.
             if use_ids:
-                push("episodes", with_date({"ids": ids}, it))
+                push("episodes", with_fields({"ids": ids}, it))
                 continue
 
             if show_scope_ok:
@@ -696,7 +741,7 @@ def build_watchlist_body(items: Iterable[Mapping[str, Any]], *, date_field: str 
                 except Exception:
                     continue
                 season_entry = entry["seasons"].setdefault(season_i, {"number": season_i, "episodes": []})
-                season_entry.setdefault("episodes", []).append(with_date({"number": episode_i}, it))
+                season_entry.setdefault("episodes", []).append(with_fields({"number": episode_i}, it))
     if nested_shows:
         body.setdefault("shows", []).extend(
             nested_show_obj(v)

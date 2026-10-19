@@ -6,11 +6,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from cw_platform.collection_media import media_block, to_floppy_fields
 from cw_platform.id_map import minimal as id_minimal
 from providers.auth._auth_FLOPPY import FloppyAuthError
 from providers.sync._mod_common import build_op_result, unresolved_keys
 
-from ._common import PLANNING, api_delete, api_get, api_post, bucket_body, bucket_params, canonical_item_key, confirmed_destination, failure_reason, int_or_none, paged, show_path, tmdb_enriched_item, tmdb_id_for_item, unresolved, write_bucket
+from ._common import PLANNING, api_delete, api_get, api_patch, api_post, bucket_body, bucket_params, canonical_item_key, confirmed_destination, failure_reason, int_or_none, paged, show_path, tmdb_enriched_item, tmdb_id_for_item, unresolved, write_bucket
 
 
 def _media_numbers(item: Mapping[str, Any]) -> tuple[int | None, int | None]:
@@ -69,15 +70,18 @@ def _to_minimal(row: Mapping[str, Any]) -> dict[str, Any] | None:
     fmt = str(row.get("media_type") or "").strip()
     if fmt:
         out["format"] = fmt
+    media_info = media_block({"resolution": row.get("resolution"), "hdr": row.get("hdr"), "audio": row.get("audio_codec"), "audio_channels": row.get("audio_channels"), "is_3d": True if row.get("is_3d") else None})
+    if media_info:
+        out["media_info"] = media_info
     collected_at = str(row.get("collected_at") or "").strip()
     if collected_at:
         out["collected_at"] = collected_at
-    return id_minimal(out) | {k: v for k, v in out.items() if k.startswith("_floppy_") or k in {"format", "collected_at", "poster"}}
+    return id_minimal(out) | {k: v for k, v in out.items() if k.startswith("_floppy_") or k in {"format", "media_info", "collected_at", "poster"}}
 
 
 def build_index(adapter: Any, **_kwargs: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
-    for row in paged(adapter, "collection"):
+    for row in paged(adapter, "collection", require_total=True):
         item = _to_minimal(row)
         if not item:
             continue
@@ -180,10 +184,28 @@ def _collection_body(adapter: Any, item: Mapping[str, Any]) -> tuple[dict[str, A
     fmt = str(item.get("format") or item.get("edition_format") or "digital").strip().lower()
     if fmt:
         body["media_type"] = fmt[:20]
+    body.update(to_floppy_fields(item))
     collected_at = str(item.get("collected_at") or "").strip()
     if collected_at:
         body["collected_at"] = collected_at
     return body, ""
+
+
+def _update_entry_id(item: Mapping[str, Any]) -> str:
+    if not item.get("_cw_media_update"):
+        return ""
+    ids = item.get("_floppy_collection_ids")
+    first = next((str(x).strip() for x in ids if str(x or "").strip()), "") if isinstance(ids, list) else ""
+    return first or str(item.get("_floppy_collection_id") or "").strip()
+
+
+def _update_body(item: Mapping[str, Any]) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    fmt = str(item.get("format") or "").strip().lower()
+    if fmt:
+        body["media_type"] = fmt[:20]
+    body.update(to_floppy_fields(item))
+    return body
 
 
 def _collection_ids_for_remove(adapter: Any, item: Mapping[str, Any]) -> list[str]:
@@ -218,13 +240,41 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]], *, dry_run: bool = Fal
     results: list[dict[str, Any]] = []
     for raw in [dict(x or {}) for x in items or [] if isinstance(x, Mapping)]:
         key = canonical_item_key(raw)
-        item = tmdb_enriched_item(adapter, raw, episode_show=str(id_minimal(raw).get("type") or "").strip().lower() in {"season", "episode"})
+        entry_id = _update_entry_id(raw)
+        if raw.get("_cw_media_update") and not entry_id:
+            entry = unresolved(raw, "floppy_collection_id_missing")
+            unresolved_rows.append(entry)
+            results.append(entry)
+            continue
+        if entry_id:
+            if not dry_run:
+                try:
+                    api_patch(adapter, f"collection/{entry_id}", json=_update_body(raw))
+                except Exception as exc:
+                    entry = unresolved(raw, failure_reason(exc))
+                    unresolved_rows.append(entry)
+                    results.append(entry)
+                    continue
+            confirmed.append(key)
+            confirmed_destinations[key] = confirmed_destination(raw)
+            results.append({"status": "dry_run" if dry_run else "updated", "item": id_minimal(raw), "canonical_key": key})
+            continue
+        try:
+            item = tmdb_enriched_item(adapter, raw, episode_show=str(id_minimal(raw).get("type") or "").strip().lower() in {"season", "episode"})
+        except Exception as exc:
+            entry = unresolved(raw, failure_reason(exc))
+            unresolved_rows.append(entry)
+            results.append(entry)
+            continue
         if dry_run:
             confirmed.append(key)
             confirmed_destinations[key] = confirmed_destination(item)
             results.append({"status": "dry_run", "item": id_minimal(item), "canonical_key": key})
             continue
-        body, reason = _collection_body(adapter, item)
+        try:
+            body, reason = _collection_body(adapter, item)
+        except Exception as exc:
+            body, reason = None, failure_reason(exc)
         if body is None:
             entry = unresolved(item, reason or "floppy_collection_unresolved")
             unresolved_rows.append(entry)

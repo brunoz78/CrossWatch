@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable, Mapping
 from .trakt._common import (
     build_headers,
     load_dropped_show_tokens as trakt_load_dropped_show_tokens,
+    tag_dropped_shows as trakt_tag_dropped_shows,
     normalize as trakt_normalize,
     key_of as trakt_key_of,
 )
@@ -213,6 +214,7 @@ def get_manifest() -> Mapping[str, Any]:
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "remove": True,
+                "media_updates": True,
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         },
@@ -633,6 +635,9 @@ class TRAKTModule:
             _warn("common", "dropped_load_failed", error=str(e))
             return set()
 
+    def tag_dropped_shows(self, items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        return trakt_tag_dropped_shows(self, items)
+
     def feature_names(self) -> tuple[str, ...]:
         return tuple(k for k, v in self.supported_features().items() if v and k in _FEATURES)
 
@@ -801,6 +806,7 @@ class _TraktOPS:
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "remove": True,
+                "media_updates": True,
             },
             "playlists": _PLAYLIST_CAPABILITIES,
         }
@@ -891,6 +897,9 @@ class _TraktOPS:
 
     def dropped_show_tokens(self, cfg: Mapping[str, Any]) -> set[str]:
         return self._adapter(cfg).dropped_show_tokens()
+
+    def tag_dropped_shows(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        return self._adapter(cfg).tag_dropped_shows(items)
 
     def _pl(self) -> Any:
         if feat_playlists is None:
