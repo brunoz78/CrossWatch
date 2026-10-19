@@ -53,15 +53,23 @@
     }
   }
 
+  // Rules for text built from numbers, e.g. "30s ago" -> "vor 30 s": [regex, replacement]
+  const rules = (dict?.rules || []).map(([re, out]) => [new RegExp("^" + re + "$"), out]);
+
   const cache = new Map();
   const missing = new Set();
   const debug = (() => { try { return localStorage.getItem("cw_i18n_debug") === "1"; } catch { return false; } })();
 
-  function translate(text) {
+  function translate(text, depth = 0) {
     const key = norm(text);
     if (!key || !/[A-Za-z]/.test(key)) return null;
     if (cache.has(key)) return cache.get(key);
     let out = exact.get(key) ?? null;
+    if (out == null) {
+      for (const [re, rep] of rules) {
+        if (re.test(key)) { out = key.replace(re, rep); break; }
+      }
+    }
     if (out == null && !values.has(key)) {
       // collect candidates from every word, most specific pattern first
       const cands = new Set(byWord.get("") || []);
@@ -74,7 +82,7 @@
         const vals = p.order.map((_, i) => m[i + 1]);
         out = p.out.replace(/\{(\d+)\}/g, (_, n) => {
           const v = vals[p.order.indexOf(+n)] ?? "";
-          return exact.get(norm(v)) ?? v;
+          return (depth < 2 ? translate(v, depth + 1) : exact.get(norm(v))) ?? v;
         });
         break;
       }
