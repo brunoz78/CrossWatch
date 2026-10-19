@@ -48,16 +48,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Only official releases of the original are merged, never its development branch.
+          TAG=$(gh api repos/cenodude/CrossWatch/releases/latest -q .tag_name)
+          echo "Latest release of the original: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           git remote add upstream "$UPSTREAM"
-          git fetch --quiet upstream main
-          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          git fetch --quiet --no-tags upstream "refs/tags/$TAG:refs/tags/upstream-$TAG"
+          REF="upstream-$TAG"
+          BEHIND=$(git rev-list --count HEAD.."$REF")
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
-          if [ "$BEHIND" = "0" ]; then echo "Up to date with upstream"; exit 0; fi
-          if ! git merge --no-edit -m "Original eingespielt ($BEHIND Commits)" upstream/main; then
+          if [ "$BEHIND" = "0" ]; then echo "Up to date with $TAG"; exit 0; fi
+          if ! git merge --no-edit -m "Original $TAG eingespielt ($BEHIND Commits)" "$REF"; then
             FILES=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
             git merge --abort
             gh issue create --repo "$GITHUB_REPOSITORY" --title "Abgleich mit dem Original: Merge-Konflikt" \
-              --body "Der wöchentliche Abgleich mit cenodude/CrossWatch ($BEHIND neue Commits) ist an Konflikten gescheitert:
+              --body "Der wöchentliche Abgleich mit cenodude/CrossWatch $TAG ($BEHIND neue Commits) ist an Konflikten gescheitert:
 
           $FILES
 
@@ -134,6 +139,9 @@ jobs:
         id: build
         run: |
           BASE=$(python -c "import re;print(re.search(r'FALLBACK_VERSION = \"v?([^\"]+)\"', open('cw_platform/app_version.py').read()).group(1))")
+          # The number of the merged release wins over the code, which may already name the next version.
+          UP="${{ steps.merge.outputs.tag }}"
+          [ -n "$UP" ] && BASE="${UP#v}"
           TAG="v${BASE}.post$(date -u +%Y%m%d%H%M)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           pip install --quiet uv
@@ -154,20 +162,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.build.outputs.tag }}
           LAST: ${{ steps.decide.outputs.last }}
+          UPTAG: ${{ steps.merge.outputs.tag }}
         run: |
           SINCE=${LAST:+^$LAST}
           {
-            echo "Wöchentlicher Stand: Original cenodude/CrossWatch mit deutscher Oberfläche und Sicherheits-Ergänzungen."
+            echo "Wöchentlicher Stand: Original cenodude/CrossWatch $UPTAG mit deutscher Oberfläche und Sicherheits-Ergänzungen."
             echo
             echo "**Aktualisieren:** Glocke in CrossWatch → «Jetzt aktualisieren», oder \`update\` in der Konsole des Containers."
             if [ -n "$LAST" ]; then
               echo
-              echo "### Neu im Original"
-              git log --no-merges --format='- %s ([%h](https://github.com/cenodude/CrossWatch/commit/%H))' upstream/main $SINCE | head -80
+              echo "### Neu im Original (bis $UPTAG)"
+              git log --no-merges --format='- %s ([%h](https://github.com/cenodude/CrossWatch/commit/%H))' "upstream-$UPTAG" $SINCE | head -80
             fi
             echo
             echo "### Neu im Fork"
-            git log --no-merges --format='- %s' HEAD $SINCE ^upstream/main | head -40
+            git log --no-merges --format='- %s' HEAD $SINCE ^"upstream-$UPTAG" | head -40
           } > notes.md
           git tag "$TAG"
           git push origin "$TAG"

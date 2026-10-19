@@ -34,10 +34,11 @@ Lizenz wie das Original: AGPL-3.0. Geändert ab Oktober 2026.
 
 Der Workflow `.github/workflows/fork-sync.yml` läuft jeden Montag um 03:00 UTC:
 
-1. Original einspielen. Bei einem Konflikt wird ein Issue erstellt.
+1. Das neueste **offizielle Release** des Originals einspielen (nie den Entwicklungszweig). Bei
+   einem Konflikt wird ein Issue erstellt.
 2. Neue Texte ermitteln und mit der Claude-API übersetzen (Secret `ANTHROPIC_API_KEY`). Ohne
    Schlüssel entsteht ein Issue mit der Liste.
-3. Kurzer Starttest, dann Release `v<Version>.post<Datum>` mit Archiv und Prüfsumme.
+3. Kurzer Starttest, dann Release `v<Version des Originals>.post<Datum>` mit Archiv und Prüfsumme.
 
 Optionales Secret `SYNC_TOKEN`: ein Token mit Recht auf *Contents* und *Workflows* für dieses
 Repo. Nur nötig, wenn das Original seine eigenen Workflow-Dateien ändert.
