@@ -108,12 +108,13 @@
     return typeof c === "string" && (c.includes("material-symbol") || c.includes("material-icons"));
   };
 
-  function skipped(el) {
+  // Icon elements: their text is a glyph name ("help"), but their title/aria-label is real text.
+  function skipped(el, attrs = false) {
     for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
       if (SKIP.has(n.nodeName)) return true;
       if (n.isContentEditable) return true;
       if (n.hasAttribute("data-no-i18n") || n.getAttribute("translate") === "no") return true;
-      if (isIcon(n)) return true;
+      if (!attrs && isIcon(n)) return true;
     }
     return false;
   }
@@ -133,7 +134,7 @@
   }
 
   function doAttrs(el) {
-    if (skipped(el)) return;
+    if (skipped(el, true)) return;
     for (const a of ATTRS) {
       const v = el.getAttribute(a);
       if (!v) continue;
@@ -150,12 +151,14 @@
     if (root.nodeType === 3) return doText(root);
     if (root.nodeType !== 1 && root.nodeType !== 9 && root.nodeType !== 11) return;
     if (root.nodeType === 1) {
-      if (SKIP.has(root.nodeName) || isIcon(root)) return;
+      if (SKIP.has(root.nodeName)) return;
       doAttrs(root);
+      if (isIcon(root)) return;
     }
     const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
       acceptNode(n) {
-        if (n.nodeType === 1 && (SKIP.has(n.nodeName) || n.hasAttribute("data-no-i18n") || isIcon(n))) return NodeFilter.FILTER_REJECT;
+        if (n.nodeType === 1 && isIcon(n)) { doAttrs(n); return NodeFilter.FILTER_REJECT; }
+        if (n.nodeType === 1 && (SKIP.has(n.nodeName) || n.hasAttribute("data-no-i18n"))) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
     });

@@ -107,7 +107,18 @@ jobs:
           EOF
 
       - name: Push
-        run: git push origin HEAD:main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! git push origin HEAD:main 2> push.err; then
+            cat push.err
+            if grep -q "workflows. permission" push.err; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "Abgleich mit dem Original: Secret SYNC_TOKEN fehlt"                 --body "Das Original hat eine Workflow-Datei geändert. Das Standard-Token darf solche Änderungen nicht pushen.
+
+          Abhilfe: ein Token mit den Rechten *Contents* und *Workflows* für dieses Repo als Secret \`SYNC_TOKEN\` hinterlegen und den Workflow erneut starten." || true
+            fi
+            exit 1
+          fi
 
       - name: Decide on a release
         id: decide
