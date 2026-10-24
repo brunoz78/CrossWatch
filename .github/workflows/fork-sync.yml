@@ -62,6 +62,7 @@ jobs:
             FILES=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
             git merge --abort
             gh issue create --repo "$GITHUB_REPOSITORY" --title "Abgleich mit dem Original: Merge-Konflikt" \
+              --assignee "${{ github.repository_owner }}" \
               --body "Der wöchentliche Abgleich mit cenodude/CrossWatch $TAG ($BEHIND neue Commits) ist an Konflikten gescheitert:
 
           $FILES
@@ -82,13 +83,24 @@ jobs:
               pip install --quiet anthropic
               python tools/i18n/translate.py de
             else
+              # The issue is assigned to the owner so GitHub sends a mail;
+              # an open issue is updated, not duplicated.
               python tools/i18n/extract.py --missing de > missing.txt 2>/dev/null
-              gh issue create --repo "$GITHUB_REPOSITORY" --title "Übersetzung: $MISSING neue Texte" \
-                --body "Ohne ANTHROPIC_API_KEY konnten diese Texte nicht automatisch übersetzt werden:
-
-          \`\`\`
-          $(head -c 60000 missing.txt)
-          \`\`\`" || true
+              {
+                echo "Ohne ANTHROPIC_API_KEY konnten diese $MISSING Texte nicht automatisch übersetzt werden (Original ${{ steps.merge.outputs.tag }}). Sie erscheinen in der Oberfläche auf Englisch, bis sie in \`assets/i18n/de.js\` ergänzt sind."
+                echo
+                echo '```'
+                head -c 60000 missing.txt
+                echo '```'
+              } > issue.md
+              OPEN=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "Übersetzung in:title" --json number -q '.[0].number')
+              if [ -n "$OPEN" ]; then
+                gh issue edit "$OPEN" --repo "$GITHUB_REPOSITORY" --title "Übersetzung: $MISSING neue Texte" --body-file issue.md || true
+                gh issue comment "$OPEN" --repo "$GITHUB_REPOSITORY" --body "Neuer Stand nach dem Abgleich: $MISSING Texte offen." || true
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "Übersetzung: $MISSING neue Texte" \
+                  --assignee "${{ github.repository_owner }}" --body-file issue.md || true
+              fi
             fi
           fi
           python tools/i18n/extract.py
@@ -118,7 +130,7 @@ jobs:
           if ! git push origin HEAD:main 2> push.err; then
             cat push.err
             if grep -q "workflows. permission" push.err; then
-              gh issue create --repo "$GITHUB_REPOSITORY" --title "Abgleich mit dem Original: Secret SYNC_TOKEN fehlt"                 --body "Das Original hat eine Workflow-Datei geändert. Das Standard-Token darf solche Änderungen nicht pushen.
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "Abgleich mit dem Original: Secret SYNC_TOKEN fehlt" --assignee "${{ github.repository_owner }}"                 --body "Das Original hat eine Workflow-Datei geändert. Das Standard-Token darf solche Änderungen nicht pushen.
 
           Abhilfe: ein Token mit den Rechten *Contents* und *Workflows* für dieses Repo als Secret \`SYNC_TOKEN\` hinterlegen und den Workflow erneut starten." || true
             fi
