@@ -26,6 +26,8 @@
   const patterns = [];   // {re, out, words}
   const byWord = new Map();
   const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Separators in meta lines such as "Movie - 2026 - 2h ago"
+  const SEP = / [-·•|–] /;
 
   const values = new Set();
   for (const [k, v] of Object.entries(strings)) {
@@ -43,7 +45,7 @@
         return reEsc(part);
       }).join("");
       const words = (k.replace(/\{\d+\}/g, " ").match(/[A-Za-z]{3,}/g) || []);
-      const entry = { re: new RegExp("^" + src + "$"), out: v, order, len: k.replace(/\{\d+\}/g, "").length };
+      const entry = { re: new RegExp("^" + src + "$"), out: v, order, len: k.replace(/\{\d+\}/g, "").length, sep: SEP.test(k) };
       patterns.push(entry);
       const key = (words.sort((a, b) => b.length - a.length)[0] || "").toLowerCase();
       if (!byWord.has(key)) byWord.set(key, []);
@@ -80,12 +82,26 @@
         const m = key.match(p.re);
         if (!m) continue;
         const vals = p.order.map((_, i) => m[i + 1]);
+        // "{0} ago" must not swallow a whole "Movie - 2026 - 2h ago" line
+        if (!p.sep && vals.some((v) => SEP.test(` ${v ?? ""} `))) continue;
         out = p.out.replace(/\{(\d+)\}/g, (_, n) => {
           const v = vals[p.order.indexOf(+n)] ?? "";
           return (depth < 2 ? translate(v, depth + 1) : exact.get(norm(v))) ?? v;
         });
         break;
       }
+    }
+    if (out == null && depth < 2 && SEP.test(key)) {
+      // translate each part of a separated line on its own
+      const parts = key.split(/( [-·•|–] )/);
+      let changed = false;
+      const tr = parts.map((part, i) => {
+        if (i % 2) return part;
+        const t = translate(part, depth + 1);
+        if (t != null && t !== part) changed = true;
+        return t ?? part;
+      });
+      if (changed) out = tr.join("");
     }
     if (out != null) values.add(norm(out));
     else if (debug && active && key.length > 1 && !values.has(key) && /[A-Z ]/.test(key)) missing.add(key);
