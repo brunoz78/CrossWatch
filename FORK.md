@@ -32,7 +32,7 @@ Lizenz wie das Original: AGPL-3.0. Geändert ab Oktober 2026.
 
 ## Ablauf der Aktualisierung
 
-Der Workflow `.github/workflows/fork-sync.yml` läuft jeden Montag um 03:00 UTC:
+Der Workflow `.github/workflows/fork-sync.yml` läuft jeden Samstag um 01:00 UTC (Nacht von Freitag auf Samstag):
 
 1. Das neueste **offizielle Release** des Originals einspielen (nie den Entwicklungszweig). Bei
    einem Konflikt wird ein Issue erstellt.

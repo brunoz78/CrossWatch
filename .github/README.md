@@ -40,7 +40,7 @@ Weboberfläche und Kommandozeile.
 | **Abhängigkeiten** | neueste Versionen beim Bau | feste Versionen mit Prüfsummen (`requirements.lock`) im Release |
 | **Installation** | Docker-Image | Python-Dienst in einem **Proxmox-LXC** (Debian 13), ohne Docker |
 | **Update** | neues Image ziehen | Glocke → **«Jetzt aktualisieren»** oder `update` im Container, mit automatischer Rückkehr zur alten Version |
-| **Releases** | von Hand | jeden Montag automatisch: neuestes offizielles Release des Originals einspielen, neue Texte übersetzen, Release `<Version des Originals>.post<Datum>` bauen |
+| **Releases** | von Hand | jeden Samstag automatisch (Nacht von Freitag auf Samstag): neuestes offizielles Release des Originals einspielen, neue Texte übersetzen, Release `<Version des Originals>.post<Datum>` bauen |
 
 Die Absicherung stammt zum Teil aus [jabrown93/CrossWatch](https://github.com/jabrown93/CrossWatch).
 Die Dateien des Originals bleiben fast unverändert; die Übersetzung geschieht beim Anzeigen im

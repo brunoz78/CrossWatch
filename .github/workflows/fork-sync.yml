@@ -4,7 +4,7 @@ name: Fork sync and release
 
 on:
   schedule:
-    - cron: "0 3 * * 1"   # Monday 03:00 UTC
+    - cron: "0 1 * * 6"   # Saturday 01:00 UTC (night Friday to Saturday)
   workflow_dispatch:
     inputs:
       force_release:
