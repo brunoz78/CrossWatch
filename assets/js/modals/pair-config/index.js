@@ -379,6 +379,7 @@ const tpl=()=>`
         </div>
       </div>
       <div class="cx-tabsrow grid2">
+        <label class="cx-mobile-section" for="cx-mobile-section"><span>Section</span><select id="cx-mobile-section" aria-controls="cx-feat-panel"></select></label>
         <div id="cx-feat-tabs" class="feature-tabs" role="tablist" aria-label="Connection sections"></div>
       </div>
       <div class="cx-main grid2">
@@ -1046,7 +1047,7 @@ function applySubDisable(feature){
     history: ["#plx-marked-watched", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-numfb", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped","#cx-tr-hs-unres", "#tr-hs-perpage", "#tr-hs-maxpages", "#tr-hs-chunk", "#sm-hs-chunk", "#md-hs-perpage", "#md-hs-maxpages", "#md-hs-chunk", "#cx-em-hs-limit", "#cx-em-hs-delay", "#cx-em-hs-guid"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
     progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance","#cx-pr-specials","#cx-pr-library-only","#cx-pr-anime-map"],
-    collection:["#cx-co-add","#cx-co-remove","#cx-co-type-all","#cx-co-type-movies","#cx-co-type-shows","#cx-co-type-seasons","#cx-co-type-episodes"]
+    collection:["#cx-co-add","#cx-co-remove","#cx-co-type-all","#cx-co-type-movies","#cx-co-type-shows","#cx-co-type-seasons","#cx-co-type-episodes","#cx-co-media","#cx-co-media-upd"]
   };
   const on=ID(feature==="ratings"?"cx-rt-enable":feature==="watchlist"?"cx-wl-enable":feature==="history"?"cx-hs-enable":feature==="progress"?"cx-pr-enable":feature==="collection"?"cx-co-enable":"cx-pl-enable")?.checked;
   (map[feature]||[]).forEach(sel=>{const n=Q(sel);if(n){const off=!on||n.dataset.locked==="1"||n.dataset.animeOnly==="1";n.disabled=off;if(n.dataset.locked==="1")n.checked=false;n.closest?.(".opt-row")?.classList.toggle("muted",off)}});
@@ -1370,6 +1371,7 @@ function renderFeaturePanel(state){
       : `<div class="opt-row"><label for="gl-oneway-remove">One-Way Remove mode Source | Mirror-mode</label><label class="switch"><input id="gl-oneway-remove" type="checkbox" ${normalizeRemoveMode(state.pair_remove_mode)==="source_deletes"?"checked":""}><span class="slider"></span></label></div>`;
     const pct = Math.round((Number.isFinite(rt.suspect_shrink_ratio)?rt.suspect_shrink_ratio:0.1)*100);
     const minPrevVal = Number.isFinite(rt.suspect_min_prev)?rt.suspect_min_prev:20;
+    const guardInputType = window.matchMedia('(max-width:760px)').matches ? 'number' : 'range';
 
     left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">tune</span>General <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-section-main">help</button></div>
       <div class="muted">Shared application safety settings. Pair-specific controls are labelled separately.</div>
@@ -1382,14 +1384,14 @@ function renderFeaturePanel(state){
           <div class="opt-row">
             <label for="gl-sus-min">Min</label>
             <div style="position:relative;width:100%">
-              <input id="gl-sus-min" type="range" min="0" max="200" step="1" value="${minPrevVal}" style="width:100%">
+              <input id="gl-sus-min" type="${guardInputType}" inputmode="numeric" min="0" max="200" step="1" value="${minPrevVal}" style="width:100%">
               <span id="gl-sus-min-val" style="position:absolute;right:6px;top:-6px;font-size:12px;opacity:var(--cw-content-opacity,.8);">${minPrevVal}</span>
             </div>
           </div>
           <div class="opt-row">
             <label for="gl-sus-pct-range">Shrink(%)</label>
             <div style="position:relative;width:100%">
-              <input id="gl-sus-pct-range" type="range" min="1" max="50" step="1" value="${pct}" style="width:100%">
+              <input id="gl-sus-pct-range" type="${guardInputType}" inputmode="numeric" min="1" max="50" step="1" value="${pct}" style="width:100%">
               <span id="gl-sus-pct-val" style="position:absolute;right:6px;top:-6px;font-size:12px;opacity:var(--cw-content-opacity,.8);">${pct}</span>
             </div>
           </div>
@@ -2101,6 +2103,8 @@ left.innerHTML = `
   if (state.feature === "collection") {
     const co = getOpts(state, "collection");
     const hasType=t=>Array.isArray(co.types)&&co.types.includes(t);
+    const mediaRead=["plex","emby","jellyfin"].some(p=>same(state.src,p));
+    const mediaUpdates=["trakt","floppy","crosswatch","flicklist"].some(p=>same(state.dst,p));
     left.innerHTML = `<div class="panel-title">Collections | Basics</div>
       <div class="opt-row">
         <label for="cx-co-enable">Enable</label>
@@ -2124,7 +2128,16 @@ left.innerHTML = `
         <div class="opt-row"><label for="cx-co-type-shows">Shows</label><label class="switch"><input id="cx-co-type-shows" type="checkbox" ${hasType("shows")?"checked":""}><span class="slider"></span></label></div>
         <div class="opt-row"><label for="cx-co-type-seasons">Seasons</label><label class="switch"><input id="cx-co-type-seasons" type="checkbox" ${hasType("seasons")?"checked":""}><span class="slider"></span></label></div>
         <div class="opt-row"><label for="cx-co-type-episodes">Episodes</label><label class="switch"><input id="cx-co-type-episodes" type="checkbox" ${hasType("episodes")?"checked":""}><span class="slider"></span></label></div>
-      </div>`;
+      </div>
+      ${mediaRead||mediaUpdates ? `<div class="panel-title small">Media info</div>` : ""}
+      ${mediaRead ? `<div class="opt-row">
+        <label for="cx-co-media" data-tip-id="cx-co-media">Read from media server</label>
+        <label class="switch"><input id="cx-co-media" type="checkbox" ${co.media_info ? "checked" : ""}><span class="slider"></span></label>
+      </div>` : ""}
+      ${mediaUpdates ? `<div class="opt-row">
+        <label for="cx-co-media-upd" data-tip-id="cx-co-media-upd">Update existing items</label>
+        <label class="switch"><input id="cx-co-media-upd" type="checkbox" ${co.media_updates ? "checked" : ""}><span class="slider"></span></label>
+      </div>` : ""}`;
     applySubDisable("collection");
     applyCollectionTypeRules(state);
     return;
@@ -2221,7 +2234,7 @@ function bindChangeHandlers(state,root){
       if(id==="gl-sus-pct-range"&&n) n.value=String(pct);
       if(id==="gl-sus-pct"&&r) r.value=String(pct);
 
-      const minPrev=Math.max(0,parseInt(Q("#gl-sus-min")?.value||"20",10)||20);
+      const minPrev=Math.min(200,Math.max(0,parseInt(Q("#gl-sus-min")?.value||"20",10)||0));
       const dropOn=!!Q("#gl-drop")?.checked;
       const bb=state.globals?.blackbox||{};
 
@@ -2540,6 +2553,8 @@ function bindChangeHandlers(state,root){
         enable:!!ID("cx-co-enable")?.checked,
         add:!!ID("cx-co-add")?.checked,
         remove:!!ID("cx-co-remove")?.checked,
+        media_info:ID("cx-co-media")?!!ID("cx-co-media").checked:!!prev.media_info,
+        media_updates:ID("cx-co-media-upd")?!!ID("cx-co-media-upd").checked:!!prev.media_updates,
         types
       });
       syncCollectionModeLock(state);
@@ -2565,7 +2580,7 @@ function bindChangeHandlers(state,root){
       if(rangeEl) rangeEl.value=String(pct);
       if(numEl) numEl.value=String(pct);
 
-      const minPrev=Math.max(0,parseInt(Q("#gl-sus-min")?.value||"20",10)||20);
+      const minPrev=Math.min(200,Math.max(0,parseInt(Q("#gl-sus-min")?.value||"20",10)||0));
       syncGlobalsUI();
       const dropOn=!!Q("#gl-drop")?.checked;
       const adv=ID("gl-drop-adv");
@@ -2667,7 +2682,7 @@ async function saveConfigBits(state){
       if(!Number.isFinite(pct)) pct=10;
       pct=Math.min(50,Math.max(1,pct));
       const runtime={
-        suspect_min_prev: Math.max(0, parseInt(ID("gl-sus-min")?.value||"20",10)||20),
+        suspect_min_prev: Math.min(200, Math.max(0, parseInt(ID("gl-sus-min")?.value||"20",10)||0)),
         suspect_shrink_ratio: pct/100
       };
 

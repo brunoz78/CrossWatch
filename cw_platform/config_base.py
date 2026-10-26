@@ -640,7 +640,12 @@ DEFAULT_CFG: dict[str, Any] = {
     "api_key": "",                                      # v3 API Key (required)
     "session_id": "",                                   # v3 Session ID (filled after Connect)
     "account_id": "",                                   # v3 Account ID (auto-filled)
+    "read_token": "",                                   # v4 API Read Access Token (needed for lists)
+    "access_token": "",                                 # v4 user access token (filled after Connect)
+    "account_object_id": "",                            # v4 Account ID (auto-filled)
+    "v4_session_ref": "",                               # Ties the v4 token to the session it was created with
     "_pending_request_token": "",                       # Temporary token waiting for approval
+    "_pending_v4": False,                               # Pending token came from the v4 flow
     "_pending_created_at": 0,                           # Epoch when request token was created
     "timeout": 15.0,
     "max_retries": 3,
@@ -1025,7 +1030,7 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "emby": {"access_token", "api_key", "password"},
         "kodi": {"password"},
         "tmdb": {"api_key"},
-        "tmdb_sync": {"api_key", "session_id", "_pending_request_token"},
+        "tmdb_sync": {"api_key", "session_id", "_pending_request_token", "read_token", "access_token", "_pending_access_token"},
         "assistant": {"api_key"},
     }
 
@@ -1534,6 +1539,9 @@ def _normalize_collection_feature(val: dict[str, Any]) -> dict[str, Any]:
     v["enable"] = bool(v.get("enable", False))
     v["add"] = bool(v.get("add", False))
     v["remove"] = bool(v.get("remove", False))
+    for flag in ("media_info", "media_updates"):
+        if flag in v:
+            v[flag] = bool(v.get(flag))
 
     raw_types = _as_list(v.get("types"))
     types = [str(t).strip().lower() for t in raw_types]
@@ -1604,7 +1612,12 @@ def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
     t["api_key"] = str(t.get("api_key") or "").strip()
     t["session_id"] = str(t.get("session_id") or "").strip()
     t["account_id"] = str(t.get("account_id") or "").strip()
+    t["read_token"] = str(t.get("read_token") or "").strip()
+    t["access_token"] = str(t.get("access_token") or "").strip()
+    t["account_object_id"] = str(t.get("account_object_id") or "").strip()
+    t["v4_session_ref"] = str(t.get("v4_session_ref") or "").strip()
     t["_pending_request_token"] = str(t.get("_pending_request_token") or "").strip()
+    t["_pending_v4"] = bool(t.get("_pending_v4"))
     try:
         t["_pending_created_at"] = int(t.get("_pending_created_at") or 0)
     except Exception:
@@ -1623,7 +1636,11 @@ def _normalize_tmdb_sync(cfg: dict[str, Any]) -> None:
     if not t["api_key"]:
         t["session_id"] = ""
         t["account_id"] = ""
+        t["access_token"] = ""
+        t["account_object_id"] = ""
+        t["v4_session_ref"] = ""
         t["_pending_request_token"] = ""
+        t["_pending_v4"] = False
         t["_pending_created_at"] = 0
 
 

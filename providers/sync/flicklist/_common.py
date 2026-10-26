@@ -29,6 +29,9 @@ URL_LIST_ITEMS = f"{API_V3_BASE}/sync/lists/{{id}}/items"
 URL_SCROBBLE = f"{API_V3_BASE}/scrobble/{{action}}"
 URL_UP_NEXT = f"{API_V3_BASE}/sync/up_next"
 URL_UP_NEXT_DROP = f"{API_V3_BASE}/sync/up_next/drop"
+URL_COLLECTION = f"{API_V3_BASE}/sync/collection"
+URL_COLLECTION_MOVIES = f"{API_V3_BASE}/sync/collection/movies"
+URL_COLLECTION_SHOWS = f"{API_V3_BASE}/sync/collection/shows"
 
 BULK_MAX = 1000
 UP_NEXT_PAGE_SIZE = 100
@@ -293,8 +296,14 @@ def _write_ids_from(src: Mapping[str, Any], *, prefer_show: bool = False) -> dic
     return out
 
 
-def write_ident(item: Mapping[str, Any]) -> dict[str, Any] | None:
+def write_ident(item: Mapping[str, Any], *, seasons: bool = False) -> dict[str, Any] | None:
     typ = norm_write_type(item.get("type"))
+    if norm_read_type(item.get("type")) == "season":
+        season = as_int(item.get("season") if item.get("season") is not None else item.get("season_number"))
+        ids = _write_ids_from(item, prefer_show=True) if seasons else {}
+        if not ids or season is None:
+            return None
+        return {"ids": ids, "media_type": "show", "season": season}
     is_episode = norm_read_type(item.get("type")) == "episode" or item.get("season") is not None or item.get("episode") is not None
     ids = _write_ids_from(item, prefer_show=is_episode)
     if not ids:
@@ -311,7 +320,7 @@ def write_ident(item: Mapping[str, Any]) -> dict[str, Any] | None:
     return payload
 
 
-def read_minimal(row: Mapping[str, Any], *, default_type: str = "movie") -> dict[str, Any] | None:
+def read_minimal(row: Mapping[str, Any], *, default_type: str = "movie", seasons: bool = False) -> dict[str, Any] | None:
     ids = ids_from_flicklist(row.get("ids") if isinstance(row.get("ids"), Mapping) else {})
     if not ids:
         return None
@@ -338,6 +347,10 @@ def read_minimal(row: Mapping[str, Any], *, default_type: str = "movie") -> dict
         ep_name = str(row.get("episode_name") or "").strip()
         if ep_name:
             out["title"] = ep_name
+        if title:
+            out["series_title"] = title
+    elif seasons and typ == "show" and season is not None and episode is None:
+        out = {"type": "season", "show_ids": dict(out["ids"]), "season": season, **{k: v for k, v in out.items() if k not in ("type", "ids")}}
         if title:
             out["series_title"] = title
     return id_minimal(out)
@@ -436,7 +449,7 @@ def percent_of(item: Mapping[str, Any]) -> float | None:
 
 
 _WRITE_ID_ORDER = ("fldb", "tmdb", "imdb", "tvdb")
-_ADD_COUNTERS = ("added", "existing", "restored")
+_ADD_COUNTERS = ("added", "existing", "restored", "updated")
 _REMOVE_COUNTERS = ("removed",)
 
 
@@ -457,7 +470,7 @@ def _ident_tokens(row: Mapping[str, Any]) -> set[str]:
     ids = _norm_write_ids(row.get("ids"))
     season = as_int(row.get("season"))
     episode = as_int(row.get("episode"))
-    frag = f"#s{season}e{episode}" if season is not None and episode is not None else ""
+    frag = f"#s{season}e{episode}" if season is not None and episode is not None else (f"#s{season}" if season is not None else "")
     return {f"{key}:{value}{frag}" for key, value in ids.items()}
 
 
@@ -606,6 +619,9 @@ __all__ = [
     "DEFAULT_POST_PER_SEC",
     "DEFAULT_TIMEOUT",
     "FlickListError",
+    "URL_COLLECTION",
+    "URL_COLLECTION_MOVIES",
+    "URL_COLLECTION_SHOWS",
     "URL_HISTORY",
     "URL_LIST",
     "URL_LISTS",

@@ -12,6 +12,8 @@ const RATINGS_TYPE_RULES = {
   MYANIMELIST: { disable: ["seasons", "episodes"] },
   KITSU: { disable: ["seasons", "episodes"] },
   STREMIO: { disable: ["seasons", "episodes"] },
+  KODI: { disable: ["shows", "seasons"] },
+  PUBLICMETADB: { disable: ["seasons"] },
 };
 
 const COLLECTION_TYPES = {
@@ -25,9 +27,10 @@ const COLLECTION_TYPES = {
   PUNCHPLAY: ["movies", "shows", "seasons"],
   FLOPPY: ["movies", "shows", "seasons", "episodes"],
   SCROB: ["movies", "shows", "seasons", "episodes"],
+  FLICKLIST: ["movies", "shows", "seasons", "episodes"],
 };
-const COLLECTION_SOURCES = new Set(["PLEX", "EMBY", "JELLYFIN", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB"]);
-const COLLECTION_TARGETS = new Set(["TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB"]);
+const COLLECTION_SOURCES = new Set(["PLEX", "EMBY", "JELLYFIN", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
+const COLLECTION_TARGETS = new Set(["TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
 const COLLECTION_ORDER = ["movies", "shows", "seasons", "episodes"];
 
 function providerKey(value) {

@@ -1322,6 +1322,47 @@
     return providerChipStrip(entries, "cw-profile-provider-badge cw-profile-provider-badge--icon");
   }
 
+  const QUALITY_RESOLUTION = { uhd_4k: "Ultra HD 4K", hd_1080p: "1080p", hd_1080i: "1080i", hd_720p: "720p", sd_576p: "576p", sd_576i: "576i", sd_480p: "480p", sd_480i: "480i" };
+  const QUALITY_HDR = { dolby_vision: ["DV", "Dolby Vision"], hdr10_plus: ["HDR10+", "HDR10+"], hdr10: ["HDR10", "HDR10"], hlg: ["HLG", "HLG"] };
+  const QUALITY_AUDIO = {
+    dolby_atmos: "Dolby TrueHD Atmos", dolby_digital_plus_atmos: "Dolby Digital Plus Atmos", dolby_truehd: "Dolby TrueHD", dolby_digital_plus: "Dolby Digital Plus",
+    dolby_digital: "Dolby Digital", dolby_prologic: "Dolby Pro Logic", dts_x: "DTS:X", dts_ma: "DTS-HD MA", dts_hr: "DTS-HD HRA", dts: "DTS", auro_3d: "Auro-3D",
+    lpcm: "LPCM", flac: "FLAC", aac: "AAC", mp3: "MP3", mp2: "MP2", ogg: "Ogg", ogg_opus: "Opus", wma: "WMA",
+  };
+  const QUALITY_FORMAT = { "4k_bluray": "4K Blu-ray", bluray: "Blu-ray", hd_dvd: "HD DVD", dvd: "DVD", digital: "Digital", vhs: "VHS", laserdisc: "LaserDisc", vcd: "VCD", betamax: "Betamax" };
+  const QUALITY_LOGOS = {
+    uhd: ["4k-uhd.svg", 14.9], uhd_bluray: ["uhd-bluray.svg", 12], bluray: ["bluray.svg", 16.4], dvd: ["dvd.svg", 12.6],
+    dolby_vision: ["dolby-vision.svg", 8.2], hdr10_plus: ["hdr10-plus.svg", 12.8], hdr10: ["hdr10.svg", 11.9],
+    atmos: ["dolby-atmos.svg", 10.1], dts_x: ["dts-x.png", 11.5],
+  };
+
+  function collectionQuality(item) {
+    const media = item?.media_info && typeof item.media_info === "object" ? item.media_info : {};
+    const fmt = String(item?.format || "").toLowerCase();
+    const res = String(media.resolution || "");
+    const hdr = QUALITY_HDR[String(media.hdr || "")];
+    const audio = String(media.audio || "");
+    const physical = !!QUALITY_FORMAT[fmt] && fmt !== "digital";
+    const fourK = res === "uhd_4k" || fmt === "4k_bluray";
+    const segments = [];
+    const disc = physical ? (fourK && (fmt === "bluray" || fmt === "4k_bluray") ? "uhd_bluray" : fmt) : "";
+    if (physical) segments.push({ label: (fmt === "bluray" && fourK ? "4K Blu-ray" : QUALITY_FORMAT[fmt]).toUpperCase(), logo: QUALITY_LOGOS[disc], disc: true });
+    else if (fourK) segments.push({ label: "4K", logo: QUALITY_LOGOS.uhd });
+    if (hdr) segments.push({ label: hdr[0], logo: QUALITY_LOGOS[media.hdr] });
+    if (audio === "dolby_atmos" || audio === "dolby_digital_plus_atmos") segments.push({ label: "ATMOS", logo: QUALITY_LOGOS.atmos });
+    else if (audio === "dts_x") segments.push({ label: "DTS:X", logo: QUALITY_LOGOS.dts_x });
+    if (!segments.length) return null;
+    const video = [fourK ? QUALITY_RESOLUTION.uhd_4k : QUALITY_RESOLUTION[res], hdr?.[1]].filter(Boolean).join(" · ");
+    const sound = [[QUALITY_AUDIO[audio], media.audio_channels].filter(Boolean).join(" "), QUALITY_FORMAT[fmt] && (fmt === "bluray" && fourK ? "4K Blu-ray" : QUALITY_FORMAT[fmt])].filter(Boolean).join(" · ");
+    const segmentHtml = (seg) => seg.logo
+      ? `<span class="cw-collection-quality-seg is-logo"><img class="cw-collection-quality-logo" src="/assets/img/quality/${esc(seg.logo[0])}" style="--q-h:${Number(seg.logo[1]) || 10}" alt="${esc(seg.label)}" loading="lazy" decoding="async"></span>`
+      : `<span class="cw-collection-quality-seg">${esc(seg.label)}</span>`;
+    const discIcon = physical && !QUALITY_LOGOS[disc] ? `<span class="material-symbols-rounded" aria-hidden="true">album</span>` : "";
+    const pill = `<span class="cw-collection-quality">${discIcon}${segments.slice(0, 3).map(segmentHtml).join("")}</span>`;
+    const tip = `<span class="cw-collection-quality-tip" aria-hidden="true">${video ? `<strong>${esc(video)}</strong>` : ""}${sound ? `<span>${esc(sound)}</span>` : ""}</span>`;
+    return { html: pill + (video || sound ? tip : ""), label: [video, sound].filter(Boolean).join(", ") };
+  }
+
   function collectionCard(item) {
     const key = storePosterItem(item);
     const [icon, kind] = collectionKind(item);
@@ -1333,9 +1374,12 @@
     const art = poster(item, "w342");
     const providerStrip = collectionProviderStrip(item);
     const meta = [kind, episode || year, when, collectionLibrarySummary(item)].filter(Boolean).join(" · ");
-    const inner = `<span class="cw-collection-poster">
+    const quality = collectionQuality(item);
+    const ariaTitle = quality?.label ? `${title}, ${quality.label}` : title;
+    const inner = `<span class="cw-collection-poster${quality ? " has-quality" : ""}">
         <img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg'">
         <span class="cw-collection-badge"><span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>${esc(kind)}</span>
+        ${quality ? quality.html : ""}
       </span>
       <span class="cw-collection-info">
         <strong class="cw-collection-name">${esc(title)}</strong>
@@ -1345,11 +1389,11 @@
     const selectKey = collectionSelectable() ? String(item?.key || "") : "";
     if (selectKey) {
       return `<article class="cw-collection-card cw-tl-card${collectionState.selected.has(selectKey) ? " is-selected" : ""}" data-collection-key="${esc(selectKey)}">
-      <button class="cw-collection-open" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(title)}">${inner}</button>
+      <button class="cw-collection-open" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(ariaTitle)}">${inner}</button>
       ${collectionSelectBox(selectKey)}
     </article>`;
     }
-    return `<button class="cw-collection-card" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(title)}">${inner}</button>`;
+    return `<button class="cw-collection-card" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(ariaTitle)}">${inner}</button>`;
   }
 
   const collectionSelectable = () => canWriteRecords();
@@ -1424,15 +1468,17 @@
 
   function removeCollectionSelection() {
     if (!collectionSelectable() || !collectionState.selected.size) return;
+    const keys = new Set(collectionState.selected.keys());
     recordRemoval.open({
       kind: "collection",
       mode: "editor",
       noun: "title",
       entries: [...collectionState.selected.values()],
+      cards: () => [...($("#profile-collection-grid")?.querySelectorAll("article[data-collection-key]") || [])].filter((node) => keys.has(node.dataset.collectionKey)),
       trigger: $("#profile-collection-bulk")?.querySelector("[data-collection-remove]"),
       onDone: async (clean) => {
         if (clean) collectionState.selected.clear();
-        await loadCollection();
+        await loadCollection({ quiet: true });
       },
     });
   }
@@ -1874,12 +1920,12 @@
     $("#profile-panel-collection")?.scrollIntoView({ block: "start", behavior: "smooth" });
   }
 
-  async function loadCollection({ reset = false, month = "" } = {}) {
+  async function loadCollection({ reset = false, month = "", quiet = false } = {}) {
     if (collectionState.loading) return;
     if (reset) collectionState.page = 1;
     collectionState.items = [];
     const skeletonGrid = $("#profile-collection-grid");
-    if (skeletonGrid) {
+    if (skeletonGrid && !quiet) {
       skeletonGrid.dataset.view = collectionState.view === "list" ? "list" : "grid";
       skeletonGrid.innerHTML = collectionState.view === "list" ? skeleton("collectionRow", 6) : skeleton("collection", 7);
     }
@@ -2146,6 +2192,36 @@
       : "";
     const label = sinks.length ? `Sent to ${numberFmt.format(sinks.length)}` : "Not sent";
     return `<span class="cw-hist-route${sinks.length ? "" : " is-unsent"}">${from}${to}<span class="cw-hist-coverage-label">${esc(label)}</span></span>`;
+  }
+
+  const RECORD_PHASE_WORKING = { remove: "Removing…", remove_progress: "Removing…", mark_watched: "Marking watched…", update_progress: "Updating…" };
+  const RECORD_PHASE_DONE = { remove: ["delete", "Removed"], remove_progress: ["delete", "Removed"], mark_watched: ["check_circle", "Watched"] };
+
+  function setRecordPhase(node, phase = "", action = "remove") {
+    if (!node) return;
+    const label = phase === "working" ? ["progress_activity", RECORD_PHASE_WORKING[action] || "Working…"]
+      : phase === "leaving" ? RECORD_PHASE_DONE[action]
+      : phase === "failed" ? ["error", "Failed"] : null;
+    const current = label ? phase : "";
+    node.dataset.recordPhase = current;
+    node.dataset.recordPhaseAction = current ? action : "";
+    node.setAttribute("aria-busy", String(current === "working"));
+    const host = node.matches(".cw-hist-card, .cw-collection-card") ? node.querySelector(".cw-hist-art, .cw-collection-poster") : null;
+    let overlay = host?.querySelector(":scope > .cw-record-pending");
+    if (!current) {
+      overlay?.remove();
+      return;
+    }
+    if (!host) return;
+    if (!overlay) {
+      overlay = document.createElement("span");
+      overlay.className = "cw-record-pending";
+      overlay.setAttribute("aria-hidden", "true");
+      overlay.innerHTML = `<span class="material-symbols-rounded"></span><strong></strong>`;
+      host.appendChild(overlay);
+    }
+    overlay.querySelector(".material-symbols-rounded").textContent = label[0];
+    overlay.querySelector("strong").textContent = label[1];
   }
 
   function timelineArt(item) {
@@ -2547,15 +2623,18 @@
       clearTimeout(state.feedbackTimer);
       state.outcome = "";
       state.busy = true;
+      const markCards = (phase) => (ctx.cards?.() || []).forEach((card) => setRecordPhase(card, phase));
       part("error").textContent = "";
       part("result").innerHTML = `<div class="cw-tl-remove-line is-running"><span class="material-symbols-rounded" aria-hidden="true">progress_activity</span><span>Removing from ${count(targets.length)} provider profile${targets.length === 1 ? "" : "s"}...</span></div>`;
       render();
+      markCards("working");
       let rows = null;
       try {
         rows = ctx.mode === "watchlist" ? await removeWatchlist(targets) : await removeEditor(ctx, targets);
         const removed = rows.reduce((sum, row) => sum + row.removed, 0);
         const clean = removed > 0 && rows.length === targets.length && rows.every((row) => !row.error && !row.unresolved && !row.skipped);
         state.outcome = clean ? "success" : "failure";
+        markCards(removed ? "leaving" : "failed");
         part("result").innerHTML = resultHtml(rows);
         syncActions();
         toast(removed ? `Removed ${count(removed)} record${removed === 1 ? "" : "s"}` : "Nothing was removed", !removed);
@@ -2572,6 +2651,7 @@
         }
       } catch (e) {
         state.outcome = "failure";
+        markCards("failed");
         part("error").textContent = e.message || "Removal failed";
         if (!rows) part("result").innerHTML = "";
       } finally {
@@ -2580,6 +2660,7 @@
         state.feedbackTimer = setTimeout(() => {
           state.outcome = "";
           syncActions();
+          markCards("");
         }, 2000);
       }
     }
@@ -3033,15 +3114,17 @@
 
     function removeSelected() {
       if (!selectable() || !state.selected.size) return;
+      const keys = new Set(state.selected.keys());
       recordRemoval.open({
         kind: meta().removeKind,
         mode: cfg.removeMode || "editor",
         noun: meta().noun,
         entries: [...state.selected.values()],
+        cards: () => [...(q("list")?.querySelectorAll("article[data-timeline-key]") || [])].filter((node) => keys.has(node.dataset.timelineKey)),
         trigger: q("bulk")?.querySelector("[data-timeline-remove]"),
         onDone: async (clean) => {
           if (clean) state.selected.clear();
-          await load();
+          await load({ quiet: true });
         },
       });
     }
@@ -3277,11 +3360,11 @@
       } catch {}
     }
 
-    async function load({ reset = false, month = "", scroll = false } = {}) {
+    async function load({ reset = false, month = "", scroll = false, quiet = false } = {}) {
       if (reset) state.page = 1;
       const seq = ++state.seq;
       const host = q("list");
-      if (host) {
+      if (host && !quiet) {
         timelineImages.release(host);
         host.dataset.view = state.view;
         host.innerHTML = `<div class="cw-hist-day-body">${state.view === "list" ? skeleton("collectionRow", 6) : skeleton("historyCard", 8)}</div>`;
@@ -3638,6 +3721,8 @@
       items: [],
       providers: [],
       errors: [],
+      loading: [],
+      loadingTimer: 0,
       summary: {},
       selected: new Map(),
       filters: { provider: "", type: "", progress: "", age: "", sort: "last_updated", search: "" },
@@ -3831,6 +3916,7 @@
       const configured = state.providers.filter((p) => p.configured && p.read);
       if (!configured.length) return "Connect a compatible provider to see playback progress.";
       if (!configured.some((p) => p.included !== false)) return "Enable at least one provider profile under Providers.";
+      if (state.loading.length) return "Still waiting for a provider to respond.";
       return state.errors.length ? "No playback records could be loaded." : "Nothing unfinished right now.";
     }
 
@@ -3890,6 +3976,12 @@
       });
       panel()?.querySelectorAll("[data-playback-bulk-select], [data-playback-select]").forEach((control) => {
         control.disabled = !!pending;
+      });
+      q("list")?.querySelectorAll("article[data-playback-key]").forEach((node) => {
+        const key = node.dataset.playbackKey;
+        const result = feedback?.results.get(key) || "";
+        if (result) setRecordPhase(node, result === "success" ? "leaving" : "failed", feedback.action);
+        else setRecordPhase(node, pending?.sent && pending.keys.has(key) ? "working" : "", pending?.action);
       });
       renderSync();
     }
@@ -3951,11 +4043,12 @@
       const summary = state.summary || {};
       const readable = state.providers.filter((p) => p.read && p.configured && p.included !== false).length;
       const failing = new Set(state.errors.map((error) => `${error.provider}:${error.instance_id}`)).size;
+      const pending = state.loading.length;
       host.innerHTML = [
         tile("violet", "play_circle", "Unfinished", "Across your players", count(summary.total ?? state.total)),
         tile("green", "flag", "Almost done", "90% or more watched", count(summary.almost_done), { key: "progress", value: "90:100" }),
         tile("amber", "hourglass_bottom", "Stale", "Paused over 30 days", count(summary.stale), { key: "age", value: "older_30d" }),
-        tile(failing ? "red" : "blue", "hub", "Providers", failing ? `${count(failing)} need attention` : "All responding", `${count(Math.max(0, readable - failing))}/${count(readable)}`),
+        tile(failing ? "red" : "blue", "hub", "Providers", failing ? `${count(failing)} need attention` : pending ? `${count(pending)} still loading` : "All responding", `${count(Math.max(0, readable - failing - pending))}/${count(readable)}`),
       ].join("");
     }
 
@@ -4012,7 +4105,7 @@
       const host = q("errors");
       const status = q("status");
       if (!host) return;
-      if (!state.errors.length) {
+      if (!state.errors.length && !state.loading.length) {
         host.hidden = true;
         host.innerHTML = "";
         if (status) delete status.dataset.issues;
@@ -4029,9 +4122,16 @@
         </span>`;
       }).join("");
       const more = state.errors.length > 6 ? `<span class="cw-play-error-more">+${count(state.errors.length - 6)} more</span>` : "";
-      host.innerHTML = `${chips}${more}`;
+      const loading = state.loading.map((entry) => {
+        const logo = entry?.provider ? providerLogLogo(entry.provider) : "";
+        return `<span class="cw-play-error is-loading" title="Still waiting for this provider">
+          ${logo ? `<img src="${esc(logo)}" alt="" onerror="this.remove()">` : ""}
+          <strong>${esc(errorName(entry))}</strong><span>Loading…</span><span class="cw-play-sync-dot" aria-hidden="true"></span>
+        </span>`;
+      }).join("");
+      host.innerHTML = `${loading}${chips}${more}`;
       host.hidden = false;
-      if (status) status.dataset.issues = partial ? "partial" : "failed";
+      if (status) status.dataset.issues = state.errors.length ? (partial ? "partial" : "failed") : "loading";
     }
 
     function syncLabel() {
@@ -4048,9 +4148,9 @@
     function renderSync() {
       const host = q("sync");
       if (host) {
-        host.dataset.state = state.busy ? "refreshing" : state.failed ? "failed" : "ready";
+        host.dataset.state = state.busy || state.loading.length ? "refreshing" : state.failed ? "failed" : "ready";
         const label = host.querySelector("strong");
-        if (label) label.textContent = state.busy ? "refreshing" : syncLabel();
+        if (label) label.textContent = state.busy ? "refreshing" : state.loading.length ? "loading" : syncLabel();
       }
       const refresh = q("refresh");
       if (refresh) {
@@ -4136,9 +4236,10 @@
       return params.toString();
     }
 
-    async function load({ force = false, scroll = false, month = "" } = {}) {
+    async function load({ force = false, scroll = false, month = "", background = false } = {}) {
+      clearTimeout(state.loadingTimer);
       const seq = ++state.seq;
-      state.busy = true;
+      state.busy = !background;
       renderSync();
       const host = q("list");
       if (host && !state.loaded) {
@@ -4146,14 +4247,16 @@
         host.dataset.view = state.view;
         host.innerHTML = `<div class="cw-hist-day-body">${state.view === "list" ? skeleton("collectionRow", 6) : skeleton("historyCard", 8)}</div>`;
       }
-      host?.setAttribute("aria-busy", "true");
-      const data = await request(`/api/playback_progress/items?${query({ force, month })}`);
+      if (!background) host?.setAttribute("aria-busy", "true");
+      const data = await request(`/api/playback_progress/items?${query({ force, month })}&progressive=true`);
       if (seq !== state.seq) return;
       state.busy = false;
       host?.removeAttribute("aria-busy");
       state.items = Array.isArray(data.items) ? data.items : [];
       if (Array.isArray(data.providers)) state.providers = data.providers;
       state.errors = Array.isArray(data.errors) ? data.errors : [];
+      state.loading = Array.isArray(data.loading) ? data.loading : [];
+      if (state.loading.length) state.loadingTimer = setTimeout(() => void load({ background: true }), 1500);
       if (data.ok === false && !state.errors.length) {
         state.errors = [{ provider: "", provider_label: "Playback", message: data.message || data.error || "Request failed.", retryable: true }];
       }
@@ -4308,6 +4411,8 @@
           const note = skipped ? ` ${skipped} unsupported record${skipped === 1 ? "" : "s"} will be skipped.` : "";
           if (!window.confirm(`${actionTitle(action)} for ${payloads.length} provider record${payloads.length === 1 ? "" : "s"}?${note}`)) return;
         }
+        state.pendingAction.sent = true;
+        syncActionUI();
         let succeeded = false;
         if (payloads.length === 1 && items.length === 1 && !items[0].is_combined) {
           const urls = {
@@ -4334,7 +4439,7 @@
         if (!succeeded) return;
         await new Promise((resolve) => setTimeout(resolve, 750));
         items.forEach((item) => state.selected.delete(keyOf(item)));
-        await load({ force: true });
+        await load({ background: true });
       } catch (error) {
         if (!state.actionFeedback) showActionResult(action, items, payloads, [], confirmFirst);
         toast(error?.message || "Could not complete the action. Refresh to check its result.", true);
@@ -4616,6 +4721,22 @@
   }
 
   function wireTabs() {
+    const tabs = document.querySelector('.cw-profile-tabs');
+    const mobileView = document.createElement('label');
+    mobileView.className = 'cw-profile-mobile-view';
+    mobileView.innerHTML = '<span>View</span><select aria-label="Profile section"></select>';
+    const mobileSelect = mobileView.querySelector('select');
+    tabs?.before(mobileView);
+    const syncMobileView = () => {
+      const buttons = Array.from(document.querySelectorAll('[data-profile-tab]'));
+      mobileSelect.replaceChildren(...buttons.filter(btn => !btn.hidden && !(btn.dataset.profileTab === 'account' && viewingAs())).map(btn => {
+        const option = document.createElement('option');
+        option.value = btn.dataset.profileTab;
+        option.textContent = btn.id === 'profile-tab-account' ? 'Settings' : btn.textContent.trim();
+        return option;
+      }));
+      mobileSelect.value = buttons.find(btn => btn.classList.contains('active'))?.dataset.profileTab || 'overview';
+    };
     const tabFromHash = () => {
       const raw = profileRouteSegment(String(window.location?.hash || "").replace(/^#\/?/, "").split("?")[0].split("/")[0]);
       const key = raw === "security" || raw === "preferences" ? "account" : raw;
@@ -4627,6 +4748,7 @@
       if (!btn) return false;
       document.querySelectorAll("[data-profile-tab]").forEach((tab) => tab.classList.toggle("active", tab === btn));
       document.querySelectorAll(".cw-profile-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `profile-panel-${key}`));
+      syncMobileView();
       if (key === "collection" && !collectionState.loaded) void loadCollection({ reset: true });
       if (key === "history") historyPanel.open(opts);
       if (key === "ratings") ratingsPanel.open(opts);
@@ -4639,6 +4761,11 @@
         selectTab(btn.dataset.profileTab);
       });
     });
+    mobileSelect.addEventListener('change', () => {
+      if (!selectTab(mobileSelect.value)) syncMobileView();
+    });
+    if (tabs) new MutationObserver(syncMobileView).observe(tabs, {subtree: true, attributes: true, attributeFilter: ['hidden']});
+    syncMobileView();
     window.addEventListener("hashchange", () => {
       const key = tabFromHash();
       if (key) selectTab(key, { fromHash: true });

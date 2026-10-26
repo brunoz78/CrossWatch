@@ -219,6 +219,7 @@ def select_baseline_keys(success_keys, result) -> list:
 
 from ..provider_instances import normalize_instance_id
 
+from ..collection_media import media_update as _collection_media_update
 from ..id_map import migrate_media_index, minimal as _minimal, canonical_key as _ck, merge_ids as _merge_ids, _norm_type, part_fragment as _part_fragment
 from ..history_events import has_history_watch, history_sync_key, minimal_history_item
 from ..anime_mapping.service import (
@@ -253,6 +254,8 @@ from ._tombstones import clear_items_for_feature, media_tombstone_tokens
 from ._pairs_utils import (
     ratings_step_for,
     ratings_zero_for,
+    collection_media_updates_for,
+    declared_types_for,
     config_with_pair_libraries as _config_with_pair_libraries,
     _supports_feature,
     _resolve_flags,
@@ -268,7 +271,7 @@ from ._pairs_utils import (
 from ._pairs_massdelete import maybe_block_mass_delete as _maybe_block_mass_delete
 from ._pairs_blocklist import apply_blocklist
 from ._specials import filter_specials_index, specials_excluded
-from ._dropped import apply_dropped_tags, matches_dropped_show as _matches_dropped_show, preview_dropped_tags, provider_dropped_mode, reads_dropped, tags_dropped
+from ._dropped import apply_dropped_tags, matches_dropped_show as _matches_dropped_show, preview_dropped_tags, provider_dropped_mode, reads_dropped, tags_dropped, with_written
 from .. import library_presence as _library_presence
 from ._history_rewatches import (
     collapse_history_latest,
@@ -674,7 +677,7 @@ def _bucket_ts(ts: int, bucket_sec: int) -> int:
     return (int(ts) // b) * b
 
 # Feature-specific filters
-def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[str, Any]:
+def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any], allowed_types: set[str] | None = None) -> dict[str, Any]:
     alias = {"movies":"movie","movie":"movie","shows":"show","show":"show","anime":"show","animes":"show",
              "episodes":"episode","episode":"episode","ep":"episode","eps":"episode"}
     types_raw = [str(t).strip().lower() for t in (fcfg.get("types") or []) if isinstance(t, (str, bytes))]
@@ -685,6 +688,8 @@ def _ratings_filter_index(idx: dict[str, Any], fcfg: Mapping[str, Any]) -> dict[
         vt = alias.get(str(v.get("type","")).strip().lower(),
                        str(v.get("type","")).strip().lower().rstrip("s"))
         if types and vt not in types:
+            return False
+        if allowed_types is not None and vt not in allowed_types:
             return False
         if from_date:
             ra = (v.get("rated_at") or v.get("ratedAt") or "").strip()
@@ -1338,10 +1343,11 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     matched_history_keys: set[str] = set()
     updates: list[dict[str, Any]] = []
     if feature == "ratings":
-        src_idx  = _ratings_filter_index(src_idx,  fcfg)
-        dst_full = _ratings_filter_index(dst_full, fcfg)
+        dst_types = declared_types_for(dst_ops, "ratings")
+        src_idx  = _ratings_filter_index(src_idx,  fcfg, dst_types)
+        dst_full = _ratings_filter_index(dst_full, fcfg, dst_types)
         if manual_adds:
-            src_idx = _merge_manual_adds(src_idx, manual_adds)
+            src_idx = _ratings_filter_index(_merge_manual_adds(src_idx, manual_adds), {}, dst_types)
         ratings_step = max(ratings_step_for(src_ops), ratings_step_for(dst_ops))
         if ratings_step < 1.0:
             dbg("ratings.step", feature=feature, src=src, dst=dst, step=ratings_step)
@@ -1564,6 +1570,17 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             if coord_pruned:
                 dbg("anime_mapping.coord_pruned", feature=feature, src=src, dst=dst, adds=coord_pruned)
             adds = pruned
+
+    if feature == "collection" and bool((fcfg or {}).get("media_updates")) and collection_media_updates_for(dst_ops):
+        for sv in (src_idx or {}).values():
+            if not isinstance(sv, Mapping) or not (sv.get("media_info") or sv.get("format")):
+                continue
+            dv = _find_in_idx(dst_full, dst_alias, sv)
+            upd = _collection_media_update(sv, dv) if dv else None
+            if upd:
+                updates.append(upd)
+        if updates:
+            dbg("collection.media_updates", src=src, dst=dst, count=len(updates))
 
     removes: list[dict[str, Any]] = []
 
@@ -2242,7 +2259,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     if src_tags_dropped and not (cancelled or src_down or dst_down):
         apply_dropped_tags(
             src=src, dst=dst, src_cfg=src_cfg, dst_ops=dst_ops, dst_cfg=dst_cfg, feature=feature,
-            source=src_idx, source_tokens=src_dropped_tokens, target=dst_full,
+            source=src_idx, source_tokens=src_dropped_tokens, target=with_written(dst_full, adds, post_apply_add_res, _sync_key),
             target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
             dry_run=dry_run_flag, emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst,
         )
