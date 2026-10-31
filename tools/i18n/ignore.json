@@ -320,5 +320,16 @@
  "· S{0}E{1}",
  "/?ui=compact#main",
  "/?ui=full",
- "a, button"
+ "a, button",
+ "?instance={0}",
+ "Kodi TMDBHelper",
+ "MDBList JSON",
+ "Partner",
+ "PIN",
+ "PLEX:",
+ "plugin://plugin.video.themoviedb.helper/?info=mdblist_locallist&&{0}",
+ "SILO",
+ "Silo",
+ "SILOSERVER",
+ "Text"
 ]
