@@ -257,10 +257,10 @@
     const lines = [`Profiles: ${profileIds.map(pretty).join(", ")}`];
     if (Number.isFinite(total) && total > 1) {
       lines.push(Number.isFinite(probed) && probed > 0 && probed < total
-        ? `Checked profiles: ${ok}/${probed}, ${total} total`
+        ? `Checked instances: ${ok}/${probed}, ${total} total`
         : Number.isFinite(ok)
-        ? `Connected profiles: ${ok}/${total}`
-        : `Profile count: ${total}`);
+        ? `Connected instances: ${ok}/${total}`
+        : `Instance count: ${total}`);
     }
     const used = Array.isArray(sum?.used) ? sum.used : [];
     if (used.length) {
@@ -280,6 +280,12 @@
   }
 
   function providerProfileDetail(key, data) {
+    if (up(key) === "SILO" && data && typeof data === "object") {
+      const profileName = txt(data.profile_name);
+      const user = txt(data.username);
+      if (profileName && user) return `Silo profile: ${profileName} (${user})`;
+      return profileName ? `Silo profile: ${profileName}` : "";
+    }
     if (up(key) !== "NUVIO" || !data || typeof data !== "object") return "";
     const name = txt(data.nuvio_profile_name || data.profile_name);
     const id = txt(data.nuvio_profile_id || data.profile_id);
@@ -451,7 +457,7 @@
         const detail = [
           `Provider: ${name}`,
           `Status: ${data?.connected ? "Connected" : "Not connected"}`,
-          instancesDetail(data) || "Profiles: Not reported",
+          instancesDetail(data) || "Instances: Not reported",
           providerProfileDetail(key, data),
           meta.detail,
           usageDetail(data),

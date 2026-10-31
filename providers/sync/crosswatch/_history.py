@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from cw_platform.history_events import history_sync_key, minimal_history_item
+from cw_platform.history_events import has_history_watch, history_sync_key, minimal_history_item
 from cw_platform.id_map import canonical_key
 
 from ._common import (
@@ -105,10 +105,15 @@ def _load_state(adapter: Any) -> dict[str, Any]:
     path = _history_path(adapter)
     raw: Any | None
 
+    unreadable: list[str] = []
+
     def _read_json(p: Path) -> Any | None:
         try:
             return json.loads(p.read_text("utf-8"))
+        except FileNotFoundError:
+            return None
         except Exception:
+            unreadable.append(p.name)
             return None
 
     read_path = state_file_for_read(root, "history", path)
@@ -118,6 +123,9 @@ def _load_state(adapter: Any) -> dict[str, Any]:
         if alt and alt != path:
             raw = _read_json(alt)
     if raw is None and current_state_only(adapter):
+        if unreadable:
+            _warn("state_unreadable", files=unreadable)
+            raise RuntimeError(f"crosswatch_history_state_unreadable:{unreadable[0]}")
         return {"ts": 0, "items": {}}
     if raw is None:
         snap = fallback_snapshot_file(root, "history")
@@ -126,6 +134,9 @@ def _load_state(adapter: Any) -> dict[str, Any]:
             if raw is not None:
                 _warn("state_restored_from_snapshot", snapshot=snap.name)
     if raw is None:
+        if unreadable:
+            _warn("state_unreadable", files=unreadable)
+            raise RuntimeError(f"crosswatch_history_state_unreadable:{unreadable[0]}")
         return {"ts": 0, "items": {}}
 
     if isinstance(raw, list):
@@ -240,7 +251,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             unresolved_src.append(obj)
             continue
         existing = cur.get(key)
-        if not accepted.get("watched_at"):
+        if not has_history_watch(accepted):
             unresolved_src.append(obj)
             continue
         if existing is None or (str(existing.get("watched_at") or "") <= str(accepted.get("watched_at") or "")):

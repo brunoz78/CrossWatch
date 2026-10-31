@@ -20,6 +20,7 @@ const COLLECTION_TYPES = {
   PLEX: ["movies", "shows", "seasons", "episodes"],
   EMBY: ["movies", "shows", "seasons", "episodes"],
   JELLYFIN: ["movies", "shows", "seasons", "episodes"],
+  SILO: ["movies", "shows", "episodes"],
   KODI: ["movies", "episodes"],
   TRAKT: ["movies", "shows", "seasons", "episodes"],
   MDBLIST: ["movies", "shows", "seasons", "episodes"],
@@ -29,7 +30,10 @@ const COLLECTION_TYPES = {
   SCROB: ["movies", "shows", "seasons", "episodes"],
   FLICKLIST: ["movies", "shows", "seasons", "episodes"],
 };
-const COLLECTION_SOURCES = new Set(["PLEX", "EMBY", "JELLYFIN", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
+const COLLECTION_WRITE_TYPES = {
+  FLOPPY: ["movies", "episodes"],
+};
+const COLLECTION_SOURCES = new Set(["PLEX", "EMBY", "JELLYFIN", "SILO", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
 const COLLECTION_TARGETS = new Set(["TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"]);
 const COLLECTION_ORDER = ["movies", "shows", "seasons", "episodes"];
 
@@ -59,6 +63,11 @@ export function sourceWatchStatusAllowed(state) {
   return [state?.src, state?.dst].every(provider => ["simkl", "anilist", "kitsu", "myanimelist"].some(name => same(provider, name)));
 }
 
+export function undatedAsTodayAllowed(state) {
+  const sides = [state?.src, state?.dst];
+  return sides.some(provider => same(provider, "simkl")) && sides.some(provider => ["myanimelist", "kitsu", "crosswatch"].some(name => same(provider, name)));
+}
+
 export function featureAllowedForPair(state, feature) {
   const key = String(feature || "").trim().toLowerCase();
   if (key === "ratings" && (same(state?.src, "stremio") || same(state?.dst, "stremio"))) {
@@ -70,10 +79,15 @@ export function featureAllowedForPair(state, feature) {
   return true;
 }
 
+function collectionWriteTypes(name) {
+  const key = providerKey(name);
+  return COLLECTION_WRITE_TYPES[key] || COLLECTION_TYPES[key] || [];
+}
+
 export function collectionTypesForPair(state) {
   if (!featureAllowedForPair(state, "collection")) return [];
-  const src = COLLECTION_TYPES[providerKey(state?.src)] || [];
-  const dst = COLLECTION_TYPES[providerKey(state?.dst)] || [];
+  const src = isTwoWay(state) ? collectionWriteTypes(state?.src) : (COLLECTION_TYPES[providerKey(state?.src)] || []);
+  const dst = collectionWriteTypes(state?.dst);
   const dstSet = new Set(dst);
   return COLLECTION_ORDER.filter(t => src.includes(t) && dstSet.has(t));
 }
@@ -85,6 +99,9 @@ export function collectionDisabledForPair(state) {
 
 export function sanitizeFeaturesForPair(state, features) {
   const out = features && typeof features === "object" ? features : {};
+  if (out.history && typeof out.history === "object" && !undatedAsTodayAllowed(state)) {
+    delete out.history.undated_as_today;
+  }
   if (!featureAllowedForPair(state, "ratings") && out.ratings && typeof out.ratings === "object") {
     Object.assign(out.ratings, { enable: false, add: false, remove: false });
   }

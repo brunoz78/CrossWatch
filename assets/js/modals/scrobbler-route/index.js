@@ -1,10 +1,11 @@
 /* CrossWatch - Scrobbler Route Modal */
+import { createIdentityMap, identityMapSupported } from "../core/identity-map.js";
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const label = (v) => ({ plex: "Plex", jellyfin: "Jellyfin", emby: "Emby", kodi: "Kodi", trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", crosswatch: "CrossWatch", floppy: "Floppy", punchplay: "PunchPlay", bingebase: "BingeBase", flicklist: "FlickList", wetrakr: "WeTrakr", anilist: "AniList", myanimelist: "MyAnimeList", kitsu: "Kitsu", scrob: "Scrob", stremio: "Stremio" }[String(v || "").toLowerCase()] || String(v || "").toUpperCase());
-const sources = ["plex", "jellyfin", "emby", "kodi", "scrob", "stremio"];
-const sinks = ["myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob"];
-const ratingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob"];
-const mediaSinks = ["plex", "jellyfin", "emby", "kodi"];
+const label = (v) => ({ plex: "Plex", jellyfin: "Jellyfin", emby: "Emby", kodi: "Kodi", trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", crosswatch: "CrossWatch", floppy: "Floppy", punchplay: "PunchPlay", bingebase: "BingeBase", flicklist: "FlickList", wetrakr: "WeTrakr", anilist: "AniList", myanimelist: "MyAnimeList", kitsu: "Kitsu", scrob: "Scrob", stremio: "Stremio", silo: "Silo" }[String(v || "").toLowerCase()] || String(v || "").toUpperCase());
+const sources = ["plex", "jellyfin", "emby", "kodi", "scrob", "stremio", "silo"];
+const sinks = ["myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob", "silo"];
+const ratingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob", "silo"];
+const mediaSinks = ["plex", "jellyfin", "emby", "kodi", "silo"];
 
 function flashCopied(btn) {
   if (!btn) return;
@@ -32,6 +33,7 @@ const lastTab = {};
 let boundRoot = null;
 let clickHandler = null;
 let changeHandler = null;
+let identityMap = null;
 let userProfiles = [];
 let selectedUserProfileId = "";
 const destinationLibraries = new Map();
@@ -162,7 +164,7 @@ function optionsForProfiles(provider, selected, kind) {
   const selectedExists = list.some((p) => p.instance === current);
   const missing = current && !selectedExists ? `<option value="${esc(current)}" selected disabled>${esc(profileLabel(provider, current, kind))} (not configured)</option>` : "";
   const options = list.map((p) => `<option value="${esc(p.instance)}" title="${esc(p.instance)}" ${p.instance === current ? "selected" : ""}>${esc(profileOptionLabel(p))}</option>`).join("");
-  return missing + options || `<option value="">No configured profile</option>`;
+  return missing + options || `<option value="">No configured instance</option>`;
 }
 
 function optionsForProviders(kind, selected, source = "") {
@@ -200,7 +202,7 @@ function userProfileField() {
   if (!current) return "";
   const profile = userProfiles.find((p) => p.id === current);
   if (!profile || !profileCanOwnRoute(profile, draft || {})) return "";
-  return `<div class="scrm-profile-row">${fieldIcon("account_circle", "Assigned profile", `<div class="scrm-profile-display" aria-label="Assigned user profile"><span>${esc(profile.label)}</span></div>`)}</div>`;
+  return `<div class="scrm-profile-row">${fieldIcon("account_circle", "Assigned profile", `<div class="scrm-profile-display" aria-label="Assigned profile"><span>${esc(profile.label)}</span></div>`)}</div>`;
 }
 
 function profileInstanceValues(profile, provider) {
@@ -371,7 +373,7 @@ function routePanel(r) {
     <section class="scrm-panel ${activeTab === "route" ? "active" : ""}" data-panel="route">
       <div class="scrm-journey">
         <span class="material-symbols-rounded scrm-journey-icon">route</span>
-        <div><strong>Choose the source, then send it to a tracker</strong><p>Watcher routes listen to one configured media profile and forward matching play events to one configured destination profile.</p></div>
+        <div><strong>Choose the source, then send it to a tracker</strong><p>Watcher routes listen to one configured media instance and forward matching play events to one configured destination instance.</p></div>
         ${journeyHelp("scrobbler-watcher")}
       </div>
       ${userProfileField()}
@@ -392,6 +394,7 @@ function routePanel(r) {
           </div>
         </div>
       </div>
+      ${matchUsersSupported(r) ? `<div id="scr-identities" class="scrm-identities"></div>` : ""}
     </section>
   `;
 }
@@ -426,6 +429,30 @@ function filterRow(o) {
     </div>`;
 }
 
+function matchUsersSupported(r) {
+  return identityMapSupported(r?.provider, r?.provider_instance, r?.sink, r?.sink_instance);
+}
+
+function mountIdentityMap(r) {
+  const host = root?.querySelector("#scr-identities");
+  identityMap = host ? createIdentityMap(host, {
+    source: r.provider,
+    sourceInstance: r.provider_instance,
+    target: r.sink,
+    targetInstance: r.sink_instance,
+    exclude: props.mode !== "create" && r.id ? `route:${r.id}` : "",
+    intro: `Send each person's plays to their own identity on ${label(r.sink)}.`,
+    note: "Linked identities replace the user filter of this route.",
+    enabled: !!r.match_users,
+    mapping: r.user_matches || {},
+    onChange: (v) => {
+      const d = ensureDraft();
+      d.match_users = v.enabled;
+      d.user_matches = v.mapping;
+    },
+  }) : null;
+}
+
 function filtersPanel(r, f) {
   const isPlex = r.provider === "plex";
   const isStremio = r.provider === "stremio";
@@ -446,7 +473,7 @@ function filtersPanel(r, f) {
     <section class="scrm-panel ${activeTab === "filters" ? "active" : ""}" data-panel="filters">
       <div class="scrm-journey scrm-journey-compact">
         <span class="material-symbols-rounded scrm-journey-icon">filter_alt</span>
-        <div><strong>Only scrobble the activity you want</strong><p>${isStremio ? "The Stremio add-on reports one account, so there is no user filter." : "Leave filters empty to accept every matching event from this source profile."}</p></div>
+        <div><strong>Only scrobble the activity you want</strong><p>${isStremio ? "The Stremio add-on reports one account, so there is no user filter." : "Leave filters empty to accept every matching event from this source instance."}</p></div>
         ${journeyHelp("scrobbler-filters")}
       </div>
       <div class="scrm-filter-rows">${rows.join("")}</div>
@@ -469,7 +496,7 @@ function librariesPanel(r) {
         <div><strong>${esc(label(r.sink))} libraries</strong><p>Only update items in the selected libraries. Leave empty to use the Whitelist libraries of ${esc(label(r.sink))} connection.</p></div>
       </div>
       <div id="scr-destination-libraries"></div>
-      <label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">library_add_check</span><span><strong>Update all copies</strong><small>When the same title exists more than once, for example in a regular and a 4K library, update every copy instead of skipping.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-update-all-copies" ${dest.update_all_copies === false ? "" : "checked"}><span class="scrm-switch-track"></span></span></label>
+      ${r.sink === "silo" ? "" : `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">library_add_check</span><span><strong>Update all copies</strong><small>When the same title exists more than once, for example in a regular and a 4K library, update every copy instead of skipping.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-update-all-copies" ${dest.update_all_copies === false ? "" : "checked"}><span class="scrm-switch-track"></span></span></label>`}
     </section>
   `;
 }
@@ -540,8 +567,8 @@ function optionsPanel(r) {
         ${field("Progress step (%)", `<input class="input" id="scr-progress-step" type="number" min="1" max="25" value="${esc(r.options.scrobble?.progress_step ?? "")}" placeholder="Global">`, "", "Minimum progress change required before sending another watching update. Leave this at the default, as it significantly affects API usage.")}
         ${field("Pause debounce (s)", `<input class="input" id="scr-watch-pause" type="number" min="0" max="3600" value="${esc(r.options.watch?.pause_debounce_seconds ?? "")}" placeholder="Global">`, "", "Seconds to ignore tiny pause/start flaps just after playback starts for this route.")}
         ${field("Suppress start (%)", `<input class="input" id="scr-watch-suppress" type="number" min="0" max="100" value="${esc(r.options.watch?.suppress_start_at ?? "")}" placeholder="Global">`, "", "Ignore new start events at or above this progress for this route.")}
-        ${["emby", "jellyfin", "kodi", "scrob"].includes(r.provider) ? field("Poll interval (s)", `<input class="input" id="scr-watch-poll" type="number" min="5" max="60" value="${esc(r.options.watch?.poll_seconds ?? "")}" placeholder="10">`, "", "Seconds between playback checks while something is playing, from 5 to 60. Higher values lower the load but delay pause and stop detection. Routes sharing this source use the lowest value set.") : ""}
-        ${["emby", "jellyfin", "kodi", "scrob"].includes(r.provider) ? field("Idle poll interval (s)", `<input class="input" id="scr-watch-idle-poll" type="number" min="5" max="120" value="${esc(r.options.watch?.idle_poll_seconds ?? "")}" placeholder="30">`, "", "Seconds between checks while nothing is playing, from 5 to 120. This decides how quickly a new playback is noticed. It never drops below the poll interval. Routes sharing this source use the lowest value set.") : ""}
+        ${["emby", "jellyfin", "kodi", "scrob", "silo"].includes(r.provider) ? field("Poll interval (s)", `<input class="input" id="scr-watch-poll" type="number" min="5" max="60" value="${esc(r.options.watch?.poll_seconds ?? "")}" placeholder="10">`, "", "Seconds between playback checks while something is playing, from 5 to 60. Higher values lower the load but delay pause and stop detection. Routes sharing this source use the lowest value set.") : ""}
+        ${["emby", "jellyfin", "kodi", "scrob", "silo"].includes(r.provider) ? field("Idle poll interval (s)", `<input class="input" id="scr-watch-idle-poll" type="number" min="5" max="120" value="${esc(r.options.watch?.idle_poll_seconds ?? "")}" placeholder="30">`, "", "Seconds between checks while nothing is playing, from 5 to 120. This decides how quickly a new playback is noticed. It never drops below the poll interval. Routes sharing this source use the lowest value set.") : ""}
       </div>
       ${unresolvedFallback}
       ${pkcSupport}
@@ -683,6 +710,7 @@ function render(errors = []) {
   ensureVisiblePanel();
   enableSelectedUnavailableRatingTargets();
   mountDestinationTable();
+  mountIdentityMap(r);
 }
 
 function collect() {
@@ -740,6 +768,8 @@ function collect() {
     sink: sinkEl ? sinkEl.value : draft.sink || "",
     sink_instance: sinkInstanceEl ? sinkInstanceEl.value : draft.sink_instance || "",
     profile_id: selectedUserProfileId || draft.profile_id || "",
+    match_users: !!identityMap?.value.enabled,
+    user_matches: identityMap?.value.enabled ? identityMap.value.mapping : {},
     filters,
     options: {
       auto_remove_watchlist: root.querySelector("#scr-auto")?.value || "inherit",
@@ -764,7 +794,7 @@ async function save(regenerate = false) {
   if (saving) return;
   syncDraftFromDom();
   if (draft.provider === draft.sink && normInst(draft.provider_instance) === normInst(draft.sink_instance)) {
-    render([{ message: "Source and destination must use different providers or profiles" }]);
+    render([{ message: "Source and destination must use different providers or instances" }]);
     return;
   }
   if (duplicateRoute(ensureDraft())) {
@@ -779,6 +809,10 @@ async function save(regenerate = false) {
       ? await request("/api/scrobbler/routes", "POST", body)
       : await request(`/api/scrobbler/routes/${encodeURIComponent(draft.id)}`, "PUT", body);
     props.onSaved?.(data);
+    if (!regenerate) {
+      window.cxCloseModal?.();
+      return;
+    }
     if (data && Array.isArray(data.routes)) props.overview = data;
     props.mode = "edit";
     busy(false);

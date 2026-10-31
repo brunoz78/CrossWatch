@@ -87,7 +87,8 @@ def test_removed_movies_use_stored_ids_and_resolve_plex_guids_once(tmp_path):
     assert all(r["source_path"] == "Plex database" and r["item"]["watched"] for r in result)
 
 
-def test_removed_shows_resolve_once_and_legacy_and_hama_guids_need_no_lookup(tmp_path):
+def test_removed_shows_resolve_once_and_legacy_and_hama_guids_need_no_lookup(tmp_path, monkeypatch):
+    monkeypatch.setattr(recovery, "query_edges", lambda *a, **kw: [])
     path = library(tmp_path / "lib.db", views=[
         episode("plex://episode/1", 1), episode("plex://episode/2", 2), episode("plex://episode/3", 3, season=0),
         episode("com.plexapp.agents.thetvdb://500/2/4?lang=en", None, show="com.plexapp.agents.thetvdb://500?lang=en", season=None,
@@ -123,14 +124,130 @@ def test_titles_readded_under_a_new_guid_still_count_as_in_plex(tmp_path):
     assert events.count("Skipped: still in Plex") == 3
 
 
+@pytest.mark.parametrize("prefix,season,scope", [("anidb-", 2, "R"), ("", 1, "R"), ("anidb-", 0, "S")])
+def test_hama_uses_episode_identity_and_explicit_numbering(tmp_path, monkeypatch, prefix, season, scope):
+    calls = []
+    def edges(tag, provider, ident, **kwargs):
+        calls.append((tag, provider, ident, kwargs["scope"]))
+        return [dict(target_provider="tvdb", target_id="900", target_kind="show", target_scope="s3",
+                     source_range="1-12", target_range="13-24")]
+    monkeypatch.setattr(recovery, "query_edges", edges)
+    path = library(tmp_path / "lib.db", views=[
+        episode(f"com.plexapp.agents.hama://{prefix}123/{season}/2?lang=en", 24, season=2,
+                show="com.plexapp.agents.hama://anidb-456?lang=en")])
+    result, asked = scan(path, release_tag="custom")
+    item = result[0]["item"]
+    assert calls == [("custom", "anidb", "123", scope)]
+    assert (item["show_ids"], item["season"], item["episode"]) == ({"tvdb": "900"}, 3, 14)
+    assert item["watched_at"] == "2023-11-14T22:13:44Z"
+    assert result[0]["recovery_valid"] and not asked
+
+
+@pytest.mark.parametrize("case", ["missing", "ambiguous", "extras", "unknown"])
+def test_unmapped_hama_never_inherits_parent_or_title_matches(tmp_path, monkeypatch, case):
+    rows = [] if case == "missing" else [
+        dict(target_provider="tvdb", target_id=ident, target_kind="show", target_scope="s1",
+             source_range="1-200", target_range="1-200") for ident in ("900", "901")]
+    monkeypatch.setattr(recovery, "query_edges", lambda *a, **kw: rows)
+    guid = "com.plexapp.agents.hama://" + ("unknown-123/1/2" if case == "unknown" else
+                                             "anidb-123/0/101" if case == "extras" else "anidb-123/1/2")
+    path = library(tmp_path / "lib.db", views=[episode(guid, 2, show="tvdb://555")])
+    searches = []
+    result, asked = scan(path, search=lambda item: searches.append(item) or {"tvdb": "777"})
+    assert not result[0]["recovery_valid"]
+    assert result[0]["item"]["show_ids"] == {}
+    assert not searches and not asked
+
+
+def test_hama_tvdb_uses_guid_coordinates(tmp_path):
+    path = library(tmp_path / "lib.db", views=[
+        episode("com.plexapp.agents.hama://tvdb-900/3/14", 2, show="tvdb://555")])
+    result, _ = scan(path)
+    item = result[0]["item"]
+    assert (item["show_ids"], item["season"], item["episode"]) == ({"tvdb": "900"}, 3, 14)
+
+
+def test_hama_matches_do_not_spread_to_other_entries_under_the_same_parent(tmp_path, monkeypatch):
+    def edges(tag, provider, ident, **kwargs):
+        return [dict(target_provider="tvdb", target_id="900", target_kind="show", target_scope="s2",
+                     source_range="1-12", target_range="1-12")] if ident == "123" else []
+    monkeypatch.setattr(recovery, "query_edges", edges)
+    path = library(tmp_path / "lib.db", views=[
+        episode("com.plexapp.agents.hama://anidb-123/1/1", 1, show="tvdb://555"),
+        episode("com.plexapp.agents.hama://anidb-456/1/2", 2, show="tvdb://555")])
+    result, _ = scan(path)
+    assert [r["recovery_valid"] for r in result] == [True, False]
+    assert [r["item"]["show_ids"] for r in result] == [{"tvdb": "900"}, {}]
+
+
+def test_database_title_fallback_requires_review_and_keeps_watch_date(tmp_path):
+    path = library(tmp_path / "lib.db", views=[movie("plex://movie/gone"), movie("imdb://tt1234567")])
+    searches = []
+    result, _ = scan(path, search=lambda item: searches.append(dict(item)) or {"tmdb": "123"})
+    assert len(searches) == 1
+    assert result[0]["item"]["ids"] == {"tmdb": "123"}
+    assert result[0]["recovery_valid"] and result[0]["recovery_requires_review"]
+    assert result[0]["item"]["watched_at"] == "2023-11-14T22:13:20Z"
+    assert not result[1]["recovery_requires_review"]
+
+
+def test_title_matching_reports_remaining_work_until_searches_finish(tmp_path):
+    path = library(tmp_path / "lib.db", views=[movie("plex://movie/one", "One"),
+                                               movie("plex://movie/two", "Two"), movie("imdb://tt1234567")])
+    updates = []
+    searches = []
+
+    def search(item):
+        stage, message, done, total, activity = updates[-1]
+        assert stage == "title_matching"
+        assert (done, total) == (len(searches), 2)
+        assert done < total
+        assert activity["checked"] == 3
+        assert activity["current_item"] == item["title"]
+        searches.append(item["title"])
+        return {"tmdb": "123"} if item["title"] == "One" else {}
+
+    rows, _ = scan(path, search=search, progress=lambda *args: updates.append(args))
+    assert searches == ["One", "Two"]
+    assert len(rows) == 3
+    assert [(u[2], u[3]) for u in updates if u[0] == "title_matching"] == [(0, 2), (1, 2), (1, 2), (2, 2)]
+    assert all(u[4]["current_item"] for u in updates if u[0] == "title_matching")
+    assert updates[-1][4]["current_item"] == "Two"
+    assert updates[-1][4]["current_action"] == "Last checked"
+
+
 def test_library_scope_applies_to_existing_sections_and_keeps_deleted_libraries(tmp_path):
     path = library(tmp_path / "lib.db", views=[
         movie("imdb://tt0000001", "In scope", library_section_id=1), movie("imdb://tt0000002", "Out of scope", library_section_id=2),
         movie("imdb://tt0000003", "Deleted library", library_section_id=99), movie("imdb://tt0000004", "No library", library_section_id=None)])
-    result, _ = scan(path, libraries={"1"})
+    result, _ = scan(path, libraries={"1"}, ignore_live_tv=False)
     assert [r["item"]["title"] for r in result] == ["In scope", "Deleted library", "No library"]
-    assert len(scan(path)[0]) == 4
+    assert len(scan(path, ignore_live_tv=False)[0]) == 4
     assert scan(path, account=7)[0] == []
+
+
+def test_live_tv_plays_are_skipped_unless_asked(tmp_path):
+    path = library(tmp_path / "lib.db", views=[
+        movie("imdb://tt0000001", "Library"), movie("tv.plex.xmltv://movie/Broadcast", "Guide movie"),
+        movie("plex://movie/aa", "Guide via Plex", library_section_id=None),
+        episode("plex://episode/1", 1, library_section_id=None, grandparent_guid="", grandparent_title=""),
+        episode("plex://episode/2", 2, library_section_id=99)])
+    updates = []
+    result, asked = scan(path, {"plex://show/s": {"tvdb": "300"}}, progress=lambda *a: updates.append(a))
+    assert [r["item"].get("series_title") or r["item"]["title"] for r in result] == ["Library", "Series"]
+    assert asked == [("show", "plex://show/s")]
+    assert updates[-1][4]["skipped"] == 3
+    assert [u[4]["event"]["result"] for u in updates if len(u) > 4 and "event" in u[4]].count("Skipped: Live TV") == 3
+    assert len(scan(path, ignore_live_tv=False)[0]) == 5
+
+
+def test_views_table_without_a_section_column_never_drops_everything(tmp_path):
+    path = library(tmp_path / "lib.db", views=[movie("imdb://tt0000001", "Library"), movie("tv.plex.xmltv://movie/x", "Guide")])
+    con = sqlite3.connect(path)
+    con.execute("ALTER TABLE metadata_item_views DROP COLUMN library_section_id")
+    con.commit()
+    con.close()
+    assert [r["item"]["title"] for r in scan(path)[0]] == ["Library"]
 
 
 def test_row_limit_and_cancel_never_return_partial_results(tmp_path):

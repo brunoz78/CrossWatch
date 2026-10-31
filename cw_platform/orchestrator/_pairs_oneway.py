@@ -101,6 +101,16 @@ def _emit_item_resolutions(emit, provider, feature, pair, keys, key2item, instan
         pass
 
 
+def filter_provider_adds(ops, cfg, feature, items):
+    hook = getattr(ops, "filter_cached_adds", None)
+    if not items or not callable(hook):
+        return items
+    try:
+        return provider_call(lambda view: hook(view, items, feature=feature), cfg)
+    except Exception:
+        return items
+
+
 def compute_effective_add(
     *,
     attempted_keys,
@@ -111,9 +121,11 @@ def compute_effective_add(
     have_exact_keys,
     verify_after_write,
     provider_skipped,
+    deferred_keys=(),
 ) -> dict[str, Any]:
     unres = set(still_unresolved or set())
-    skset = set(skipped_keys or set())
+    deferred = set(deferred_keys or ())
+    skset = set(skipped_keys or set()) | deferred
     conf = [k for k in (confirmed_keys or []) if k not in unres and k not in skset]
     pc = int(prov_confirmed or 0)
     if have_exact_keys:
@@ -124,7 +136,7 @@ def compute_effective_add(
         eff = 0
     else:
         eff = len(conf) if (verify_after_write or have_exact_keys) else min(pc, len(conf))
-    skipped_success = [k for k in (attempted_keys or []) if k in skset]
+    skipped_success = [k for k in (attempted_keys or []) if k in skset and k not in deferred]
     success_keys = conf if (verify_after_write or have_exact_keys) else conf[:eff]
     success_keys = list(dict.fromkeys(list(success_keys) + skipped_success))
     sset = set(success_keys)
@@ -234,6 +246,7 @@ from ..anime_mapping.history_coords import (
 )
 from ._snapshots import (
     build_snapshots_for_feature,
+    emit_cloud_history_read,
     bust_snapshot_cache,
     coerce_suspect_snapshot,
     module_checkpoint,
@@ -242,6 +255,7 @@ from ._snapshots import (
     provider_index_semantics,
     prev_checkpoint,
     refresh_destination_after_apply,
+    require_snapshot,
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
@@ -877,7 +891,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                     show_v = show_ids.get(k)
                     if show_v is not None and str(show_v).lower() == str(v).lower():
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}#episode")
             try:
                 season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
                 episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
@@ -899,7 +913,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 for k, v in ids.items():
                     if v is None or str(v) == "":
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}#episode")
 
         elif typ == "season":
             try:
@@ -1005,12 +1019,17 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         if ck and ck in idx:
             v = idx.get(ck)
             return v if isinstance(v, Mapping) else None
+        is_episode = _norm_type(it.get("type")) == "episode"
         for tok in _typed_tokens(it):
             dk = alias.get(tok)
             if not dk:
                 continue
             v = idx.get(dk)
-            return v if isinstance(v, Mapping) else None
+            if not isinstance(v, Mapping):
+                return None
+            if (_norm_type(v.get("type")) == "episode") != is_episode:
+                continue
+            return v
         if feature == "history" and str(it.get("type") or "").strip().lower() == "show":
             target = _show_level_tokens(it)
             if target:
@@ -1073,6 +1092,14 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     src_cfg = pair_endpoint_config(provider_cfg, src, src_inst)
     dst_cfg = pair_endpoint_config(provider_cfg, dst, dst_inst)
+    disable_dst_cloud_read = feature == "history" and dst == "PLEX" and ((dst_cfg.get("plex") or {}).get("history") or {}).get("read_cloud_history") is True
+    if disable_dst_cloud_read:
+        plex_cfg = dict(dst_cfg.get("plex") or {})
+        plex_cfg["history"] = {**(plex_cfg.get("history") or {}), "read_cloud_history": False}
+        dst_cfg = {**dst_cfg, "plex": plex_cfg}
+    if feature == "history" and src == "PLEX" and ((src_cfg.get("plex") or {}).get("history") or {}).get("read_cloud_history") is True:
+        allow_removes = False
+        emit("history:cloud_read", feature=feature, provider="PLEX", reason="Plex cloud history reads enabled; History removals are disabled for this pair.")
     pair_providers = {src: src_ops, dst: dst_ops}
 
     def _on_snapshot(name: str, idx: Mapping[str, Any]) -> None:
@@ -1086,17 +1113,19 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             dbg=dbg,
         )
 
-    if src == dst:
+    if src == dst or disable_dst_cloud_read:
         src_cur = build_snapshots_for_feature(
             feature=feature, config=src_cfg, providers={src: src_ops},
             snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
             dbg=dbg, emit_info=ctx.emit_info, on_snapshot=_on_snapshot,
-        ).get(src) or {}
+        )
+        src_cur = require_snapshot(src_cur, src, feature)
         dst_cur = build_snapshots_for_feature(
             feature=feature, config=dst_cfg, providers={dst: dst_ops},
             snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
             dbg=dbg, emit_info=ctx.emit_info,
-        ).get(dst) or {}
+        )
+        dst_cur = require_snapshot(dst_cur, dst, feature)
     else:
         snaps = build_snapshots_for_feature(
             feature=feature,
@@ -1110,8 +1139,9 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             on_snapshot=_on_snapshot,
         )
 
-        src_cur = snaps.get(src) or {}
-        dst_cur = snaps.get(dst) or {}
+        src_cur = require_snapshot(snaps, src, feature)
+        dst_cur = require_snapshot(snaps, dst, feature)
+    emit_cloud_history_read(emit, src, feature, src_cfg, src_cur)
     cancelled = bool(cancel_requested())
 
     prev_state = load_feature_state(ctx.state_store, feature)
@@ -1774,6 +1804,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         emit("debug", msg="library_only.filtered", feature=feature, dst=dst,
              kept=len(adds), skipped=len(library_skipped), error=presence_error or None)
 
+    adds = filter_provider_adds(dst_ops, dst_cfg, feature, adds)
+
     emit("one:plan", src=src, dst=dst, feature=feature,
         adds=len(adds), removes=len(removes), updates=len(updates),
         src_count=len(src_idx), dst_count=len(dst_full))
@@ -1789,6 +1821,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     review = getattr(ctx, "interactive", None)
     if review is not None:
+        review.discover_notice(feature, dst, dst_inst, dst_cfg)
         planned_adds = list(adds)
         review_args = dict(source=src, source_instance=src_inst, before=dst_full, down=dst_down)
         review.excluded(feature, dst, dst_inst, "add", library_skipped, **review_args)
@@ -2024,6 +2057,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 have_exact_keys=have_exact_keys,
                 verify_after_write=verify_after_write,
                 provider_skipped=bool(res_add.get("skipped")),
+                deferred_keys=(add_res or {}).get("deferred_keys", []),
             )
             prov_confirmed = _decision["prov_confirmed"]
             added_effective = _decision["effective"]
@@ -2075,7 +2109,7 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                         pair=pair_key,
                     )
                 if use_phantoms and guard and success_keys and not ambiguous_partial and not dry_run_flag:
-                    guard.record_success(success_keys)
+                    guard.record_success(set(success_keys) - set((add_res or {}).get("cloud_confirmed_keys") or []))
             except Exception:
                 pass
             baseline_keys = select_baseline_keys(success_keys, add_res)

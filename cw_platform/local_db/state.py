@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..provider_instances import is_sync_user_instance, normalize_instance_id
 from .db import get_conn
 from .schema import ID_KEYS
 
@@ -59,6 +60,7 @@ _BASELINE_ITEM_COLUMNS = [
     "provider_event_id",
     "path_metadata_json",
     "media_json",
+    "plex_cloud_history",
     "updated_at",
 ]
 _BASELINE_ITEM_COMPARE_COLUMNS = _BASELINE_ITEM_COLUMNS[1:-1]
@@ -232,6 +234,7 @@ def _item_to_row(provider_state_id: int, key: str, item: Mapping[str, Any], ts: 
         _s(item.get("provider_event_id") or item.get("_simkl_rewatch_id") or item.get("rewatch_id") or item.get("_publicmetadb_history_id") or item.get("_wetrakr_history_id")),
         json.dumps({k: item[k] for k in ("media_paths", "part") if k in item}, separators=(",", ":")) if item.get("media_paths") else None,
         json.dumps({k: item[k] for k in ("format", "media_info") if item.get(k)}, separators=(",", ":"), sort_keys=True) if item.get("format") or item.get("media_info") else None,
+        1 if item.get("_plex_cloud_history") is True else None,
         ts,
     )
 
@@ -285,6 +288,8 @@ def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
                         out[key] = media[key]
         except (TypeError, ValueError):
             pass
+    if row["plex_cloud_history"] == 1:
+        out["_plex_cloud_history"] = True
     if row["watched"] is not None:
         out["watched"] = bool(row["watched"])
     if row["rating"] is not None:
@@ -569,18 +574,27 @@ def _build_state_from_feature_rows(
     }
 
 
-def load_state(base_path: str | Path) -> dict[str, Any]:
+def _without_sync_users(rows: list[sqlite3.Row], include_sync_users: bool) -> list[sqlite3.Row]:
+    if include_sync_users:
+        return rows
+    return [row for row in rows if not is_sync_user_instance(row["instance"])]
+
+
+def load_state(base_path: str | Path, *, include_sync_users: bool = False) -> dict[str, Any]:
     with _LOCK:
         conn = get_conn(base_path)
         if conn is None:
             return {"providers": {}, "wall": [], "last_sync_epoch": None}
+        if include_sync_users:
+            rows = conn.execute("SELECT * FROM provider_feature_state ORDER BY provider, instance, feature").fetchall()
+            return _build_state_from_feature_rows(conn, rows)
         path_key = str(Path(base_path).resolve())
         fp = _fingerprint(conn)
         if _CACHE.get("path") == path_key and _CACHE.get("fingerprint") == fp and isinstance(_CACHE.get("state"), dict):
             return copy.deepcopy(_CACHE["state"])
-        rows = conn.execute(
+        rows = _without_sync_users(conn.execute(
             "SELECT * FROM provider_feature_state ORDER BY provider, instance, feature"
-        ).fetchall()
+        ).fetchall(), False)
         state = _build_state_from_feature_rows(conn, rows)
         _CACHE["path"] = path_key
         _CACHE["fingerprint"] = fp
@@ -593,6 +607,7 @@ def load_state_features(
     features: set[str] | list[str] | tuple[str, ...],
     *,
     recent_limit: int | None = None,
+    include_sync_users: bool = False,
 ) -> dict[str, Any]:
     wanted = sorted({str(feature or "").strip().lower() for feature in features or [] if str(feature or "").strip()})
     if not wanted:
@@ -602,17 +617,37 @@ def load_state_features(
         if conn is None:
             return {"providers": {}, "wall": [], "last_sync_epoch": None}
         placeholders = ",".join("?" for _ in wanted)
-        rows = conn.execute(
+        rows = _without_sync_users(conn.execute(
             f"SELECT * FROM provider_feature_state WHERE feature IN ({placeholders}) ORDER BY provider, instance, feature",
             wanted,
-        ).fetchall()
+        ).fetchall(), include_sync_users)
         return _build_state_from_feature_rows(conn, rows, recent_limit=recent_limit)
 
 
-def provider_feature_counts(base_path: str | Path, feature: str = "watchlist") -> dict[str, int]:
+def provider_feature_counts(
+    base_path: str | Path,
+    feature: str = "watchlist",
+    *,
+    include_sync_users: bool = False,
+    instances: Mapping[str, Any] | None = None,
+) -> dict[str, int]:
     feat = str(feature or "").strip().lower()
     if not feat:
         return {}
+    where = "WHERE p.feature=? "
+    params: list[Any] = [feat]
+    if instances is not None:
+        refs = [
+            (str(provider or "").strip().upper(), normalize_instance_id(inst))
+            for provider, values in instances.items()
+            for inst in (values if isinstance(values, (list, set, tuple)) else [values])
+        ]
+        if not refs:
+            return {}
+        where += "AND (" + " OR ".join("(UPPER(p.provider)=? AND p.instance=?)" for _ in refs) + ") "
+        params.extend(value for ref in refs for value in ref)
+    elif not include_sync_users:
+        where += "AND instr(p.instance, '~')=0 "
     conn = get_conn(base_path)
     if conn is None:
         return {}
@@ -620,9 +655,9 @@ def provider_feature_counts(base_path: str | Path, feature: str = "watchlist") -
         "SELECT p.provider AS provider, COUNT(DISTINCT b.item_key) AS count "
         "FROM provider_feature_state p "
         "LEFT JOIN baseline_items b ON b.provider_state_id=p.id "
-        "WHERE p.feature=? "
+        + where +
         "GROUP BY p.provider",
-        (feat,),
+        params,
     ).fetchall()
     return {
         str(row["provider"] or "").upper(): int(row["count"] or 0)
@@ -647,7 +682,7 @@ def provider_names(base_path: str | Path, features: set[str] | list[str] | tuple
     return [str(row["provider"] or "").upper() for row in rows if str(row["provider"] or "").strip()]
 
 
-def feature_inventory(base_path: str | Path) -> list[dict[str, Any]]:
+def feature_inventory(base_path: str | Path, *, include_sync_users: bool = False) -> list[dict[str, Any]]:
     conn = get_conn(base_path)
     if conn is None:
         return []
@@ -660,6 +695,7 @@ def feature_inventory(base_path: str | Path) -> list[dict[str, Any]]:
         "LEFT JOIN baseline_items b ON b.provider_state_id=p.id "
         "GROUP BY p.id ORDER BY p.provider,p.instance,p.feature"
     ).fetchall()
+    rows = _without_sync_users(rows, include_sync_users)
     return [
         {
             "provider": str(row["provider"] or "").upper(),

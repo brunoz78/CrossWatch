@@ -8,7 +8,8 @@ import { createLibraryController } from "./libraries.js";
 import { providerLogoHTML, providerToneRgb, sharedFeatureOrder, sharedFeatureLabel } from "./meta.js";
 import { ensurePairConfigStyles } from "./styles.js";
 import { createTabsController } from "./tabs.js";
-import { collectionDisabledForPair, collectionTypesForPair, commonFeaturesForPair, featureAllowedForPair, hasCumulativeAnimeHistory, ratingsDisabledForPair, sanitizeFeaturesForPair, sourceWatchStatusAllowed } from "./custom-rules.js";
+import { createIdentityMap } from "../core/identity-map.js";
+import { collectionDisabledForPair, collectionTypesForPair, commonFeaturesForPair, featureAllowedForPair, hasCumulativeAnimeHistory, ratingsDisabledForPair, sanitizeFeaturesForPair, sourceWatchStatusAllowed, undatedAsTodayAllowed } from "./custom-rules.js";
 
 const TWO_WAY_WARNING =
   "Two-way sync means both sides can write to each other. It keeps both providers aligned, but it also heavily increases the risk of conflicts, duplicates, overwrites, and deletions. Use with extreme caution.";
@@ -27,7 +28,22 @@ const isManagedPlaylistPair=(pair)=>String(playlistBlockOf(pair).managed_by||"")
 
 const isEmby = v => same(v, "emby");
 function getPairMarkedWatchedValue(state){ return !!(state?.pairProviders?.plex?.history?.include_marked_watched ?? state?.cfgRaw?.plex?.history?.include_marked_watched ?? true) }
-function supportsPathMatching(state){ return [state?.src,state?.dst].every(p=>["PLEX","JELLYFIN","EMBY"].includes(String(p||"").toUpperCase())) }
+function supportsPathMatching(state){ return [state?.src,state?.dst].every(p=>["PLEX","JELLYFIN","EMBY","SILO"].includes(String(p||"").toUpperCase())) }
+function supportsMatchUsers(state){ return [state?.src,state?.dst].every(p=>["PLEX","JELLYFIN","EMBY","SILO"].includes(String(p||"").toUpperCase())) }
+function renderMatchUsersCard(state){
+  return supportsMatchUsers(state)?`<div id="pair-identities"></div>`:"";
+}
+function mountMatchUsersCard(state){
+  const host=ID("pair-identities");
+  if(!host) return;
+  createIdentityMap(host,{
+    source:state.src,sourceInstance:state.src_instance,target:state.dst,targetInstance:state.dst_instance,
+    exclude:state.editing_pair_id?`pair:${state.editing_pair_id}`:"",
+    intro:"Sync several people of these servers, each with their own history.",
+    enabled:!!state.match_users,mapping:state.user_matches||{},
+    onChange:(v)=>{state.match_users=v.enabled;state.user_matches=v.mapping;},
+  });
+}
 function hasEmby(state){ return isEmby(state?.src) || isEmby(state?.dst) }
 
 // Provider helpers
@@ -45,7 +61,9 @@ const isKodi = (v) => same(v, "kodi");
 const isCrossWatch = (v) => same(v, "crosswatch");
 function hasPlex(state){ return isPlex(state?.src) || isPlex(state?.dst) }
 function hasKodi(state){ return isKodi(state?.src) || isKodi(state?.dst) }
-const isMedia = (v) => isPlex(v) || isEmby(v) || isJelly(v);
+const isSilo = (v) => same(v, "silo");
+function hasSilo(state){ return isSilo(state?.src) || isSilo(state?.dst) }
+const isMedia = (v) => isPlex(v) || isEmby(v) || isJelly(v) || isSilo(v);
 function providerSupportsProgress(state, name){ return !!(byName(state, name)?.features || {}).progress }
 function isProgressPair(state){ return providerSupportsProgress(state, state?.src) && providerSupportsProgress(state, state?.dst) }
 function hasSimkl(state){return isSimkl(state?.src)||isSimkl(state?.dst)}
@@ -54,7 +72,7 @@ function hasTrakt(state){return isTrakt(state?.src)||isTrakt(state?.dst)}
 function hasMDBList(state){return isMDBList(state?.src)||isMDBList(state?.dst)}
 function hasPublicMetaDB(state){return isPublicMetaDB(state?.src)||isPublicMetaDB(state?.dst)}
 function hasFloppy(state){return isFloppy(state?.src)||isFloppy(state?.dst)}
-function hasProviderControls(state){return hasPlex(state)||hasJelly(state)||hasEmby(state)||hasKodi(state)}
+function hasProviderControls(state){return hasPlex(state)||hasJelly(state)||hasEmby(state)||hasKodi(state)||hasSilo(state)}
 function floppyAnimeLibraryOn(state){const pair=state?.pairProviders?.floppy;return pair&&"anime_library" in pair?!!pair.anime_library:!!state?.cfgRaw?.floppy?.anime_library}
 function hasScrob(state){return isScrob(state?.src)||isScrob(state?.dst)}
 function hasStremio(state){return isStremio(state?.src)||isStremio(state?.dst)}
@@ -402,7 +420,7 @@ function defaultState(){
       progress:{enable:false,add:false,remove:false,min_seconds:60,delta_seconds:30,max_percent:PROGRESS_LEGACY_MAX_PERCENT,replay_enabled:false,timestamp_tolerance_seconds:30,propagate_timestamp_updates:false,include_specials:true},
       collection:{enable:false,add:false,remove:false,types:["movies"]}
     },
-    pairProviders:{},path_matching:false,
+    pairProviders:{},path_matching:false,match_users:false,user_matches:{},
     pair_remove_mode:"source_deletes",
     pair_remove_mode_touched:false,
     jellyfin:{watchlist:{mode:"favorites",playlist_name:"Watchlist"}},
@@ -462,7 +480,7 @@ function normalizePairProviders(p){
 
 function defaultStrictIdForProvider(providerKey){
   const key=String(providerKey||"").trim().toLowerCase();
-  return key==="plex" || key==="jellyfin" || key==="emby";
+  return key==="plex" || key==="jellyfin" || key==="emby" || key==="silo";
 }
 
 function getPairProviderStrictValue(state, providerKey){
@@ -828,15 +846,31 @@ const {
   hasJelly,
   hasEmby,
   hasKodi,
+  hasSilo,
   getOpts,
   onLibrariesChanged: (state) => refreshProviderCardSummaries(state),
   instanceFor: (state, kind) => pairInstanceForKind(state, kind),
 });
 
+function scopedPairView(){
+  const d=document.documentElement.dataset;
+  return d.cwRole==="user"||d.cwViewAs==="1";
+}
+
+function hasOwnInstance(state,prov){
+  const map=state.instanceMap||{};
+  const raw=map[String(prov||"").toUpperCase()]||map[String(prov||"").toLowerCase()]||[];
+  return (Array.isArray(raw)?raw:[]).some(x=>{
+    const id=String((typeof x==="string"?x:x?.id)||"").trim();
+    return !!id&&id.toLowerCase()!=="default"&&(typeof x==="string"||x.configured!==false);
+  });
+}
+
 function renderProviderSelects(state){
   const srcSel=ID("cx-src"),dstSel=ID("cx-dst");
-  const opts=state.providers.map(p=>`<option value="${p.name}">${p.label}</option>`).join("");
-  const dstOpts=state.providers.filter(p=>p.capabilities?.can_target!==false).map(p=>`<option value="${p.name}">${p.label}</option>`).join("");
+  const providers=scopedPairView()?state.providers.filter(p=>hasOwnInstance(state,p.name)||same(p.name,state.src)||same(p.name,state.dst)):state.providers;
+  const opts=providers.map(p=>`<option value="${p.name}">${p.label}</option>`).join("");
+  const dstOpts=providers.filter(p=>p.capabilities?.can_target!==false).map(p=>`<option value="${p.name}">${p.label}</option>`).join("");
   srcSel.innerHTML=`<option value="">Select…</option>${opts}`;dstSel.innerHTML=`<option value="">Select…</option>${dstOpts}`;
   if(state.src) srcSel.value=state.src;if(state.dst) dstSel.value=state.dst;
   const providerKind=(name)=>{
@@ -892,6 +926,7 @@ function renderInstanceSelects(state){
   const srcInstSel=ID("cx-src-inst"),dstInstSel=ID("cx-dst-inst");
   if(!srcInstSel||!dstInstSel) return;
   const map=state.instanceMap||{};
+  const scoped=scopedPairView();
   const norm=(v)=>{const s=String(v||"default").trim();return (!s||s.toLowerCase()==="default")?"default":s};
   const optsFor=(prov)=>{
     const key=String(prov||"").toUpperCase();
@@ -921,7 +956,7 @@ function renderInstanceSelects(state){
     const want=norm(cur);
     const gated=all.some(row=>typeof row.configured==="boolean");
     let rows=gated?all.filter(row=>row.configured!==false):all.slice();
-    if(pin&&pin===want&&!rows.some(row=>row.id===pin)){
+    if(!scoped&&pin&&pin===want&&!rows.some(row=>row.id===pin)){
       const known=all.find(row=>row.id===pin);
       const neverConfigured=pin==="default"&&known&&known.configured===false;
       if(!neverConfigured||!rows.length){
@@ -930,18 +965,21 @@ function renderInstanceSelects(state){
         rows=pin==="default"?[stale,...rows]:[...rows,stale];
       }
     }
-    if(!rows.length) rows=[{id:"default",label:"Default",stale:!!state.instancesLoaded}];
-    if(sel===dstInstSel&&same(state.src,state.dst)) rows=rows.filter(row=>row.id!==norm(srcInstSel.value));
+    if(scoped) rows=rows.filter(row=>row.id!=="default"&&row.configured!==false);
+    else if(!rows.length) rows=[{id:"default",label:"Default",stale:!!state.instancesLoaded}];
+    const samePair=sel===dstInstSel&&same(state.src,state.dst);
+    if(samePair) rows=rows.filter(row=>row.id!==norm(srcInstSel.value));
     const ids=rows.map(row=>row.id);
-    sel.innerHTML=rows.map(row=>`<option value="${escHTML(row.id)}" title="${escHTML(row.id)}">${escHTML(row.stale?`${row.label} - not configured`:row.label)}</option>`).join("");
-    sel.value=ids.includes(want)?want:(ids[0]||"");
-    if(!rows.length) sel.innerHTML='<option value="">No other configured instance</option>';
+    const lost=scoped&&!!pin&&!ids.includes(pin)&&(pin===want||!String(cur||"").trim());
+    sel.innerHTML=(lost?'<option value="" disabled>Choose an account</option>':"")+rows.map(row=>`<option value="${escHTML(row.id)}" title="${escHTML(row.id)}">${escHTML(row.stale?`${row.label} - not configured`:row.label)}</option>`).join("");
+    sel.value=ids.includes(want)?want:(lost?"":(ids[0]||""));
+    if(!rows.length) sel.innerHTML=`<option value="">${samePair?"No other configured instance":"No configured instance"}</option>`;
     sel.disabled=!prov||!rows.length;
   };
 
   fill(srcInstSel, state.src, state.src_instance, pinnedFor("src", state.src));
   fill(dstInstSel, state.dst, state.dst_instance, pinnedFor("dst", state.dst));
-  state.src_instance=norm(srcInstSel.value);
+  state.src_instance=srcInstSel.value||!scoped ? norm(srcInstSel.value) : "";
   state.dst_instance=dstInstSel.value ? norm(dstInstSel.value) : "";
 
   const onInstChange=()=>{resetPairUserProfileControl(state);try{renderFeaturePanel(state)}catch{}};
@@ -997,7 +1035,7 @@ function renderPairUserProfileControl(state){
   const show=!!profile;
   slot.classList.toggle("hidden",!show);
   row.classList.toggle("hidden",!show);
-  row.innerHTML=show?`<div class="cx-user-profile-display" aria-label="Assigned user profile"><span class="material-symbols-rounded" aria-hidden="true">account_circle</span><span>${escHTML(profile.label)}</span></div>`:"";
+  row.innerHTML=show?`<div class="cx-user-profile-display" aria-label="Assigned profile"><span class="material-symbols-rounded" aria-hidden="true">account_circle</span><span>${escHTML(profile.label)}</span></div>`:"";
 }
 
 // Fold toggles (works with draggable modals)
@@ -1030,21 +1068,18 @@ function applySubDisable(feature){
     watchlist: [
       "#cx-wl-add","#cx-wl-remove","#cx-wl-library-only",
       "#cx-wl-anime-map","#cx-wl-anime-only",
-      "#plx-wl-pms","#plx-wl-limit","#plx-wl-delay","#plx-wl-title","#plx-wl-meta","#plx-wl-guid",
+      "#plx-wl-pms","#plx-wl-title",
       "#cx-jf-wl-mode-fav","#cx-jf-wl-mode-pl","#cx-jf-wl-mode-col","#cx-jf-wl-pl-name",
       "#cx-em-wl-mode-fav","#cx-em-wl-mode-pl","#cx-em-wl-mode-col","#cx-em-wl-pl-name",
       "#cx-floppy-wl-name",
       "#cx-scrob-wl-name",
-      "#cx-wl-q","#cx-wl-delay","#cx-wl-guid",
-      "#tr-wl-etag","#tr-wl-ttl","#tr-wl-batch","#tr-wl-log","#tr-wl-freeze",
-      "#cx-pmdb-wl-name","#sm-wl-batch","#md-wl-batch"
+      "#cx-pmdb-wl-name"
     ],
     ratings: [
       "#cx-rt-add","#cx-rt-remove","#cx-rt-library-only","#cx-rt-anime-map","#cx-rt-anime-only","#cx-rt-type-all","#cx-rt-type-movies","#cx-rt-type-shows","#cx-rt-type-seasons","#cx-rt-type-episodes","#cx-rt-mode","#cx-rt-from-date","#cx-rt-specials",
-      "#tr-rt-perpage","#tr-rt-maxpages","#tr-rt-chunk",
-      "#sm-rt-chunk","#st-rt-liked-min","#st-rt-loved-min","#md-rt-perpage","#md-rt-maxpages","#md-rt-chunk"
+      "#st-rt-liked-min","#st-rt-loved-min"
     ],
-    history: ["#plx-marked-watched", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-numfb", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped","#cx-tr-hs-unres", "#tr-hs-perpage", "#tr-hs-maxpages", "#tr-hs-chunk", "#sm-hs-chunk", "#md-hs-perpage", "#md-hs-maxpages", "#md-hs-chunk", "#cx-em-hs-limit", "#cx-em-hs-delay", "#cx-em-hs-guid"],
+    history: ["#plx-marked-watched", "#plx-cloud-read", "#plx-discover-fallback", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-undated-today", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
     progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance","#cx-pr-specials","#cx-pr-library-only","#cx-pr-anime-map"],
     collection:["#cx-co-add","#cx-co-remove","#cx-co-type-all","#cx-co-type-movies","#cx-co-type-shows","#cx-co-type-seasons","#cx-co-type-episodes","#cx-co-media","#cx-co-media-upd"]
@@ -1129,6 +1164,9 @@ function getProviderOverrideCount(state, providerKey){
   if (providerKey === "kodi") {
     return countProviderLibraries(state, "KODI");
   }
+  if (providerKey === "silo") {
+    return countProviderLibraries(state, "SILO");
+  }
   return 0;
 }
 
@@ -1140,7 +1178,7 @@ function getProviderSummaryText(state, providerKey){
 }
 
 function refreshProviderCardSummaries(state){
-  [["plex","prov-plex-summary"],["jellyfin","prov-jelly-summary"],["emby","prov-emby-summary"],["kodi","prov-kodi-summary"]].forEach(([key, id]) => {
+  [["plex","prov-plex-summary"],["jellyfin","prov-jelly-summary"],["emby","prov-emby-summary"],["kodi","prov-kodi-summary"],["silo","prov-silo-summary"]].forEach(([key, id]) => {
     const el = ID(id);
     if (el) el.textContent = getProviderSummaryText(state, key);
   });
@@ -1167,6 +1205,7 @@ function renderFeaturePanel(state){
       if (providerKey === "plex") return "Tune Plex retries, workers, and pair library scope";
       if (providerKey === "jellyfin") return "Tune Jellyfin lookup, timeouts and pair library scope.";
       if (providerKey === "kodi") return "Tune Kodi pair library scope.";
+      if (providerKey === "silo") return "Tune Silo pair library scope.";
       return "Tune Emby timeouts and pair library scope.";
     };
 
@@ -1342,23 +1381,65 @@ function renderFeaturePanel(state){
         </div>
       </details>`);
 
-    left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">dns</span>Providers</div>
+    if (hasSilo(state)) providerCards.push(`
+      <details class="mods fold provider-card provider-silo" id="prov-silo">
+        <summary class="fold-head provider-card-head">
+          <span class="provider-card-main">
+            <span class="provider-card-badge">Silo</span>
+            <span class="provider-card-copy">
+              <span class="provider-card-title">Silo</span>
+              <span class="provider-card-sub" id="prov-silo-summary">${getProviderSummaryText(state, "silo")}</span>
+            </span>
+          </span>
+          <span class="provider-card-meta">
+            <span class="provider-card-hint">${providerHintText("silo")}</span>
+            <span class="chev">expand_more</span>
+          </span>
+        </summary>
+        <div class="fold-body provider-card-body">
+          <div class="prov-box" id="silo-pair-libs">
+            <div class="panel-title small">Pair library whitelist</div>
+            <div class="muted">Empty = use connection-level whitelist.</div>
+            <div class="opt-row">
+              <div class="field-label">History</div>
+              <div class="chip-row" id="silo-hist-libs"></div>
+            </div>
+            <div class="opt-row">
+              <div class="field-label">Ratings</div>
+              <div class="chip-row" id="silo-rate-libs"></div>
+            </div>
+            <div class="opt-row">
+              <div class="field-label">Progress</div>
+              <div class="chip-row" id="silo-prog-libs"></div>
+            </div>
+            <div class="opt-row">
+              <div class="field-label">Collections</div>
+              <div class="chip-row" id="silo-coll-libs"></div>
+            </div>
+            <button type="button" class="cx-btn small" id="silo-libs-load">Load libraries</button>
+          </div>
+        </div>
+      </details>`);
+
+    left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">dns</span>Media servers</div>
+      ${renderMatchUsersCard(state)}
       <div class="providers-intro">
         <div class="providers-intro-copy">
-          <div class="providers-intro-title">Advanced provider tuning</div>
-          <div class="providers-intro-sub">Open a provider only if you want different retry behavior or pair-specific library scope.</div>
+          <div class="providers-intro-title">Advanced media server tuning</div>
+          <div class="providers-intro-sub">Open a media server only if you want different retry behavior or pair-specific library scope.</div>
         </div>
-        <div class="providers-intro-badge">${providerCards.length} ${providerCards.length === 1 ? "provider" : "providers"} in this pair</div>
+        <div class="providers-intro-badge">${providerCards.length} ${providerCards.length === 1 ? "media server" : "media servers"} in this pair</div>
       </div>
-      <div class="provider-card-list">${providerCards.length ? providerCards.join("") : `<div class="providers-empty">This connection does not include a provider with provider-specific controls.</div>`}</div>
+      <div class="provider-card-list">${providerCards.length ? providerCards.join("") : `<div class="providers-empty">This connection does not include a media server with extra controls.</div>`}</div>
       <div class="providers-note" role="note" aria-live="polite">
         <div class="providers-note-title"><span class="material-symbols-rounded">info</span>Optional advanced controls</div>
-        <div class="providers-note-body">Library whitelists only appear for providers that support pair-specific library scope and are actually part of this pair.</div>
+        <div class="providers-note-body">Library whitelists only appear for media servers in this pair that support pair-specific library scope.</div>
       </div>`;
 
     right.innerHTML = "";
     initPairLibraryUIController(state);
     QA(".fold").forEach(f=>{f.classList.remove("open")});
+    mountMatchUsersCard(state);
     return;
   }
 
@@ -1373,7 +1454,9 @@ function renderFeaturePanel(state){
     const minPrevVal = Number.isFinite(rt.suspect_min_prev)?rt.suspect_min_prev:20;
     const guardInputType = window.matchMedia('(max-width:760px)').matches ? 'number' : 'range';
 
-    left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">tune</span>General <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-section-main">help</button></div>
+    const managedUser = document.documentElement.dataset.cwRole === "user";
+    if (managedUser) left.innerHTML = `<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">tune</span>General</div><div class="muted">Shared safety settings such as dry run, drop guard and blackbox are managed by the admin.</div>`;
+    else left.innerHTML=`<div class="panel-title"><span class="material-symbols-rounded" style="vertical-align:-3px;margin-right:6px;">tune</span>General <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-section-main">help</button></div>
       <div class="muted">Shared application safety settings. Pair-specific controls are labelled separately.</div>
       <div class="opt-row"><label for="gl-dry">Dry run</label><label class="switch"><input id="gl-dry" type="checkbox" ${g.dry_run?"checked":""}><span class="slider"></span></label></div>
       <div class="opt-row"><label for="gl-verify">Verify after write</label><label class="switch"><input id="gl-verify" type="checkbox" ${g.verify_after_write?"checked":""}><span class="slider"></span></label></div>
@@ -1402,13 +1485,14 @@ function renderFeaturePanel(state){
       </div>`;
     right.innerHTML=`<div class="panel-title small">Pair safety</div>
       ${removeModeRow}
-      ${hasPlex(state)||hasJelly(state)||hasEmby(state)||hasFloppy(state)?`<div class="panel-title small">Matching</div>`:""}
+      ${hasPlex(state)||hasJelly(state)||hasEmby(state)||hasSilo(state)||hasFloppy(state)?`<div class="panel-title small">Matching</div>`:""}
       ${hasPlex(state)?`<div class="opt-row"><label for="plx-strict-ids">Plex: Strict ID matching</label><label class="switch"><input id="plx-strict-ids" type="checkbox" ${getPairProviderStrictValue(state, "plex")?"checked":""}><span class="slider"></span></label></div>`:""}
       ${hasJelly(state)?`<div class="opt-row"><label for="jf-strict-ids">Jellyfin: Strict ID matching</label><label class="switch"><input id="jf-strict-ids" type="checkbox" ${getPairProviderStrictValue(state, "jellyfin")?"checked":""}><span class="slider"></span></label></div>`:""}
       ${hasEmby(state)?`<div class="opt-row"><label for="em-strict-ids">Emby: Strict ID matching</label><label class="switch"><input id="em-strict-ids" type="checkbox" ${getPairProviderStrictValue(state, "emby")?"checked":""}><span class="slider"></span></label></div>`:""}
+      ${hasSilo(state)?`<div class="opt-row"><label for="silo-strict-ids">Silo: Strict ID matching</label><label class="switch"><input id="silo-strict-ids" type="checkbox" ${getPairProviderStrictValue(state, "silo")?"checked":""}><span class="slider"></span></label></div>`:""}
       ${hasFloppy(state)?`<div class="opt-row"><label for="floppy-anime-library" data-tip-id="floppy-anime-library">Floppy: Send new anime to the Anime library</label><label class="switch"><input id="floppy-anime-library" type="checkbox" ${floppyAnimeLibraryOn(state)?"checked":""}><span class="slider"></span></label></div>`:""}
       ${supportsPathMatching(state)?`<div class="opt-row"><label for="pair-path-matching">Match by file path</label><label class="switch"><input id="pair-path-matching" type="checkbox" ${state.path_matching?"checked":""}><span class="slider"></span></label></div><div class="muted">When IDs cannot resolve an item, try matching its file path across the media servers in this pair. Supports movie and episode history, ratings and progress in both directions, including with Strict ID matching enabled.</div>`:""}
-      <div class="panel-title" style="margin-top:10px">Advanced (shared) <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-section-advanced">help</button></div>
+      ${managedUser ? "" : `      <div class="panel-title" style="margin-top:10px">Advanced (shared) <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-section-advanced">help</button></div>
       <div class="opt-row"><label for="gl-ttl">Tombstone TTL (days)</label><input id="gl-ttl" class="input" type="number" min="0" step="1" value="${g.tombstone_ttl_days??30}"></div><div class="muted">Keep delete markers to avoid re-adding.</div>
       <div class="opt-row"><label for="gl-observed">Include observed deletes</label><label class="switch"><input id="gl-observed" type="checkbox" ${g.include_observed_deletes?"checked":""}><span class="slider"></span></label></div>
       <div class="panel-title small" style="margin-top:10px">Blackbox (shared) <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-bb-section">help</button></div>
@@ -1418,7 +1502,7 @@ function renderFeaturePanel(state){
         <div class="opt-row"><label for="gl-bb-promote">Promote after (failed writes) <button type="button" class="cx-help material-symbols-rounded" data-tip-id="gl-bb-promote">help</button></label><input id="gl-bb-promote" class="input small" type="number" min="0" max="365" step="1" value="${bb.promote_after??3}"></div>
         <div class="opt-row"><label for="gl-bb-cooldown">Cooldown days</label><input id="gl-bb-cooldown" class="input small" type="number" min="0" max="365" step="1" value="${bb.cooldown_days??30}"></div>
       </div>
-      <div class="muted">Unresolved is a reporting state: failed writes are logged and retried every sync. Blackbox is the quarantine state: after this many failed writes an item is blackboxed and only then stops being planned.</div>`;
+      <div class="muted">Unresolved is a reporting state: failed writes are logged and retried every sync. Blackbox is the quarantine state: after this many failed writes an item is blackboxed and only then stops being planned.</div>`}`;
     return;
   }
 
@@ -1544,7 +1628,6 @@ function renderFeaturePanel(state){
     
     if (hasPlex(state)) {
       const plex = (state.cfgRaw?.plex) || {};
-      const defPri = ["tmdb","imdb","tvdb","agent:themoviedb:en","agent:themoviedb","agent:imdb"];
       parts.push(`
         <div class="panel-title small" style="margin-top:6px">Plex</div>
         <details id="cx-plx-wl">
@@ -1555,109 +1638,8 @@ function renderFeaturePanel(state){
               <label class="switch"><input id="plx-wl-pms" type="checkbox" ${plex.watchlist_allow_pms_fallback ? "checked" : ""}><span class="slider"></span></label>
             </div>
             <div class="opt-row">
-              <label for="plx-wl-limit">Query limit</label>
-              <input id="plx-wl-limit" class="input small" type="number" min="1" max="1000" value="${Number.isFinite(plex.watchlist_query_limit)?plex.watchlist_query_limit:25}">
-            </div>
-            <div class="opt-row">
-              <label for="plx-wl-delay">Write delay (ms)</label>
-              <input id="plx-wl-delay" class="input small" type="number" min="0" max="5000" value="${Number.isFinite(plex.watchlist_write_delay_ms)?plex.watchlist_write_delay_ms:0}">
-            </div>
-            <div class="opt-row">
               <label for="plx-wl-title">Title text search</label>
               <label class="switch"><input id="plx-wl-title" type="checkbox" ${plex.watchlist_title_query !== false ? "checked" : ""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row">
-              <label for="plx-wl-meta">Use METADATA.matches</label>
-              <label class="switch"><input id="plx-wl-meta" type="checkbox" ${plex.watchlist_use_metadata_match !== false ? "checked" : ""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="plx-wl-guid">GUID priority</label>
-              <input id="plx-wl-guid" class="input" type="text" value="${(Array.isArray(plex.watchlist_guid_priority)&&plex.watchlist_guid_priority.length?plex.watchlist_guid_priority:defPri).join(", ")}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasEmby(state)) {
-      const emAdv = (state.cfgRaw?.emby?.watchlist) || {};
-      const defPri = ["tmdb","imdb","tvdb","agent:themoviedb:en","agent:themoviedb","agent:imdb"];
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">Emby</div>
-        <details id="cx-em-wl">
-          <summary class="muted" style="margin-bottom:10px;">Emby watchlist controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row">
-              <label for="cx-wl-q">Query limit</label>
-              <input id="cx-wl-q" class="input small" type="number" min="5" max="1000" value="${emAdv.watchlist_query_limit ?? 25}">
-            </div>
-            <div class="opt-row">
-              <label for="cx-wl-delay">Write delay (ms)</label>
-              <input id="cx-wl-delay" class="input small" type="number" min="0" max="5000" value="${emAdv.watchlist_write_delay_ms ?? 0}">
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="cx-wl-guid">GUID priority</label>
-              <input id="cx-wl-guid" class="input" type="text" value="${(emAdv.watchlist_guid_priority || defPri).join(", ")}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasTrakt(state)) {
-      const tr = (state.cfgRaw?.trakt) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">Trakt</div>
-        <details id="cx-tr-wl">
-          <summary class="muted" style="margin-bottom:10px;">Trakt watchlist controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row"><label for="tr-wl-etag">Use ETag</label>
-              <label class="switch"><input id="tr-wl-etag" type="checkbox" ${tr.watchlist_use_etag!==false?"checked":""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row"><label for="tr-wl-batch">Batch size</label>
-              <input id="tr-wl-batch" class="input small" type="number" min="10" max="500" value="${tr.watchlist_batch_size ?? 100}">
-            </div>
-            <div class="opt-row"><label for="tr-wl-log">Log rate limits</label>
-              <label class="switch"><input id="tr-wl-log" type="checkbox" ${tr.watchlist_log_rate_limits?"checked":""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row"><label for="tr-wl-freeze">Freeze details</label>
-              <label class="switch"><input id="tr-wl-freeze" type="checkbox" ${tr.watchlist_freeze_details!==false?"checked":""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="tr-wl-ttl">Shadow TTL (hours)</label>
-              <input id="tr-wl-ttl" class="input small" type="number" min="1" max="9999" value="${tr.watchlist_shadow_ttl_hours ?? 168}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasSimkl(state)) {
-      const sm = (state.cfgRaw?.simkl) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">SIMKL</div>
-        <details id="cx-sm-wl">
-          <summary class="muted" style="margin-bottom:10px;">SIMKL watchlist controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="sm-wl-batch">Batch size</label>
-              <input id="sm-wl-batch" class="input small" type="number" min="1" max="1000" value="${sm.watchlist_batch_size ?? 500}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasMDBList(state)) {
-      const md = (state.cfgRaw?.mdblist) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">MDBList</div>
-        <details id="cx-md-wl">
-          <summary class="muted" style="margin-bottom:10px;">MDBList watchlist controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="md-wl-batch">Batch size</label>
-              <input id="md-wl-batch" class="input small" type="number" min="1" max="1000" value="${md.watchlist_batch_size ?? 500}">
             </div>
           </div>
         </details>
@@ -1718,46 +1700,6 @@ function renderFeaturePanel(state){
         <div class="hint">All is everything or “From a date”.</div>
       </details>`];
 
-    if (hasTrakt(state)) {
-      const tr = (state.cfgRaw?.trakt) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">Trakt</div>
-        <details id="cx-tr-rt">
-          <summary class="muted" style="margin-bottom:10px;">Trakt ratings controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row">
-              <label for="tr-rt-perpage">Items per page</label>
-              <input id="tr-rt-perpage" class="input small" type="number" min="1" max="500" value="${tr.ratings_per_page ?? 100}">
-            </div>
-            <div class="opt-row">
-              <label for="tr-rt-maxpages">Max pages</label>
-              <input id="tr-rt-maxpages" class="input small" type="number" min="1" max="1000" value="${tr.ratings_max_pages ?? 50}">
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="tr-rt-chunk">Write chunk size</label>
-              <input id="tr-rt-chunk" class="input small" type="number" min="1" max="1000" value="${tr.ratings_chunk_size ?? 100}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasSimkl(state)) {
-      const sm = (state.cfgRaw?.simkl) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">SIMKL</div>
-        <details id="cx-sm-rt">
-          <summary class="muted" style="margin-bottom:10px;">SIMKL ratings controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="sm-rt-chunk">Write chunk size</label>
-              <input id="sm-rt-chunk" class="input small" type="number" min="1" max="1000" value="${sm.ratings_chunk_size ?? 500}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
     if (hasStremio(state)) {
       const sr = ((state.cfgRaw?.stremio) || {}).ratings || {};
       parts.push(`
@@ -1779,34 +1721,6 @@ function renderFeaturePanel(state){
       `);
     }
 
-    if (hasMDBList(state)) {
-      const md = (state.cfgRaw?.mdblist) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">MDBList</div>
-        <details id="cx-md-rt">
-          <summary class="muted" style="margin-bottom:10px;">MDBList ratings controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row">
-              <label for="md-rt-perpage">Items per page</label>
-              <input id="md-rt-perpage" class="input small" type="number" min="1" max="1000" value="${md.ratings_per_page ?? 1000}">
-            </div>
-            <div class="opt-row">
-              <label for="md-rt-maxpages">Max pages</label>
-              <input id="md-rt-maxpages" class="input small" type="number" min="1" max="2000" value="${md.ratings_max_pages ?? 50}">
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="md-rt-chunk">Write chunk size</label>
-              <input id="md-rt-chunk" class="input small" type="number" min="1" max="1000" value="${md.ratings_chunk_size ?? 500}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasSimkl(state)) {
-      parts.push(`<div class="simkl-alert" role="note" aria-live="polite"><div class="title"><span class="ic">⚠</span> Simkl heads-up for Ratings</div><div class="body"><ul class="bul"><li><b>Movies:</b> Rating auto-marks as <i>Completed</i> on Simkl.</li><li>Can appear under <i>Recently watched</i> and <i>My List</i>.</li></ul><div class="mini">Tip: Prefer small windows when backfilling.</div></div></div>`);
-    }
-
     right.innerHTML = parts.join("");
     try{updateRtSummary()}catch{}
     applySubDisable("ratings");
@@ -1818,8 +1732,6 @@ function renderFeaturePanel(state){
     const hs = getOpts(state, "history");
     const rwSupported = pairSupportsHistoryRewatches(state);
     const libSupported = pairSupportsLibraryOnly(state);
-    const trCfg = (state.cfgRaw?.trakt) || {};
-    const emCfg = (state.cfgRaw?.emby?.history) || {};
 
     const trPair = (state.pairProviders?.trakt) || {};
     const trColOn = !!trPair.history_collection;
@@ -1952,105 +1864,26 @@ left.innerHTML = `
             <span class="slider"></span>
           </label>
         </div>` : ""}
+        ${undatedAsTodayAllowed(state) ? `<div class="opt-row" style="grid-column:1/-1">
+          <label for="cx-hs-undated-today" data-tip-id="cx-hs-undated-today">Undated watches as today (SIMKL)</label>
+          <label class="switch">
+            <input id="cx-hs-undated-today" type="checkbox" ${hs.undated_as_today ? "checked" : ""}>
+            <span class="slider"></span>
+          </label>
+        </div>` : ""}
       </div>
       ${droppedBlock}
       ${animeRow}`];
 
-    if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex</div><div class="opt-row"><label for="plx-marked-watched">Marked Watched</label><label class="switch"><input id="plx-marked-watched" type="checkbox" ${getPairMarkedWatchedValue(state)?"checked":""}><span class="slider"></span></label></div><div class="muted">Include manually marked watched items from Plex. Applies only to this pair.</div>`);
+    if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex</div><div class="opt-row"><label for="plx-marked-watched">Marked Watched</label><label class="switch"><input id="plx-marked-watched" type="checkbox" ${getPairMarkedWatchedValue(state)?"checked":""}><span class="slider"></span></label></div><div class="muted">Include watched items from your Plex library, even when no playback-history entry is available. Applies only to this pair.</div>`);
+    if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex cloud history</div>`);
+    if (same(state.src,"plex") || (isTwoWayMode(state) && same(state.dst,"plex"))) parts.push(`<div class="opt-row"><label for="plx-cloud-read" data-tip-id="plx-cloud-read">${isTwoWayMode(state) || (same(state.src,"plex") && same(state.dst,"plex")) ? "Read cloud history" : "Include Plex cloud history"}</label><label class="switch"><input id="plx-cloud-read" type="checkbox" ${state.pairProviders?.plex?.history?.read_cloud_history === true ? "checked" : ""}><span class="slider"></span></label></div>`);
+    if (same(state.dst,"plex") || (isTwoWayMode(state) && same(state.src,"plex"))) parts.push(`<div class="opt-row"><label for="plx-discover-fallback" data-tip-id="plx-discover-fallback">${isTwoWayMode(state) || (same(state.src,"plex") && same(state.dst,"plex")) ? "Write cloud fallback" : "Include Plex cloud history"}</label><label class="switch"><input id="plx-discover-fallback" type="checkbox" ${state.pairProviders?.plex?.history?.discover_fallback === true ? "checked" : ""}><span class="slider"></span></label></div>`);
 
     if (hasTrakt(state)) {
       parts.push(`
         <div class="panel-title small" style="margin-top:6px">Trakt</div>
         <div class="grid2 compact">${trColRow}</div>
-        <details id="cx-tr-hs">
-          <summary class="muted" style="margin-bottom:10px;">Trakt history controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row">
-              <label for="cx-tr-hs-numfb">Number Fallback</label>
-              <label class="switch"><input id="cx-tr-hs-numfb" type="checkbox" ${trCfg.history_number_fallback ? "checked" : ""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row">
-              <label for="cx-tr-hs-unres">Unresolved Freeze</label>
-              <label class="switch"><input id="cx-tr-hs-unres" type="checkbox" ${trCfg.history_unresolved ? "checked" : ""}><span class="slider"></span></label>
-            </div>
-            <div class="opt-row">
-              <label for="tr-hs-perpage">Items per page</label>
-              <input id="tr-hs-perpage" class="input small" type="number" min="1" max="500" value="${trCfg.history_per_page ?? 100}">
-            </div>
-            <div class="opt-row">
-              <label for="tr-hs-maxpages">Max pages</label>
-              <input id="tr-hs-maxpages" class="input small" type="number" min="1" max="100000" value="${trCfg.history_max_pages ?? 10000}">
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="tr-hs-chunk">Write chunk size</label>
-              <input id="tr-hs-chunk" class="input small" type="number" min="1" max="1000" value="${trCfg.history_chunk_size ?? 100}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasSimkl(state)) {
-      const sm = (state.cfgRaw?.simkl) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">SIMKL</div>
-        <details id="cx-sm-hs">
-          <summary class="muted" style="margin-bottom:10px;">SIMKL history controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="sm-hs-chunk">Write chunk size</label>
-              <input id="sm-hs-chunk" class="input small" type="number" min="1" max="1000" value="${sm.history_chunk_size ?? 500}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasMDBList(state)) {
-      const md = (state.cfgRaw?.mdblist) || {};
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">MDBList</div>
-        <details id="cx-md-hs">
-          <summary class="muted" style="margin-bottom:10px;">MDBList history controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row">
-              <label for="md-hs-perpage">Items per page</label>
-              <input id="md-hs-perpage" class="input small" type="number" min="1" max="1000" value="${md.history_per_page ?? 1000}">
-            </div>
-            <div class="opt-row">
-              <label for="md-hs-maxpages">Max pages</label>
-              <input id="md-hs-maxpages" class="input small" type="number" min="1" max="2000" value="${md.history_max_pages ?? 250}">
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="md-hs-chunk">Write chunk size</label>
-              <input id="md-hs-chunk" class="input small" type="number" min="1" max="1000" value="${md.history_chunk_size ?? 500}">
-            </div>
-          </div>
-        </details>
-      `);
-    }
-
-    if (hasEmby(state)) {
-      const defPri = ["tmdb","imdb","tvdb","agent:themoviedb:en","agent:themoviedb","agent:imdb"];
-      parts.push(`
-        <div class="panel-title small" style="margin-top:6px">Emby</div>
-        <details id="cx-em-hs">
-          <summary class="muted" style="margin-bottom:10px;">Emby history controls</summary>
-          <div class="grid2 compact">
-            <div class="opt-row">
-              <label for="cx-em-hs-limit">Query limit</label>
-              <input id="cx-em-hs-limit" class="input small" type="number" min="1" max="1000" value="${Number.isFinite(emCfg.history_query_limit)?emCfg.history_query_limit:25}">
-            </div>
-            <div class="opt-row">
-              <label for="cx-em-hs-delay">Write delay (ms)</label>
-              <input id="cx-em-hs-delay" class="input small" type="number" min="0" max="5000" value="${Number.isFinite(emCfg.history_write_delay_ms)?emCfg.history_write_delay_ms:0}">
-            </div>
-            <div class="opt-row" style="grid-column:1/-1">
-              <label for="cx-em-hs-guid">GUID priority</label>
-              <input id="cx-em-hs-guid" class="input" type="text" value="${(Array.isArray(emCfg.history_guid_priority)&&emCfg.history_guid_priority.length?emCfg.history_guid_priority:defPri).join(", ")}">
-            </div>
-          </div>
-        </details>
       `);
     }
 
@@ -2103,8 +1936,8 @@ left.innerHTML = `
   if (state.feature === "collection") {
     const co = getOpts(state, "collection");
     const hasType=t=>Array.isArray(co.types)&&co.types.includes(t);
-    const mediaRead=["plex","emby","jellyfin"].some(p=>same(state.src,p));
-    const mediaUpdates=["trakt","floppy","crosswatch","flicklist"].some(p=>same(state.dst,p));
+    const mediaRead=["plex","emby","jellyfin","silo"].some(p=>same(state.src,p));
+    const mediaUpdates=["trakt","floppy","crosswatch","flicklist","mdblist"].some(p=>same(state.dst,p));
     left.innerHTML = `<div class="panel-title">Collections | Basics</div>
       <div class="opt-row">
         <label for="cx-co-enable">Enable</label>
@@ -2259,6 +2092,35 @@ function bindChangeHandlers(state,root){
   root.addEventListener("change",(e)=>{
     const id=e.target.id, el=e.target;
 
+    if(id==="cx-hs-library-only" && el.checked){
+      state.pairProviders=state.pairProviders||{};
+      const plex=state.pairProviders.plex||{};
+      state.pairProviders.plex={...plex,history:{...plex.history,discover_fallback:false}};
+      const discover=ID("plx-discover-fallback");
+      if(discover) discover.checked=false;
+    }
+    if(id==="plx-cloud-read"){
+      state.pairProviders=state.pairProviders||{};
+      const plex=state.pairProviders.plex||{};
+      state.pairProviders.plex={...plex,history:{...plex.history,read_cloud_history:el.checked===true}};
+      if(el.checked){
+        state.options.history={...(state.options.history||{}),remove:false};
+        const remove=ID("cx-hs-remove");
+        if(remove) remove.checked=false;
+      }
+      return;
+    }
+    if(id==="plx-discover-fallback"){
+      state.pairProviders=state.pairProviders||{};
+      const plex=state.pairProviders.plex||{};
+      state.pairProviders.plex={...plex,history:{...plex.history,discover_fallback:el.checked===true}};
+      if(el.checked){
+        state.options.history={...(state.options.history||{}),library_only:false};
+        const libraryOnly=ID("cx-hs-library-only");
+        if(libraryOnly) libraryOnly.checked=false;
+      }
+      return;
+    }
     if(id==="plx-marked-watched"){
       state.pairProviders=state.pairProviders||{};
       const plex=state.pairProviders.plex||{};
@@ -2266,12 +2128,14 @@ function bindChangeHandlers(state,root){
       return;
     }
     if(id==="pair-path-matching") state.path_matching=!!el.checked;
-    if(id==="plx-strict-ids"||id==="jf-strict-ids"||id==="em-strict-ids"||id==="jf-targeted-lookup"){
+    if(el.closest?.("#pair-identities")) return;
+    if(id==="plx-strict-ids"||id==="jf-strict-ids"||id==="em-strict-ids"||id==="silo-strict-ids"||id==="jf-targeted-lookup"){
       state.pairProviders=state.pairProviders||{};
       if(id==="plx-strict-ids") state.pairProviders.plex=Object.assign({},state.pairProviders.plex||{}, {strict_id_matching:!!el.checked});
       if(id==="jf-strict-ids") state.pairProviders.jellyfin=Object.assign({},state.pairProviders.jellyfin||{}, {strict_id_matching:!!el.checked});
       if(id==="jf-targeted-lookup") state.pairProviders.jellyfin=Object.assign({},state.pairProviders.jellyfin||{}, {targeted_lookup:!!el.checked});
       if(id==="em-strict-ids") state.pairProviders.emby=Object.assign({},state.pairProviders.emby||{}, {strict_id_matching:!!el.checked});
+      if(id==="silo-strict-ids") state.pairProviders.silo=Object.assign({},state.pairProviders.silo||{}, {strict_id_matching:!!el.checked});
       return;
     }
     if(id==="floppy-anime-library"){
@@ -2498,6 +2362,7 @@ function bindChangeHandlers(state,root){
         use_anime_mapping: !!(animeEl && animeEl.checked && tmdbMetadataReady(state)),
         anime_only_sync: false,
         use_source_status: !!ID("cx-hs-source-status")?.checked && sourceWatchStatusAllowed(state),
+        undated_as_today: !!ID("cx-hs-undated-today")?.checked && undatedAsTodayAllowed(state),
       });
       state.visited.add("history");
     }
@@ -2603,24 +2468,18 @@ function bindChangeHandlers(state,root){
       }
     }
 
-    if(id==="cx-jf-wl-mode-fav"||id==="cx-jf-wl-mode-pl"||id==="cx-jf-wl-mode-col"||id==="cx-jf-wl-pl-name"||id==="cx-wl-q"||id==="cx-wl-delay"||id==="cx-wl-guid"){
+    if(id==="cx-jf-wl-mode-fav"||id==="cx-jf-wl-mode-pl"||id==="cx-jf-wl-mode-col"||id==="cx-jf-wl-pl-name"){
       const jf=state.jellyfin||(state.jellyfin={});
       const mode=ID("cx-jf-wl-mode-pl")?.checked?"playlist":ID("cx-jf-wl-mode-col")?.checked?"collection":"favorites";
       const name=(ID("cx-jf-wl-pl-name")?.value||"").trim()||"Watchlist";
-      const q=parseInt(ID("cx-wl-q")?.value||"25",10)||25;
-      const d=parseInt(ID("cx-wl-delay")?.value||"0",10)||0;
-      const gp=(ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
-      jf.watchlist={mode,playlist_name:name,watchlist_query_limit:q,watchlist_write_delay_ms:d,watchlist_guid_priority:gp.length?gp:undefined};
+      jf.watchlist={mode,playlist_name:name};
     }
 
-    if(id==="cx-em-wl-mode-fav"||id==="cx-em-wl-mode-pl"||id==="cx-em-wl-mode-col"||id==="cx-em-wl-pl-name"||id==="cx-wl-q"||id==="cx-wl-delay"||id==="cx-wl-guid"){
+    if(id==="cx-em-wl-mode-fav"||id==="cx-em-wl-mode-pl"||id==="cx-em-wl-mode-col"||id==="cx-em-wl-pl-name"){
       const em=state.emby||(state.emby={});
       const mode=ID("cx-em-wl-mode-pl")?.checked?"playlist":ID("cx-em-wl-mode-col")?.checked?"collection":"favorites";
       const name=(ID("cx-em-wl-pl-name")?.value||"").trim()||"Watchlist";
-      const q=parseInt(ID("cx-wl-q")?.value||"25",10)||25;
-      const d=parseInt(ID("cx-wl-delay")?.value||"0",10)||0;
-      const gp=(ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
-      em.watchlist={mode,playlist_name:name,watchlist_query_limit:q,watchlist_write_delay_ms:d,watchlist_guid_priority:gp.length?gp:undefined};
+      em.watchlist={mode,playlist_name:name};
     }
 
     if(id==="cx-pmdb-wl-name"){
@@ -2656,6 +2515,7 @@ function bindChangeHandlers(state,root){
 
 // Save config bits
 async function saveConfigBits(state){
+  if(document.documentElement.dataset.cwRole === "user") return;
   try{
     const cur=await fetch("/api/config",{cache:"no-store"}).then(r=>r.ok?r.json():{});
     const cfg=typeof structuredClone==="function"?structuredClone(cur||{}):jclone(cur||{});
@@ -2711,17 +2571,7 @@ async function saveConfigBits(state){
         plex.max_retries = Number.isFinite(rv) ? Math.max(0, rv) : (plex.max_retries ?? 3);
       }
       if (ID("plx-wl-pms"))          plex.watchlist_allow_pms_fallback = !!ID("plx-wl-pms").checked;
-      if (ID("plx-wl-limit"))        plex.watchlist_query_limit        = num("plx-wl-limit", 1, plex.watchlist_query_limit ?? 25);
-      if (ID("plx-wl-delay")) {
-        const dv = n("plx-wl-delay");
-        plex.watchlist_write_delay_ms = Number.isFinite(dv) ? Math.max(0, dv) : (plex.watchlist_write_delay_ms ?? 0);
-      }
-      if (ID("plx-wl-guid")) {
-        plex.watchlist_guid_priority = (ID("plx-wl-guid").value || "")
-          .split(",").map(s=>s.trim()).filter(Boolean);
-      }
       if (ID("plx-wl-title"))        plex.watchlist_title_query        = !!ID("plx-wl-title").checked;
-      if (ID("plx-wl-meta"))         plex.watchlist_use_metadata_match = !!ID("plx-wl-meta").checked;
 
       cfg.plex = plex;
     }
@@ -2758,40 +2608,12 @@ async function saveConfigBits(state){
       cfg.jellyfin=jf;
     }
 
-    if(ID("tr-wl-etag")){
-      cfg.trakt = Object.assign({}, cfg.trakt||{}, {
-        watchlist_use_etag: !!ID("tr-wl-etag")?.checked,
-        watchlist_shadow_ttl_hours: Math.max(1, parseInt(ID("tr-wl-ttl")?.value||"168",10)||168),
-        watchlist_batch_size: Math.max(1, parseInt(ID("tr-wl-batch")?.value||"100",10)||100),
-        watchlist_log_rate_limits: !!ID("tr-wl-log")?.checked,
-        watchlist_freeze_details: !!ID("tr-wl-freeze")?.checked
-      });
-    }
-
-    if(ID("sm-wl-batch")){
-      cfg.simkl = Object.assign({}, cfg.simkl||{}, {
-        watchlist_batch_size: Math.max(1, parseInt(ID("sm-wl-batch")?.value||"500",10)||500)
-      });
-    }
-
-    if(ID("md-wl-batch")){
-      cfg.mdblist = Object.assign({}, cfg.mdblist||{}, {
-        watchlist_batch_size: Math.max(1, parseInt(ID("md-wl-batch")?.value||"500",10)||500)
-      });
-    }
-
     const hasJF=String(state.src||"").toUpperCase()==="JELLYFIN"||String(state.dst||"").toUpperCase()==="JELLYFIN";
     if(hasJF){
       const jf=Object.assign({},cfg.jellyfin||{});
       const mode=ID("cx-jf-wl-mode-pl")?.checked?"playlist":ID("cx-jf-wl-mode-col")?.checked?"collection":ID("cx-jf-wl-mode-fav")?.checked?"favorites":(state.jellyfin?.watchlist?.mode||"favorites");
       const name=(ID("cx-jf-wl-pl-name")?.value||state.jellyfin?.watchlist?.playlist_name||"Watchlist").trim()||"Watchlist";
-      const q= parseInt(ID("cx-wl-q")?.value||"25",10)||undefined;
-      const d= parseInt(ID("cx-wl-delay")?.value||"0",10)||undefined;
-      const gp=(ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
       jf.watchlist=Object.assign({},jf.watchlist||{},{mode,playlist_name:name});
-      if(Number.isFinite(q)) jf.watchlist.watchlist_query_limit=q;
-      if(Number.isFinite(d)) jf.watchlist.watchlist_write_delay_ms=d;
-      if(gp.length) jf.watchlist.watchlist_guid_priority=gp;
       cfg.jellyfin=jf;
     }
 
@@ -2800,63 +2622,9 @@ async function saveConfigBits(state){
       const em = Object.assign({}, cfg.emby || {});
       const mode = ID("cx-em-wl-mode-pl")?.checked ? "playlist" : ID("cx-em-wl-mode-col")?.checked ? "collection" : ID("cx-em-wl-mode-fav")?.checked ? "favorites" : (state.emby?.watchlist?.mode || "favorites");
       const name = (ID("cx-em-wl-pl-name")?.value || state.emby?.watchlist?.playlist_name || "Watchlist").trim() || "Watchlist";
-      const q = parseInt(ID("cx-wl-q")?.value||"25",10)||undefined;
-      const d = parseInt(ID("cx-wl-delay")?.value||"0",10)||undefined;
-      const gp = (ID("cx-wl-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
       em.watchlist = Object.assign({}, em.watchlist||{}, { mode, playlist_name:name });
-      if(Number.isFinite(q)) em.watchlist.watchlist_query_limit = q;
-      if(Number.isFinite(d)) em.watchlist.watchlist_write_delay_ms = d;
-      if(gp.length) em.watchlist.watchlist_guid_priority = gp;
-
-      const hq = parseInt(ID("cx-em-hs-limit")?.value||"",10);
-      const hd = parseInt(ID("cx-em-hs-delay")?.value||"",10);
-      const hg = (ID("cx-em-hs-guid")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
-      em.history = Object.assign({}, em.history || {});
-      if (Number.isFinite(hq)) em.history.history_query_limit = Math.max(1, hq);
-      if (Number.isFinite(hd)) em.history.history_write_delay_ms = Math.max(0, hd);
-      if (hg.length) em.history.history_guid_priority = hg;
 
       cfg.emby = em;
-    }
-
-    const hasTR = String(state.src||"").toUpperCase()==="TRAKT" || String(state.dst||"").toUpperCase()==="TRAKT";
-    if(hasTR){
-      const tr=Object.assign({},cfg.trakt||{});
-      const numfb=ID("cx-tr-hs-numfb");
-      const unres=ID("cx-tr-hs-unres");
-      if(numfb) tr.history_number_fallback = !!numfb.checked; 
-      if(unres) tr.history_unresolved       = !!unres.checked;
-
-      const n = x => parseInt((ID(x)?.value||"").trim(), 10);
-      const clamp = (v,min,max)=>Math.min(max,Math.max(min,Number.isFinite(v)?v:min));
-
-      const perEl   = ID("tr-rt-perpage") || ID("tr-rt-page");
-      const pagesEl = ID("tr-rt-maxpages")|| ID("tr-rt-pages");
-      const chunkEl = ID("tr-rt-chunk");
-      const hsPerEl = ID("tr-hs-perpage");
-      const hsPagesEl = ID("tr-hs-maxpages");
-      const hsChunkEl = ID("tr-hs-chunk");
-
-      if (perEl)   tr.ratings_per_page   = clamp(n(perEl.id), 10, 500);
-      if (pagesEl) tr.ratings_max_pages  = clamp(n(pagesEl.id), 1, 1000);
-      if (chunkEl) tr.ratings_chunk_size = clamp(n(chunkEl.id), 10, 1000);
-      if (hsPerEl)   tr.history_per_page   = clamp(n(hsPerEl.id), 1, 500);
-      if (hsPagesEl) tr.history_max_pages  = clamp(n(hsPagesEl.id), 1, 100000);
-      if (hsChunkEl) tr.history_chunk_size = clamp(n(hsChunkEl.id), 1, 1000);
-
-      cfg.trakt=tr;
-    }
-
-    const hasSM = String(state.src||"").toUpperCase()==="SIMKL" || String(state.dst||"").toUpperCase()==="SIMKL";
-    if(hasSM){
-      const sm = Object.assign({}, cfg.simkl||{});
-      const wlBatchEl = ID("sm-wl-batch");
-      const rtChunkEl = ID("sm-rt-chunk");
-      const hsChunkEl = ID("sm-hs-chunk");
-      if (wlBatchEl) sm.watchlist_batch_size = Math.max(1, parseInt(wlBatchEl.value||"500", 10) || 500);
-      if (rtChunkEl) sm.ratings_chunk_size = Math.max(1, parseInt(rtChunkEl.value||"500", 10) || 500);
-      if (hsChunkEl) sm.history_chunk_size = Math.max(1, parseInt(hsChunkEl.value||"500", 10) || 500);
-      cfg.simkl = sm;
     }
 
     const hasST = String(state.src||"").toUpperCase()==="STREMIO" || String(state.dst||"").toUpperCase()==="STREMIO";
@@ -2876,28 +2644,6 @@ async function saveConfigBits(state){
         st.ratings = ratings;
         cfg.stremio = st;
       }
-    }
-
-    const hasMD = String(state.src||"").toUpperCase()==="MDBLIST" || String(state.dst||"").toUpperCase()==="MDBLIST";
-    if(hasMD){
-      const md = Object.assign({}, cfg.mdblist||{});
-      const n = x => parseInt((ID(x)?.value||"").trim(), 10);
-      const clamp = (v,min,max)=>Math.min(max,Math.max(min,Number.isFinite(v)?v:min));
-      const wlBatchEl = ID("md-wl-batch");
-      const rtPerEl = ID("md-rt-perpage");
-      const rtPagesEl = ID("md-rt-maxpages");
-      const rtChunkEl = ID("md-rt-chunk");
-      const hsPerEl = ID("md-hs-perpage");
-      const hsPagesEl = ID("md-hs-maxpages");
-      const hsChunkEl = ID("md-hs-chunk");
-      if (wlBatchEl) md.watchlist_batch_size = clamp(n(wlBatchEl.id), 1, 1000);
-      if (rtPerEl) md.ratings_per_page = clamp(n(rtPerEl.id), 1, 1000);
-      if (rtPagesEl) md.ratings_max_pages = clamp(n(rtPagesEl.id), 1, 2000);
-      if (rtChunkEl) md.ratings_chunk_size = clamp(n(rtChunkEl.id), 1, 1000);
-      if (hsPerEl) md.history_per_page = clamp(n(hsPerEl.id), 1, 1000);
-      if (hsPagesEl) md.history_max_pages = clamp(n(hsPagesEl.id), 1, 2000);
-      if (hsChunkEl) md.history_chunk_size = clamp(n(hsChunkEl.id), 1, 1000);
-      cfg.mdblist = md;
     }
 
     const res=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(cfg)});
@@ -2954,6 +2700,8 @@ function buildPayload(state,wrap){
   if(state.pair_remove_mode_touched) applyPairRemoveMode(features,state.pair_remove_mode);
   const payload={source:src,target:dst,source_instance:String(srcInst||"default"),target_instance:String(dstInst??"default"),enabled,mode:modeTwo?"two-way":"one-way",features};
   payload.path_matching=supportsPathMatching({src,dst})&&!!state.path_matching;
+  payload.match_users=supportsMatchUsers({src,dst})&&!!state.match_users;
+  payload.user_matches=payload.match_users?{...(state.user_matches||{})}:{};
   const eid=wrap.dataset&&wrap.dataset.editingId?String(wrap.dataset.editingId||""):"";
   const selectedProfileId=String(state.selected_user_profile_id||"").trim();
   if(selectedProfileId||eid) payload.profile_id=selectedProfileId;
@@ -2962,6 +2710,7 @@ function buildPayload(state,wrap){
   const usePlex=(String(src).toUpperCase()==="PLEX"||String(dst).toUpperCase()==="PLEX");
   const useJf=(String(src).toUpperCase()==="JELLYFIN"||String(dst).toUpperCase()==="JELLYFIN");
   const useEm=(String(src).toUpperCase()==="EMBY"||String(dst).toUpperCase()==="EMBY");
+  const useSilo=(String(src).toUpperCase()==="SILO"||String(dst).toUpperCase()==="SILO");
   const useTr=(String(src).toUpperCase()==="TRAKT"||String(dst).toUpperCase()==="TRAKT");
   const usePmdb=(String(src).toUpperCase()==="PUBLICMETADB"||String(dst).toUpperCase()==="PUBLICMETADB");
   const useFloppy=(String(src).toUpperCase()==="FLOPPY"||String(dst).toUpperCase()==="FLOPPY");
@@ -2972,6 +2721,7 @@ function buildPayload(state,wrap){
   }
   if(useJf) prov.jellyfin={strict_id_matching:getPairProviderStrictValue(state, "jellyfin"),targeted_lookup:getPairProviderTargetedLookupValue(state)};
   if(useEm) prov.emby={strict_id_matching:getPairProviderStrictValue(state, "emby")};
+  if(useSilo) prov.silo={strict_id_matching:getPairProviderStrictValue(state, "silo")};
   if(usePmdb){
     const pmSrc=pp.publicmetadb||{};
     const name=(ID("cx-pmdb-wl-name")?.value||pmSrc.watchlist_name||state.cfgRaw?.publicmetadb?.watchlist_name||"Watchlist").trim()||"Watchlist";
@@ -3073,9 +2823,12 @@ export default{
       state.options.collection=safe(f.collection,state.options.collection);
       const r0=state.options.ratings, rI=f.ratings||{};
       state.options.ratings=Object.assign({},r0,rI,{types:Array.isArray(rI.types)&&rI.types.length?rI.types:r0.types,mode:rI.mode||r0.mode,from_date:rI.from_date||r0.from_date||""});
-      ["watchlist","ratings","history","progress"].forEach(k=>{state.options[k].library_only=!!state.options[k].library_only});
+      if(pair.id) ["watchlist","ratings","history","progress"].forEach(k=>{state.options[k].library_only=!!state.options[k].library_only});
       state.pairProviders = normalizePairProviders(pair.providers);
       state.path_matching = !!pair.path_matching;
+      state.match_users = !!pair.match_users;
+      state.user_matches = pair.user_matches && typeof pair.user_matches === "object" ? { ...pair.user_matches } : {};
+      state.editing_pair_id = pair?.id ? String(pair.id) : "";
       state.selected_user_profile_id=String(pair.profile_id||"").trim();
       wrap.dataset.editingId=pair?.id?String(pair.id):"";
     }
@@ -3114,6 +2867,10 @@ export default{
         alert("Choose two different instances to create a sync pair.");
         return;
       }
+      if(scopedPairView()&&(!state.src_instance||!state.dst_instance)){
+        alert("Choose a connected account for both source and target.");
+        return;
+      }
       await saveConfigBits(state);
 
       const feats=payload.features||{};
@@ -3124,7 +2881,7 @@ export default{
       }
 
       const res=await savePair(payload);
-      if(!res.ok){alert(res.error==="same_provider_instance"?"Choose two different instances to create a sync pair.":res.error==="not_found"?"This pair no longer exists. Close the editor and create a new pair.":"Save failed");return;}
+      if(!res.ok){alert(res.error==="same_provider_instance"?"Choose two different instances to create a sync pair.":res.error==="not_found"?"This pair no longer exists. Close the editor and create a new pair.":res.error==="profile_scope_denied"?"Choose accounts that belong to this profile.":"Save failed");return;}
 
       try{
         if(typeof window.loadPairs==="function"){await window.loadPairs(true)}

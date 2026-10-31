@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable, Mapping
 import requests
 
 from cw_platform.app_version import app_version, user_agent as http_user_agent
-from cw_platform.provider_instances import normalize_instance_id
+from cw_platform.provider_instances import is_sync_user_instance, normalize_instance_id, resolve_sync_user_block
 from cw_platform.value_coercion import coerce_bool
 
 from ._log import log as cw_log
@@ -135,7 +135,7 @@ try:  # type: ignore[name-defined]
 except Exception:
     ctx = None  # type: ignore[assignment]
 
-__VERSION__ = "2.7"
+__VERSION__ = "2.8"
 os.environ.setdefault("CW_EMBY_UA", http_user_agent("Emby", override_env="CW_EMBY_UA"))
 __all__ = ["get_manifest", "EMBYModule", "OPS"]
 
@@ -164,6 +164,8 @@ def _pick_instance_id(provider: str, cfg: Mapping[str, Any] | None = None) -> st
 
 def _merge_instance_block(raw: Any, inst: str) -> dict[str, Any]:
     base = dict(raw or {}) if isinstance(raw, Mapping) else {}
+    if is_sync_user_instance(inst):
+        return resolve_sync_user_block(base, inst)
     if inst == "default":
         base.pop("instances", None)
         return base
@@ -683,7 +685,7 @@ class EMBYModule:
     def build_index(self, feature: str, **kwargs: Any) -> Mapping[str, dict[str, Any]]:
         f = (feature or "watchlist").lower()
         if not self._is_enabled(f):
-            _info("index_skipped", feature=f, reason="feature_disabled")
+            _info("index_skipped", sync_feature=f, reason="feature_disabled")
             return {}
         mod = _FEATURES.get(f)
         if not mod:
@@ -703,7 +705,7 @@ class EMBYModule:
     ) -> Mapping[str, Any]:
         f = (feature or "watchlist").lower()
         if not self._is_enabled(f):
-            _info("write_skipped", op="add", feature=f, reason="feature_disabled")
+            _info("write_skipped", op="add", sync_feature=f, reason="feature_disabled")
             return {"ok": True, "count": 0, "unresolved": []}
         if dry_run:
             return self._dry_result(items)
@@ -733,7 +735,7 @@ class EMBYModule:
     ) -> Mapping[str, Any]:
         f = (feature or "watchlist").lower()
         if not self._is_enabled(f):
-            _info("write_skipped", op="remove", feature=f, reason="feature_disabled")
+            _info("write_skipped", op="remove", sync_feature=f, reason="feature_disabled")
             return {"ok": True, "count": 0, "unresolved": []}
         if dry_run:
             return self._dry_result(items)

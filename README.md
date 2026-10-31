@@ -61,7 +61,7 @@ When you need more control, Interactive Sync lets you review changes before appl
 - Watcher with multiple routes for different servers and users. **No Plex Pass or Emby Premiere needed.**
 - Server-to-server, server-to-tracker and tracker-to-tracker sync, where supported.
 - Watchlists, ratings, history, playback progress and collections. Rewatches too, for supported trackers.
-- Multiple accounts, separate profiles and managed user support.
+- Multiple accounts, separate profiles and managed users who can handle their own pairs, routes and schedule.
 - Interactive Sync to review additions, updates and removals before applying them.
 - Webhook scrobbling for supported providers.
 - Custom mappings for wrong matches, anime IDs, and split or combined episodes.
@@ -70,7 +70,7 @@ When you need more control, Interactive Sync lets you review changes before appl
 
 ## Supported integrations
 
-CW works with Plex, Jellyfin, Emby, SIMKL, Floppy, FlickList, Trakt, WeTrakr, AniList, MyAnimeList (MAL), Kitsu, TMDb, MDBList, PublicMetaDB, PunchPlay, BingeBase, Scrob, Tautulli, Tracearr, Kodi, Nuvio, Stremio and its own local CW Tracker.
+CW works with Plex, Jellyfin, Emby, Silo, SIMKL, Floppy, FlickList, Trakt, WeTrakr, AniList, MyAnimeList (MAL), Kitsu, TMDb, MDBList, PublicMetaDB, PunchPlay, BingeBase, Scrob, Tautulli, Tracearr, Kodi, Nuvio, Stremio and its own local CW Tracker.
 
 Not every integration supports every feature. Some sync lists and history; others report playback activity. Setup details are in the [wiki](https://wiki.crosswatch.app/).
 
@@ -134,7 +134,7 @@ See the [first-time setup guide](https://wiki.crosswatch.app/getting-started/fir
 
 ## Scrobbling
 
-**Watcher** reports playback from Plex, Emby, Jellyfin, Kodi and Scrob to supported trackers. No Plex Pass or Emby Premiere needed for Watcher.
+**Watcher** reports playback from Plex, Emby, Jellyfin, Silo, Kodi and Scrob to supported trackers. No Plex Pass or Emby Premiere needed for Watcher.
 
 You can also use **webhooks** from Plex, Emby and Jellyfin. Anime ID mapping is available for Watcher and webhooks with supported providers.
 

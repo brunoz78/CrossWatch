@@ -761,6 +761,8 @@ def build_snapshots_for_feature(
             normalize = getattr(ops, "replay_index", None)
             if replaying() and callable(normalize):
                 idx_raw = provider_call(normalize, config, feature=feature, items=idx_raw)
+            if not isinstance(idx_raw, (Mapping, list)):
+                raise RuntimeError(f"snapshot_invalid_result:{name}:{feature}:{type(idx_raw).__name__}")
         except Exception as e:
             emit_info(
                 f"[!] snapshot.failed provider={name} feature={feature} error={e}"
@@ -789,6 +791,11 @@ def build_snapshots_for_feature(
 
     _maybe_backfill_anilist_shadow(snaps, feature=feature, dbg=dbg)
     return snaps
+
+def require_snapshot(snaps: Mapping[str, Any], name: str, feature: str) -> dict[str, Any]:
+    if name not in snaps:
+        raise RuntimeError(f"snapshot_unavailable:{name}:{feature}")
+    return dict(snaps.get(name) or {})
 
 def coerce_suspect_snapshot(
     *,
@@ -847,3 +854,14 @@ def coerce_suspect_snapshot(
         return dict(prev_idx), True, reason
 
     return dict(cur_idx), False, "progressed"
+
+
+def emit_cloud_history_read(emit, provider, feature, config, index):
+    if provider != "PLEX" or feature != "history":
+        return
+    if ((config.get("plex") or {}).get("history") or {}).get("read_cloud_history") is not True:
+        return
+    emit("history:cloud_read:done", provider=provider, feature=feature,
+         instance=config.get("_cw_endpoint_instance") or config.get("_cw_provider_instance") or "default",
+         cloud_history_entries=sum(1 for item in index.values() if isinstance(item, Mapping) and item.get("_plex_cloud_history") is True),
+         count=len(index))

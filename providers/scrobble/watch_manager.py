@@ -15,7 +15,7 @@ except Exception:
     BASE_LOG = None
 
 from cw_platform.config_base import load_config
-from providers.scrobble.routes import ROUTE_POLL_KEYS, build_route_cfg, build_route_cfg_by_id, find_route, group_poll_seconds, normalize_routes, route_is_self_target
+from providers.scrobble.routes import ROUTE_POLL_KEYS, build_route_cfg, build_route_cfg_by_id, expand_sync_user_route, find_route, group_poll_seconds, normalize_routes, route_is_self_target
 from providers.scrobble.scrobble import Dispatcher, ScrobbleEvent
 from providers.scrobble.sources import source_enabled
 
@@ -264,6 +264,10 @@ def _make_sink(name: str, cfg_provider: Callable[[], dict[str, Any]], instance_i
         from providers.scrobble.scrob.sink import ScrobSink
 
         cls = ScrobSink
+    elif sink == "silo":
+        from providers.scrobble.silo.sink import SiloSink
+
+        cls = SiloSink
     else:
         raise ValueError(f"Unknown sink: {sink}")
 
@@ -308,6 +312,8 @@ def _make_watcher(provider: str, group_dispatcher: MultiDispatcher, cfg_provider
         from providers.scrobble.scrob.watch import make_default_watch as make_watch
     elif prov == "stremio":
         from providers.scrobble.stremio.watch import make_default_watch as make_watch
+    elif prov == "silo":
+        from providers.scrobble.silo.watch import make_default_watch as make_watch
     else:
         from providers.scrobble.plex.watch import make_default_watch as make_watch
         prov = "plex"
@@ -355,7 +361,7 @@ class WatchManager:
                 self._app.state.watch_groups = {}
                 return self.status()
 
-            routes = [r for r in normalize_routes(cfg) if isinstance(r, dict) and bool(r.get("enabled"))]
+            routes = [d for r in normalize_routes(cfg) if isinstance(r, dict) and bool(r.get("enabled")) for d in expand_sync_user_route(cfg, r)]
             grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
             for r in routes:
                 if route_is_self_target(r):
@@ -466,7 +472,7 @@ class WatchManager:
                     "provider": g.provider,
                     "provider_instance": g.provider_instance,
                     "running": bool(alive),
-                    "routes": [str(rr.route.get("id") or "") for rr in (g.routes or [])],
+                    "routes": list(dict.fromkeys(str(rr.route.get("_cw_parent_route_id") or rr.route.get("id") or "") for rr in (g.routes or []))),
                 }
             )
             for rr in (g.routes or []):
@@ -474,7 +480,8 @@ class WatchManager:
                 r = find_route(cfg, rr.route_id) or rr.route or {}
                 out_routes.append(
                     {
-                        "id": str(r.get("id") or ""),
+                        "id": str(r.get("_cw_parent_route_id") or r.get("id") or ""),
+                        **({"sync_user": str(r["_cw_sync_user"])} if r.get("_cw_sync_user") else {}),
                         "provider": str(r.get("provider") or g.provider),
                         "provider_instance": str(r.get("provider_instance") or g.provider_instance),
                         "sink": str(r.get("sink") or ""),

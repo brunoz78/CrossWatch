@@ -16,6 +16,33 @@ const sourceFor = name => {
   return index.slice(node.start, node.end);
 };
 
+test("New provider selections retain library filtering defaults while saved pairs keep their setting", () => {
+  const exported = parse(index, {ecmaVersion: "latest", sourceType: "module"}).body.find(node => node.type === "ExportDefaultDeclaration");
+  const mount = exported.declaration.properties.find(node => node.key.name === "mount").value;
+  const initialize = mount.body.body.find(node => node.type === "IfStatement" && index.slice(node.test.start, node.test.end) === 'pair && typeof pair==="object"');
+  for (const scenario of [
+    {pair: {}, expected: true},
+    {pair: {features: {history: {library_only: false}}}, expected: false},
+    {pair: {id: "saved"}, expected: false},
+    {pair: {id: "saved", features: {history: {library_only: true}}}, expected: true},
+  ]) {
+    const context = vm.createContext({
+      PROGRESS_LEGACY_MAX_PERCENT: 95,
+      pair: {source: "JELLYFIN", target: "SILO", ...scenario.pair},
+      wrap: {dataset: {}}, normalizePairProviders: value => value || {},
+      isTwoWayMode: () => false,
+      byName: (_, name) => ({capabilities: {library_presence: {features: name === "SILO" ? ["history", "ratings", "progress"] : []}}}),
+    });
+    vm.runInContext(["defaultState", "providerSupportsLibraryOnly", "pairSupportsLibraryOnly", "libraryOnlyOn"].map(sourceFor).join(";"), context);
+    vm.runInContext(`const state = defaultState(); ${index.slice(initialize.start, initialize.end)}`, context);
+    assert.equal(vm.runInContext('libraryOnlyOn(state, state.options.history)', context), scenario.expected);
+    if (!scenario.pair.id) {
+      assert.equal(vm.runInContext('libraryOnlyOn(state, state.options.progress, "progress")', context), true);
+      assert.equal(vm.runInContext('libraryOnlyOn(state, state.options.watchlist, "watchlist")', context), false);
+    }
+  }
+});
+
 for (const peer of ["SIMKL", "FLOPPY", "KITSU"]) {
   for (const twoWay of [false, true]) {
     for (const reverse of [false, true]) {
@@ -205,7 +232,7 @@ for (const instance of ["default", "P01"]) {
   test(`a sole ${instance} instance leaves the destination explicitly empty`, () => {
     const src = element(), dst = element();
     const context = vm.createContext({
-      ID: id => id === "cx-src-inst" ? src : dst,
+      ID: id => id === "cx-src-inst" ? src : dst, document: {documentElement: {dataset: {}}},
       same: (a, b) => a === b, escHTML: value => value, G: {}, renderPairUserProfileControl() {},
       defaultFor: () => ({}), isAniList: () => false, isSimkl: () => false, isMDBList: () => false, isCrossWatch: () => false,
       applyProgressMaxRecommendation: () => ({maxPercent: 90}), ratingsDisabledFor: () => new Set(),
@@ -213,7 +240,7 @@ for (const instance of ["default", "P01"]) {
       sanitizeFeaturesForPair: (_, features) => features, getPairProviderStrictValue: () => false,
       libraryOnlyOn: () => false, tmdbMetadataReady: () => true,
     });
-    vm.runInContext([sourceFor("renderInstanceSelects"), sourceFor("hasAniList"), sourceFor("hasAnimeProvider"), sourceFor("supportsPathMatching"), sourceFor("getPairMarkedWatchedValue"), sourceFor("buildPayload")].join(";"), context);
+    vm.runInContext([sourceFor("scopedPairView"), sourceFor("renderInstanceSelects"), sourceFor("hasAniList"), sourceFor("hasAnimeProvider"), sourceFor("supportsPathMatching"), sourceFor("getPairMarkedWatchedValue"), sourceFor("buildPayload")].join(";"), context);
     const state = {src: "PLEX", dst: "PLEX", src_instance: instance, instanceMap: {PLEX: [{id: instance, configured: true}]}};
     context.renderInstanceSelects(state);
     assert.equal(state.src_instance, instance);
@@ -223,6 +250,57 @@ for (const instance of ["default", "P01"]) {
     assert.equal(payload.target_instance, "");
   });
 }
+
+for (const dataset of [{cwRole: "user"}, {cwViewAs: "1"}]) {
+  test(`a scoped ${Object.keys(dataset)[0]} view never offers the default instance`, () => {
+    const src = element(), dst = element();
+    const context = vm.createContext({
+      ID: id => id === "cx-src-inst" ? src : dst, document: {documentElement: {dataset}},
+      same: (a, b) => a === b, escHTML: value => value, G: {}, renderPairUserProfileControl() {},
+    });
+    vm.runInContext([sourceFor("scopedPairView"), sourceFor("renderInstanceSelects")].join(";"), context);
+    const state = {src: "SIMKL", dst: "MDBLIST", src_instance: "default", dst_instance: "default", instancesLoaded: true, instanceMap: {SIMKL: [{id: "SIMKL-P01", configured: true}]}};
+    context.renderInstanceSelects(state);
+    assert.equal(state.src_instance, "SIMKL-P01");
+    assert.equal(state.dst_instance, "");
+    assert.equal(dst.disabled, true);
+    assert.ok(!src.innerHTML.includes("Default"));
+    assert.ok(dst.innerHTML.includes("No configured instance"));
+    state.dst = "SIMKL";
+    context.renderInstanceSelects(state);
+    assert.equal(state.dst_instance, "");
+    assert.ok(dst.innerHTML.includes("No other configured instance"));
+  });
+}
+
+test("a scoped edit never keeps an unconfigured saved instance or swaps it silently", () => {
+  const src = element(), dst = element();
+  const context = vm.createContext({
+    ID: id => id === "cx-src-inst" ? src : dst, document: {documentElement: {dataset: {cwRole: "user"}}},
+    same: (a, b) => a === b, escHTML: value => value, G: {}, renderPairUserProfileControl() {},
+    resetPairUserProfileControl() {}, renderFeaturePanel() {},
+  });
+  vm.runInContext([sourceFor("scopedPairView"), sourceFor("renderInstanceSelects")].join(";"), context);
+  const state = {
+    src: "SIMKL", dst: "TRAKT", src_instance: "SIMKL-P02", dst_instance: "TRAKT-P01", instancesLoaded: true,
+    savedInstances: {src: {provider: "SIMKL", instance: "SIMKL-P02"}, dst: {provider: "TRAKT", instance: "TRAKT-P01"}},
+    instanceMap: {SIMKL: [{id: "SIMKL-P01", configured: true}, {id: "SIMKL-P02", configured: false}]},
+  };
+  context.renderInstanceSelects(state);
+  assert.equal(state.src_instance, "");
+  assert.ok(src.innerHTML.includes("Choose an account"));
+  assert.ok(!src.innerHTML.includes("SIMKL-P02"));
+  assert.equal(state.dst_instance, "");
+  assert.equal(dst.disabled, true);
+  state.dst = "MDBLIST";
+  context.renderInstanceSelects(state);
+  assert.equal(state.src_instance, "");
+  assert.ok(src.innerHTML.includes("Choose an account"));
+  src.value = "SIMKL-P01";
+  src.onchange();
+  assert.equal(state.src_instance, "SIMKL-P01");
+  assert.ok(!src.innerHTML.includes("Choose an account"));
+});
 
 test("library lists load and save independently for both instances", async () => {
   const nodes = new Map(), requests = [];
@@ -331,6 +409,50 @@ test("saving History leaves the shared Plex Marked Watched default unchanged", a
   assert.equal(saved.plex.history.include_marked_watched, true);
 });
 
+test("Discover opt-in stays in its pair and allows items outside the destination library", () => {
+  const listeners = [];
+  const libraryOnly = {checked: true};
+  const context = vm.createContext({ID: id => id === "cx-hs-library-only" ? libraryOnly : null});
+  vm.runInContext(sourceFor("bindChangeHandlers"), context);
+  const cfgRaw = {plex: {history: {discover_fallback: false}}};
+  const state = {cfgRaw, options: {history: {library_only: true, add: true}},
+    pairProviders: {plex: {history: {include_marked_watched: false}}}};
+  context.bindChangeHandlers(state, {addEventListener: (event, handler) => { if (event === "change") listeners.push(handler); }});
+  for (const handler of listeners) handler({target: {id: "plx-discover-fallback", checked: true}});
+  assert.equal(state.pairProviders.plex.history.discover_fallback, true);
+  assert.equal(state.pairProviders.plex.history.include_marked_watched, false);
+  assert.equal(state.options.history.library_only, false);
+  assert.equal(state.options.history.add, true);
+  assert.equal(libraryOnly.checked, false);
+  assert.equal(cfgRaw.plex.history.discover_fallback, false);
+  for (const handler of listeners) handler({target: {id: "plx-discover-fallback", checked: false}});
+  assert.equal(state.pairProviders.plex.history.discover_fallback, false);
+});
+
+test("Discover control is off by default and only shown when the pair writes to Plex", () => {
+  const render = index.split("\n").find(line => line.includes('parts.push(`') && line.includes('id="plx-discover-fallback"'));
+  for (const [src, dst, twoWay, visible] of [["TRAKT", "PLEX", false, true], ["PLEX", "TRAKT", false, false], ["PLEX", "TRAKT", true, true]]) {
+    const context = vm.createContext({parts: [], state: {src, dst},
+      same: (a, b) => a.toLowerCase() === b.toLowerCase(), isTwoWayMode: () => twoWay});
+    vm.runInContext(render, context);
+    assert.equal(context.parts.length > 0, visible);
+    assert.doesNotMatch(context.parts.join(""), /type="checkbox" checked/);
+  }
+});
+
+test("Discover turns off when destination library filtering is enabled", () => {
+  const listeners = [];
+  const nodes = new Map([["cx-hs-library-only", {checked: true}], ["plx-discover-fallback", {checked: true}]]);
+  const context = vm.createContext({ID: id => nodes.get(id), Q: () => null, updateFlow: () => {}});
+  vm.runInContext(sourceFor("bindChangeHandlers"), context);
+  const state = {options: {history: {}}, visited: new Set(), pairProviders: {plex: {history: {discover_fallback: true}}}};
+  context.bindChangeHandlers(state, {addEventListener: (event, handler) => { if (event === "change") listeners.push(handler); }});
+  for (const handler of listeners) handler({target: {id: "cx-hs-library-only", checked: true}});
+  assert.equal(state.pairProviders.plex.history.discover_fallback, false);
+  assert.equal(nodes.get("plx-discover-fallback").checked, false);
+  assert.equal(state.options.history.library_only, true);
+});
+
 for (const [feature, prefix, rule] of [["ratings", "rt", "applyRatingsTypeRules"], ["collection", "co", "applyCollectionTypeRules"]]) {
   test(feature + " scope stays disabled until the feature is enabled", () => {
     const nodes = new Map();
@@ -355,12 +477,12 @@ for (const [feature, prefix, rule] of [["ratings", "rt", "applyRatingsTypeRules"
   });
 }
 
-test("Marked Watched follows History enable without changing its value", () => {
+for (const controlId of ["plx-marked-watched", "plx-cloud-read", "plx-discover-fallback"]) test(`${controlId} follows History enable without changing its value`, () => {
   for (const checked of [false, true]) {
     const classes = new Set();
     const control = {checked, dataset: {}, closest: () => ({classList: {toggle: (name, on) => on ? classes.add(name) : classes.delete(name)}})};
     const enable = {checked: false};
-    const nodes = new Map([["cx-hs-enable", enable], ["plx-marked-watched", control]]);
+    const nodes = new Map([["cx-hs-enable", enable], [controlId, control]]);
     const context = vm.createContext({ID: id => nodes.get(id), Q: selector => nodes.get(selector.slice(1))});
     vm.runInContext(sourceFor("applySubDisable"), context);
     for (const enabled of [false, true, false]) {
@@ -369,6 +491,66 @@ test("Marked Watched follows History enable without changing its value", () => {
       assert.equal(control.disabled, !enabled);
       assert.equal(classes.has("muted"), !enabled);
       assert.equal(control.checked, checked);
+    }
+  }
+});
+
+
+test("cloud read opt-in is independent of writes and disables removals", () => {
+  const listeners = [];
+  const remove = {checked:true};
+  const context = vm.createContext({ID: id => id === "cx-hs-remove" ? remove : null});
+  vm.runInContext(sourceFor("bindChangeHandlers"), context);
+  const state = {options:{history:{remove:true}}, pairProviders:{plex:{history:{discover_fallback:true}}}};
+  context.bindChangeHandlers(state, {addEventListener:(event, handler)=>{if(event === "change") listeners.push(handler);}});
+  for(const handler of listeners) handler({target:{id:"plx-cloud-read",checked:true}});
+  assert.equal(state.pairProviders.plex.history.read_cloud_history, true);
+  assert.equal(state.pairProviders.plex.history.discover_fallback, true);
+  assert.equal(state.options.history.remove, false);
+  assert.equal(remove.checked, false);
+  for(const handler of listeners) handler({target:{id:"plx-cloud-read",checked:false}});
+  assert.equal(state.pairProviders.plex.history.read_cloud_history, false);
+  assert.equal(state.pairProviders.plex.history.discover_fallback, true);
+});
+
+test("cloud read is offered only when Plex sends history", () => {
+  const render = index.split("\n").find(line => line.includes('parts.push(`') && line.includes('id="plx-cloud-read"'));
+  for(const [src,dst,twoWay,visible] of [["PLEX","TRAKT",false,true],["TRAKT","PLEX",false,false],["TRAKT","PLEX",true,true]]){
+    const context = vm.createContext({parts:[],state:{src,dst},same:(a,b)=>a.toLowerCase()===b.toLowerCase(),isTwoWayMode:()=>twoWay});
+    vm.runInContext(render, context);
+    assert.equal(context.parts.length > 0,visible);
+    assert.doesNotMatch(context.parts.join(""), /type="checkbox" checked/);
+  }
+});
+
+
+test("Plex cloud controls follow direction and preserve independent settings across mode changes", () => {
+  const render = index.split("\n").filter(line => line.includes('parts.push(`') && /id="plx-(cloud-read|discover-fallback)"/.test(line)).join("\n");
+  for (const [src, dst] of [["PLEX", "TRAKT"], ["SIMKL", "PLEX"], ["JELLYFIN", "PLEX"], ["TRAKT", "SIMKL"], ["PLEX", "PLEX"]]) {
+    for (const read of [false, true]) for (const write of [false, true]) {
+      const state = {src, dst, twoWay:false, pairProviders:{plex:{history:{read_cloud_history:read, discover_fallback:write}}}};
+      const before = JSON.stringify(state.pairProviders);
+      const context = vm.createContext({parts:[],state,same:(a,b)=>a.toLowerCase()===b.toLowerCase(),isTwoWayMode:state=>state.twoWay});
+      for (const twoWay of [false, true, false]) {
+        state.twoWay = twoWay;
+        context.parts = [];
+        vm.runInContext(render, context);
+        const html = context.parts.join("");
+        const hasPlex = src === "PLEX" || dst === "PLEX";
+        const separate = twoWay || (src === "PLEX" && dst === "PLEX");
+        assert.equal((html.match(/type="checkbox"/g) || []).length, hasPlex ? separate ? 2 : 1 : 0);
+        if (hasPlex) {
+          assert.equal(html.includes(">Include Plex cloud history</label>"), !separate);
+          assert.equal(html.includes(">Read cloud history</label>"), separate);
+          assert.equal(html.includes(">Write cloud fallback</label>"), separate);
+          for (const [id, visible, checked] of [["plx-cloud-read", twoWay || src === "PLEX", read], ["plx-discover-fallback", twoWay || dst === "PLEX", write]]) {
+            const input = html.match(new RegExp(`<input id="${id}"[^>]*>`));
+            assert.equal(!!input, visible);
+            if (input) assert.equal(input[0].includes(" checked"), checked);
+          }
+        }
+        assert.equal(JSON.stringify(state.pairProviders), before);
+      }
     }
   }
 });

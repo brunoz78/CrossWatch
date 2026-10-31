@@ -46,6 +46,14 @@ const maybeTS = (v) => {
   return String(v);
 };
 
+const cloudResultsHTML = (e) => {
+  const detail = detailOf(e);
+  const rows = Array.isArray(detail.cloud_results) ? detail.cloud_results.filter(row => row && typeof row === "object") : [];
+  const omitted = Number(detail.cloud_results_omitted || 0);
+  const labels = {dated:"Plex cloud: original date restored",present:"Plex cloud: already watched, unchanged",cached:"Plex cloud: previously confirmed",plex_discover_date_pending:"Plex cloud: date repair pending"};
+  const counts = detail.cloud_outcome_counts && typeof detail.cloud_outcome_counts === "object" ? detail.cloud_outcome_counts : {};
+  return rows.length || omitted ? `<span class="ev-tl-desc"><strong>Plex Discover fallback</strong>${Object.entries(counts).map(([outcome, count]) => `<span>${esc(labels[outcome] || outcome)}: ${esc(count)}; </span>`).join("")}${rows.map(row => `<span><br>${esc(row.title || row.key)}: ${esc(labels[row.outcome] || row.reason || row.outcome)}</span>`).join("")}${omitted ? `<span><br>${omitted} additional item details omitted; totals include all outcomes.</span>` : ""}</span>` : "";
+};
 const detailOf = (e) => {
   try {
     return typeof e?.detail === "string" ? (e.detail ? JSON.parse(e.detail) : {}) : (e?.detail || {});
@@ -83,11 +91,17 @@ const instLabel = (prov, inst) => {
   if (!p) return "";
   const i = String(inst || "").trim();
   if (!i || i.toLowerCase() === "default") return `${p} default`;
+  const user = SYNC_USER_LABELS[p] && SYNC_USER_LABELS[p][i];
+  if (user !== undefined && i.includes("~")) {
+    const parent = i.split("~")[0];
+    return `${instLabel(p, parent)} · ${user || i.split("~").slice(1).join("~")}`;
+  }
   const label = (PROFILE_LABELS[p] && PROFILE_LABELS[p][i]) || i;
   return `${p} ${label}`;
 };
 
 let PROFILE_LABELS = {};
+let SYNC_USER_LABELS = {};
 
 async function loadProfileLabels(isCurrent = () => true) {
   try {
@@ -107,6 +121,12 @@ async function loadProfileLabels(isCurrent = () => true) {
     if (isCurrent()) PROFILE_LABELS = out;
   } catch {
     if (isCurrent()) PROFILE_LABELS = {};
+  }
+  try {
+    const users = await fjson("/api/sync-user-labels", { cache: "no-store" });
+    if (isCurrent()) SYNC_USER_LABELS = users && typeof users === "object" ? users : {};
+  } catch {
+    if (isCurrent()) SYNC_USER_LABELS = {};
   }
 }
 
@@ -137,6 +157,7 @@ const BADGE = {
   blackbox_blocked: "Blackbox blocked",
   tombstone_created: "Tombstone created",
   tombstone_pruned: "Tombstone pruned",
+  cloud_history_read: "Plex cloud history read",
   plan_created: "Item planned",
   provider_health: "Provider health",
   sync_run_started: "Sync started",
@@ -261,6 +282,7 @@ const titleLine = (e) => {
     case "blackbox_blocked": return "Blocked by blackbox";
     case "tombstone_created": return "Tombstone created";
     case "tombstone_pruned": return "Tombstone pruned";
+    case "cloud_history_read": return `Plex cloud history: ${Number(detailOf(e).cloud_history_entries || 0)} entries included after merging with server history`;
     case "plan_created": return "Add attempted";
     case "provider_health": return `Provider health · ${(e.source_provider || "").toUpperCase()}`;
     case "sync_run_started": return "Sync run started";
@@ -286,6 +308,7 @@ const titleLine = (e) => {
 };
 
 const EVENT_TYPES = [
+  "cloud_history_read",
   "", "write_succeeded", "write_attempted", "write_failed", "unresolved_recorded",
   "blackbox_promoted", "blackbox_blocked", "tombstone_created", "plan_created",
   "provider_health", "sync_run_started", "sync_run_finished",
@@ -728,8 +751,9 @@ export default {
     Q("#ev-mode", root).appendChild(modeSeg.el);
     ddCategory.el.style.display = (mode === "grouped") ? "" : "none";
 
+    const canAudit = isAdmin && !String(window.CW?.OverviewProfile?.id || "").trim();
     let view = initialDomain && ["sync", "scrobble", "audit"].includes(initialDomain) ? initialDomain : ls("cw.events.view", domain === "scrobble" ? "scrobble" : "sync");
-    if (view === "audit" && !isAdmin) view = "sync";
+    if (view === "audit" && !canAudit) view = "sync";
     if (view === "sync" || view === "scrobble" || view === "audit") domain = view;
     let statsRange = ls("cw.events.stats.range", "30d");
 
@@ -755,7 +779,7 @@ export default {
     const VIEW_TABS = [
       { value: "sync", label: "Sync", icon: "sync" },
       { value: "scrobble", label: "Scrobble", icon: "play_circle" },
-      ...(isAdmin ? [{ value: "audit", label: "Audits", icon: "admin_panel_settings" }] : []),
+      ...(canAudit ? [{ value: "audit", label: "Audits", icon: "admin_panel_settings" }] : []),
       { value: "statistics", label: "Statistics", icon: "bar_chart" },
     ];
     const RANGE_TABS = [["24h", "24H"], ["7d", "7D"], ["30d", "30D"], ["90d", "90D"]];
@@ -1456,7 +1480,7 @@ export default {
         const es = sevOf(e);
         const pct = detailOf(e).progress;
         const desc = [eventDesc(e), pct != null ? String(pct) + "%" : ""].filter(Boolean).join(" · ");
-        return `<div class="ev-tl" data-id="${e.id}"><span class="ev-tl-time">${esc(TS(e.created_at))}</span><span class="ev-tl-dot ${es}"></span><span class="ev-tl-body"><span class="ev-tl-head"><span class="ev-tl-title">${esc(titleLine(e))}</span><span class="ev-badge ${es}">${esc(badgeOf(e))}</span></span>${desc ? `<span class="ev-tl-desc">${esc(desc)}</span>` : ""}</span></div>`;
+        return `<div class="ev-tl" data-id="${e.id}"><span class="ev-tl-time">${esc(TS(e.created_at))}</span><span class="ev-tl-dot ${es}"></span><span class="ev-tl-body"><span class="ev-tl-head"><span class="ev-tl-title">${esc(titleLine(e))}</span><span class="ev-badge ${es}">${esc(badgeOf(e))}</span></span>${desc ? `<span class="ev-tl-desc">${esc(desc)}</span>` : ""}${cloudResultsHTML(e)}</span></div>`;
       }).join("");
 
       const detailsPane = kvGrid([
@@ -1573,7 +1597,7 @@ export default {
           <span class="ev-tl-dot ${es}"></span>
           <span class="ev-tl-body">
             <span class="ev-tl-head"><span class="ev-tl-title">${esc(titleLine(e))}</span><span class="ev-badge ${es}">${esc(badgeOf(e))}</span></span>
-            ${desc ? `<span class="ev-tl-desc">${esc(desc)}</span>` : ""}
+            ${desc ? `<span class="ev-tl-desc">${esc(desc)}</span>` : ""}${cloudResultsHTML(e)}
             ${e.reason_code ? `<span class="ev-tl-code mono">${esc(e.reason_code)}</span>` : ""}
           </span>
         </div>`;
@@ -1835,6 +1859,7 @@ export default {
 
     // event detail (raw mode)
     const renderEventDetail = (ctx, e) => {
+      const d = detailOf(e);
       if (String(e.domain || "").toLowerCase() === "audit") {
         renderAuditDetail({ event: e, events: [e] }, e);
         return;
@@ -1859,6 +1884,8 @@ export default {
         ["Destination", esc(dest)],
         ["Pair", esc(pairLabel)],
         ["Run", e.run_id ? `<span class="mono">${esc(e.run_id)}</span>` : "–"],
+        ...(e.event_type === "cloud_history_read" ? [["Cloud history entries included", esc(d.cloud_history_entries ?? 0)], ["Total merged history entries", esc(d.history_entries ?? 0)]] : []),
+        ...(cloudResultsHTML(e) ? [["Plex Discover fallback", cloudResultsHTML(e)]] : []),
         ["Reason", esc(e.reason || e.reason_code || "–")],
         ["Source", e.source_file ? `<span class="mono">${esc(e.source_file)}</span>` : esc(e.source_kind || "–")],
         ["Run time", runTime ? esc(runTime) : "–"],

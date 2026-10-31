@@ -78,7 +78,7 @@ register_cache("analyzer", _clear_analyzer_caches)
 
 _LOG = logging.getLogger("crosswatch.analyzer")
 _TRACKER_PROVIDER_BASES = {"CROSSWATCH", "TRAKT", "SIMKL", "MDBLIST", "ANILIST", "KITSU", "MYANIMELIST", "WETRAKR"}
-_MEDIA_SERVER_PROVIDER_BASES = {"PLEX", "EMBY", "JELLYFIN"}
+_MEDIA_SERVER_PROVIDER_BASES = {"PLEX", "EMBY", "JELLYFIN", "SILO"}
 _STRICT_PAIRS_PREFIX = "__cw_strict_pairs__:"
 
 
@@ -263,7 +263,12 @@ def _cfg() -> dict[str, Any]:
         cfg = load_config()
     except Exception:
         return {}
-    return cfg or {}
+    cfg = cfg or {}
+    if any(isinstance(pair, Mapping) and pair.get("match_users") for pair in cfg.get("pairs") or []):
+        from cw_platform.orchestrator._pairs import expand_sync_user_pairs
+
+        cfg = {**cfg, "pairs": [dict(pair) for pair in expand_sync_user_pairs(cfg)]}
+    return cfg
 
 
 def _tmdb_key() -> str:
@@ -486,7 +491,8 @@ def _load_state_at(path: Path) -> dict[str, Any]:
 
 def _analysis_pair_ids(pairs_raw: str | None) -> list[str]:
     cfg = _config_for_pairs(_cfg(), pairs_raw)
-    return [_pair_id(pair) for pair in cfg.get("pairs") or [] if isinstance(pair, Mapping) and _pair_id(pair) and pair.get("enabled") is not False]
+    ids = [_pair_id(pair) for pair in cfg.get("pairs") or [] if isinstance(pair, Mapping) and _pair_id(pair) and pair.get("enabled") is not False]
+    return list(dict.fromkeys(ids))
 
 
 def _load_state_handles(pairs_raw: str | None, features: Iterable[str] | None = None) -> list[dict[str, Any]]:
@@ -2023,7 +2029,7 @@ def _history_rewatch_pair_set(cfg: dict[str, Any]) -> set[tuple[str, str]]:
 
 def _supports_pair_libs(prov: str) -> bool:
     base, _ = _split_prov_token(prov)
-    return base in ("PLEX", "EMBY", "JELLYFIN")
+    return base in ("PLEX", "EMBY", "JELLYFIN", "SILO")
 
 
 _TYPE_TOKEN_MAP: dict[str, str] = {
@@ -2621,6 +2627,25 @@ class _AnalysisContext:
     anime_coords: _AnimeHistoryCoords | None = None
     anime_eligibility: dict[tuple[str, str, str], dict[int, bool]] = field(default_factory=dict)
     episode_groups: Any = None
+
+    cloud_confirmations: dict[str, set[str]] = field(default_factory=dict)
+
+    def cloud_confirmed(self, target, item):
+        from types import SimpleNamespace
+        from cw_platform.provider_instances import build_provider_config_view, is_sync_user_instance
+        from providers.sync.plex._discover_history import completed_items, _signature
+
+        provider, instance = _split_prov_token(target)
+        if provider != "PLEX" or is_sync_user_instance(instance):
+            return False
+        cache = self.cloud_confirmations
+        if target not in cache:
+            view = build_provider_config_view(self.cfg, provider, instance)
+            plex = dict(view.get("plex") or {})
+            plex["history"] = dict(plex.get("history") or {}, discover_fallback=True)
+            adapter = SimpleNamespace(config={"plex": plex}, client=SimpleNamespace(user_username=plex.get("username"), selected_username=plex.get("username"), selected_account_id=plex.get("account_id")))
+            cache[target] = completed_items(adapter, None)
+        return _signature(item) in cache[target]
 
     def groups(self):
         if self.episode_groups is None:
@@ -3990,6 +4015,19 @@ def _problems(
                         details = ([{"target": "ALL", "feature": feat, "message": f"Blocked by {_MANUAL_POLICY_REF}."}] + (details or []))
                     if details:
                         prob["target_show_info"] = details
+                if feat == "history" and v.get("_plex_cloud_history") is True:
+                    prob["history_source"] = "plex_cloud"
+                    source_message = "Source: Plex cloud history. This entry does not confirm presence in a Plex server library."
+                    prob["message"] = " ".join(filter(None, [prob.get("message"), source_message]))
+                    prob.setdefault("hints", []).append({"kind": "plex_cloud_history", "message": source_message})
+                cloud_targets = [target for target in missing_targets if feat == "history" and analysis.cloud_confirmed(target, v)]
+                if cloud_targets:
+                    prob["cloud_confirmed_targets"] = cloud_targets
+                    cloud_message = "Recently confirmed watched in Plex cloud; absent from the saved server snapshot. Cloud confirmation is retained for 24 hours."
+                    prob["message"] = " ".join(filter(None, [prob.get("message"), cloud_message]))
+                    prob.setdefault("hints", []).append({"kind": "plex_cloud_confirmed", "message": cloud_message, "targets": cloud_targets})
+                    if len(cloud_targets) == len(missing_targets) and not blocked and not time_differences and not group_details:
+                        prob["severity"] = "info"
                 probs.append(prob)
 
     probs.extend(analysis.groups().problems)
@@ -4582,6 +4620,8 @@ def _detail_for_item(pairs_raw: str | None, provider: str, feature: str, key: st
     blocked = bool(blocks and any(kk in blocks for kk in [key, *alias_keys]))
 
     hints = _missing_peer_hints(_unresolved_index(allowed), feat_key, alias_keys, missing_targets, blocked, key)
+    if feat_key == "history" and it.get("_plex_cloud_history") is True:
+        hints.append({"kind": "plex_cloud_history", "message": "Source: Plex cloud history. This entry does not confirm presence in a Plex server library."})
     group_details = [group for dst in context.pairs.get((prov_key, feat_key), [])
                      if feat_key == "history" and (group := context.groups().match(prov_key, dst, it))]
     hints.extend(dict(kind="episode_group", **group) for group in group_details)

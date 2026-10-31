@@ -1,11 +1,60 @@
 /* CrossWatch - Scrobbler Webhook Modal */
+import { createIdentityMap, identityMapSupported } from "../core/identity-map.js";
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const label = (v) => window.CW?.ProviderMeta?.label?.(v) || ({ plex: "Plex", jellyfin: "Jellyfin", emby: "Emby", trakt: "Trakt", simkl: "SIMKL", mdblist: "MDBList", crosswatch: "CrossWatch", floppy: "Floppy", punchplay: "PunchPlay", bingebase: "BingeBase", flicklist: "FlickList", wetrakr: "WeTrakr", anilist: "AniList", myanimelist: "MyAnimeList", kitsu: "Kitsu", scrob: "Scrob" }[String(v || "").toLowerCase()] || String(v || "").toUpperCase());
-const sinks = ["myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob"];
-const ratingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob"];
+const sinks = ["myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob", "silo"];
+const ratingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob", "silo"];
 const webhookSources = new Set(["plex", "jellyfin", "emby"]);
 const animeMappingSinks = new Set(["crosswatch", "simkl"]);
 const mediaSinks = new Set(["plex", "jellyfin", "emby", "kodi"]);
+const matchUserServers = new Set(["plex", "jellyfin", "emby"]);
+function webhookMatchUsersSupported(sink, sinkInst) {
+  const src = currentSource();
+  return matchUserServers.has(String(sink || "").toLowerCase()) && matchUserServers.has(String(src?.provider || "").toLowerCase()) && identityMapSupported(src.provider, src.instance, sink, sinkInst);
+}
+
+let identityMap = null;
+const identityDrafts = new Map();
+
+function identityDraftKey(sink, sinkInst) {
+  const src = currentSource();
+  return `${String(src.provider || "").toLowerCase()}:${normInst(src.instance)}:${String(sink || "").toLowerCase()}:${normInst(sinkInst)}`;
+}
+
+function identityDraft(sink, sinkInst) {
+  const key = identityDraftKey(sink, sinkInst);
+  if (!identityDrafts.has(key)) {
+    const s = settings();
+    const cur = selectedWebhook();
+    const same = String(cur.sink || "").toLowerCase() === sink && normInst(cur.sink_instance) === normInst(sinkInst);
+    const on = same && s.match_users && typeof s.match_users === "object" ? s.match_users[sink] === true : false;
+    const map = same && s.user_matches && typeof s.user_matches === "object" ? s.user_matches[sink] || {} : {};
+    identityDrafts.set(key, { enabled: on, mapping: { ...map } });
+  }
+  return identityDrafts.get(key);
+}
+
+function mountIdentityMap() {
+  const host = root?.querySelector("#scw-identities");
+  if (!host) { identityMap = null; return; }
+  const src = currentSource();
+  const sink = selectedSinkKey();
+  const sinkInst = selectedSinkInstance(sink);
+  const d = identityDraft(sink, sinkInst);
+  const users = splitValues(root.querySelector("#scw-users")?.value);
+  identityMap = createIdentityMap(host, {
+    source: src.provider,
+    sourceInstance: src.instance,
+    target: sink,
+    targetInstance: sinkInst,
+    exclude: props.mode === "edit" ? `webhook:${String(src.provider || "").toLowerCase()}:${normInst(src.instance)}:${sink}` : "",
+    intro: `Send each person's plays to their own identity on ${label(sink)}.`,
+    note: users.length ? "The user filter on the Filters tab still applies, so add these people there or leave it empty." : "",
+    enabled: d.enabled,
+    mapping: d.mapping,
+    onChange: (v) => { d.enabled = v.enabled; d.mapping = v.mapping; },
+  });
+}
 
 function flashCopied(btn) {
   if (!btn) return;
@@ -222,7 +271,7 @@ function sourceProfiles(provider) {
 function sourceProviderSelect(current) {
   const provs = sourceProviders().sort((a, b) => label(a).localeCompare(label(b), undefined, { sensitivity: "base", numeric: true }));
   const dis = props.mode === "edit" ? "disabled" : "";
-  if (!provs.length) return `<select class="input" id="scw-source-provider" disabled><option value="">No configured media profile</option></select>`;
+  if (!provs.length) return `<select class="input" id="scw-source-provider" disabled><option value="">No configured media instance</option></select>`;
   return `<select class="input" id="scw-source-provider" ${dis}>${provs.map((p) => `<option value="${esc(p)}" ${p === current.provider ? "selected" : ""}>${esc(label(p))}</option>`).join("")}</select>`;
 }
 
@@ -255,7 +304,7 @@ function userProfileField() {
   if (!current) return "";
   const profile = userProfiles.find((p) => p.id === current);
   if (!profile || !profileCanOwnWebhook(profile, selectedWebhook())) return "";
-  return `<div class="scrm-profile-row">${fieldIcon("account_circle", "Assigned profile", `<div class="scrm-profile-display" aria-label="Assigned user profile"><span>${esc(profile.label)}</span></div>`)}</div>`;
+  return `<div class="scrm-profile-row">${fieldIcon("account_circle", "Assigned profile", `<div class="scrm-profile-display" aria-label="Assigned profile"><span>${esc(profile.label)}</span></div>`)}</div>`;
 }
 
 function profileInstanceValues(profile, provider) {
@@ -395,7 +444,7 @@ function sinkSelect(current) {
 
 function sinkProfileSelect(sink, currentInst) {
   const profiles = sinkProfiles(sink).sort((a, b) => profileOptionLabel(a).localeCompare(profileOptionLabel(b), undefined, { sensitivity: "base", numeric: true }));
-  if (!profiles.length) return `<option value="" selected disabled>No configured profile</option>`;
+  if (!profiles.length) return `<option value="" selected disabled>No configured instance</option>`;
   const cur = String(currentInst || "default");
   return profiles.map((p) => `<option value="${esc(p.instance)}" title="${esc(p.instance)}" ${p.instance === cur ? "selected" : ""}>${esc(profileOptionLabel(p))}</option>`).join("");
 }
@@ -405,7 +454,7 @@ function endpointBlock(current) {
     <div class="scrm-provider-card scwm-endpoint-card">
       <div class="scrm-card-head"><span class="scrm-provider-mark"><span class="material-symbols-rounded">link</span></span><div><strong>Endpoint URL</strong><small>Use this URL in ${esc(label(current.provider))}</small></div></div>
       <div class="scrm-endpoint scwm-endpoint">
-        <code title="${esc(current.endpoint_url || "")}">${esc(current.endpoint_url || "Saved profile will receive a URL")}</code>
+        <code title="${esc(current.endpoint_url || "")}">${esc(current.endpoint_url || "Saved instance will receive a URL")}</code>
         <button type="button" class="btn small sc2-icon-btn material-symbols-rounded" data-copy="${esc(current.endpoint_url || "")}" title="Copy URL">content_copy</button>
         <button type="button" class="btn small danger sc2-icon-btn cw-danger-confirm" data-regenerate title="Regeneration is destructive for the old endpoint URL."><span class="material-symbols-rounded">sync_lock</span></button>
       </div>
@@ -431,7 +480,7 @@ function sourcePanel(current) {
     <section class="scrm-panel ${activeTab === "source" ? "active" : ""}" data-panel="source">
       <div class="scrm-journey scrm-journey-compact">
         <span class="material-symbols-rounded scrm-journey-icon">webhook</span>
-        <div><strong>Attach a webhook to a media profile</strong><p>Forward inbound Plex, Jellyfin, or Emby webhook events to one tracker.</p></div>
+        <div><strong>Attach a webhook to a media instance</strong><p>Forward inbound Plex, Jellyfin, or Emby webhook events to one tracker.</p></div>
         ${journeyHelp("scrobbler-webhooks")}
       </div>
       ${userProfileField()}
@@ -452,6 +501,7 @@ function sourcePanel(current) {
           </div>
         </div>
       </div>
+      ${webhookMatchUsersSupported(sink, sinkInst) ? `<div id="scw-identities" class="scrm-identities"></div>` : ""}
       ${endpointBlock(current)}
     </section>
   `;
@@ -521,7 +571,7 @@ function ratingsPanel(provider, ratingsTargets) {
   const targets = visibleRatingSinks(ratingsTargets);
   const globalTargets = globalRatingTargets();
   const globalWarn = globalTargets.length
-    ? `<div class="scrm-note is-warn"><span class="material-symbols-rounded">warning</span><span>Global Plex ratings is on and already forwarding to <strong>${esc(globalTargets.map(label).join(", "))}</strong>. This webhook sends ratings <em>in addition</em> to the global one — only enable trackers here if this profile needs different destinations.</span></div>`
+    ? `<div class="scrm-note is-warn"><span class="material-symbols-rounded">warning</span><span>Global Plex ratings is on and already forwarding to <strong>${esc(globalTargets.map(label).join(", "))}</strong>. This webhook sends ratings <em>in addition</em> to the global one — only enable trackers here if this instance needs different destinations.</span></div>`
     : "";
   return `
     <section class="scrm-panel ${activeTab === "ratings" ? "active" : ""}" data-panel="ratings">
@@ -556,9 +606,9 @@ function optionsPanel() {
       ${anilistHint}
       <div class="scrm-journey scrm-journey-compact">
         <span class="material-symbols-rounded scrm-journey-icon">tune</span>
-        <div><strong>Profile webhook options</strong><p>These values remain inherited unless you enable this override for the profile.</p></div>
+        <div><strong>Instance webhook options</strong><p>These values remain inherited unless you enable this override for the instance.</p></div>
       </div>
-      <label class="scrm-check"><input type="checkbox" id="scw-override-options" ${["pause_debounce_seconds", "suppress_start_at"].some(explicitHas) ? "checked" : ""}> <span>Override profile options</span></label>
+      <label class="scrm-check"><input type="checkbox" id="scw-override-options" ${["pause_debounce_seconds", "suppress_start_at"].some(explicitHas) ? "checked" : ""}> <span>Override instance options</span></label>
       <div class="scrm-fields two">
         ${field("Pause debounce", `<input class="input" id="scw-pause" type="number" min="0" max="3600" value="${esc(settings().pause_debounce_seconds ?? "")}" placeholder="Inherited">`)}
         ${field("Suppress start", `<input class="input" id="scw-suppress" type="number" min="0" max="3600" value="${esc(settings().suppress_start_at ?? "")}" placeholder="Inherited">`)}
@@ -690,7 +740,7 @@ function render(errs = []) {
       <div class="scrm-body">
         <div class="scrm-panel-shell" data-scrm-provider="${esc(provider)}">
           <nav class="cw-subtiles scrm-nav" aria-label="Webhook sections">
-            ${navButton("source", "webhook", "Source", "Profile, destinations, URL")}
+            ${navButton("source", "webhook", "Source", "Instance, destinations, URL")}
             ${navButton("filters", "filter_alt", "Filters", "Users and media")}
             ${navButton("options", "tune", "Options", "Thresholds")}
             ${mediaSinks.has(selectedSinkKey()) ? navButton("libraries", "video_library", "Libraries", "Destination scope") : ""}
@@ -707,7 +757,7 @@ function render(errs = []) {
             ${props.mode === "edit" ? `<button type="button" class="btn danger cw-connection-footer-delete cw-danger-confirm" data-delete-webhook><span class="material-symbols-rounded">delete</span><span>Delete webhook</span></button>` : `<span></span>`}
             ${errs.length
               ? `<span class="scrm-footer-error" role="alert" aria-live="polite"><span class="material-symbols-rounded">warning</span><span class="scrm-footer-error-text">${errs.map((x) => esc(x.message || x.code || x.field)).join(" ")}</span></span>`
-              : dup ? `<span class="scrm-footer-warn"><span class="material-symbols-rounded">warning</span>This media profile already has a webhook</span>` : `<span></span>`}
+              : dup ? `<span class="scrm-footer-warn"><span class="material-symbols-rounded">warning</span>This media instance already has a webhook</span>` : `<span></span>`}
             <button type="button" class="btn cw-connection-footer-cancel" data-close>Cancel</button>
             <button type="button" class="btn primary cw-connection-footer-save" data-save ${dup ? "disabled" : ""}>${saving ? "Saving..." : "Save changes"}</button>
           </div>
@@ -717,6 +767,7 @@ function render(errs = []) {
   `;
   ensureVisiblePanel();
   mountDestinationTable();
+  mountIdentityMap();
 }
 
 function setBusy(flag) {
@@ -760,6 +811,12 @@ function payload() {
   }
   if (animeMappingSinks.has(sink)) body[`anime_mapping_${sink}`] = !!root.querySelector("#scw-anime-mapping")?.checked;
   if (sink === "simkl") body.simkl_rewatches = !!root.querySelector("#scw-simkl-rewatches")?.checked;
+  const sinkInstValue = (body.sink_instances || {})[sink] || "default";
+  if (webhookMatchUsersSupported(sink, sinkInstValue) && identityMap) {
+    const v = identityMap.value;
+    body.match_users = { [sink]: v.enabled };
+    body.user_matches = { [sink]: v.enabled ? v.mapping : {} };
+  }
   if (mediaSinks.has(sink)) {
     const dest = destinationFor(sink);
     const copiesEl = root.querySelector("#scw-update-all-copies");
@@ -911,6 +968,8 @@ export async function mount(shell, incoming = {}) {
   selectedUserProfileId = "";
   destinationState = null;
   destinationLibraries.clear();
+  identityMap = null;
+  identityDrafts.clear();
   modalKey = String(props.mode === "create" ? "__new__" : `${props.webhook?.provider || ""}:${props.webhook?.provider_instance || ""}`);
   activeTab = normalizeActiveTab("source");
   if (root) root.dataset.scrmTab = activeTab;
@@ -1048,6 +1107,8 @@ export function unmount() {
   userProfiles = [];
   selectedUserProfileId = "";
   activeTab = "source";
+  identityMap = null;
+  identityDrafts.clear();
 }
 
 export default { mount, unmount };

@@ -6,6 +6,8 @@ from __future__ import annotations
 from typing import Any
 
 _PLEX_HISTORY_MESSAGES = {
+    "plex_discover_scope_unavailable": "Plex library scope could not be checked completely. Cloud fallback was deferred; retry when the server is available.",
+    "plex_write_exception": "Plex history write failed unexpectedly. Check the write_failed log for the exception type and code location.",
     "in_catalog_watched": "Plex catalog already has this item marked watched.",
     "in_catalog_unwatched": "Plex catalog has this item, but it is not marked watched yet.",
     "not_in_plex_catalog": "Plex could not find this item in the selected libraries.",
@@ -18,11 +20,34 @@ _PLEX_HISTORY_MESSAGES = {
     "scrobble_failed": "Plex scrobble failed before the watched state could be confirmed.",
     "missing_watched_at": "The source item has no watched date, so CrossWatch cannot backdate the Plex history write.",
     "home_scope_not_applied": "Plex Home scope was required but could not be applied.",
+    "plex_discover_disabled": "Plex Discover watched-state fallback is not enabled for this pair.",
+    "plex_discover_not_found": "Plex Discover could not match this movie or episode by its external IDs.",
+    "plex_discover_ambiguous_match": "Plex Discover returned conflicting matches. No watched state was written.",
+    "plex_discover_account_token_required": "Plex rejected or is missing the account token. Reconnect the Plex account before retrying.",
+    "plex_discover_endpoint_unavailable": "Plex could not find the cloud endpoint. Check the connection before retrying.",
+    "plex_discover_manual_review": "The cloud play remained unidentified for one hour after the first completed identification scan. Automatic retries stopped. Inspect Plex history; the journal remains locked against repeat scrobbles. There is currently no supported reset action.",
+    "plex_discover_account_mismatch": "The Plex account token does not belong to the selected user. No cloud write was made.",
+    "plex_discover_account_unsupported": "Plex Discover fallback does not support managed accounts or switched Plex users.",
+    "plex_discover_outside_library_scope": "This item exists outside the selected Plex libraries, so the cloud fallback was skipped.",
+    "plex_discover_date_pending": "The Plex cloud watch date still needs repair. Retry with Discover fallback enabled; an ambiguous play will not be edited.",
+    "plex_discover_rate_limited": "Plex cloud writes are rate limited. Retry after the limit expires; pending date updates are retained.",
+    "plex_discover_request_failed": "Plex cloud recovery could not finish. Pending date updates are retained for retry.",
+    "plex_discover_invalid_response": "Plex returned an unexpected cloud response. Retry after checking the account connection.",
+    "plex_discover_watch_state_unavailable": "Plex did not expose this item's cloud watched state. No new play was written.",
+    "plex_discover_history_unavailable": "Plex cloud history is unavailable. Pending date updates are retained for retry.",
+    "plex_discover_history_order_unavailable": "Plex cloud history was not ordered newest-first or contained an invalid date. Cloud writes are paused for one hour; pending dates are retained.",
+    "plex_discover_history_incomplete": "The cloud history scan reached its batch limit or returned incomplete pagination. Account cloud writes are paused for one hour; pending dates are retained.",
+    "plex_discover_catalog_incomplete": "Plex's cloud episode catalog could not be read completely. No new play was written.",
 }
 
 _MEDIA_SERVER_LIBRARY_MESSAGES = {
     "not_in_library": "The media server library does not contain this item.",
     "not_found": "The media server could not find a matching library item.",
+}
+
+_SILO_MESSAGES = {
+    "ignored_by_server": "Silo ignored this watch because the title was unwatched in Silo after this watch date.",
+    "missing_duration": "Silo has no runtime for this item, so the watch cannot be written.",
 }
 
 _SIMKL_HISTORY_MESSAGES = {
@@ -44,7 +69,14 @@ _DIRECT_LABELS = {
     "path_id_conflict": "File path matches but IDs disagree",
     "not_in_plex_catalog": "Not in library",
     "not_in_library": "Not in library",
+    "ignored_by_server": "Ignored by server",
+    "missing_duration": "Missing runtime",
     "not_in_catalog": "Not in library",
+    "plex_discover_date_pending": "Plex cloud date pending",
+    "plex_discover_manual_review": "Plex cloud play needs manual review",
+    "plex_discover_rate_limited": "Plex cloud rate limit",
+    "plex_discover_not_found": "Not found in Plex Discover",
+    "plex_discover_request_failed": "Plex cloud write incomplete",
     "simkl_not_found:anime_retry:episodes": "SIMKL anime episode not found",
     "simkl_not_found:anime:episodes": "SIMKL anime episode not found",
     "simkl_not_found:anime:shows": "SIMKL anime entry not found",
@@ -128,8 +160,10 @@ def reason_message(raw: Any, *, provider: Any = None, feature: Any = None) -> st
         if low == "not_in_plex_catalog":
             return f"{msg} {TRACKER_TO_MEDIA_SERVER_MESSAGE}"
         return msg
-    if provider_base in {"PLEX", "EMBY", "JELLYFIN", "KODI"} and low in _MEDIA_SERVER_LIBRARY_MESSAGES:
+    if provider_base in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO"} and low in _MEDIA_SERVER_LIBRARY_MESSAGES:
         return _MEDIA_SERVER_LIBRARY_MESSAGES[low]
+    if provider_base == "SILO" and low in _SILO_MESSAGES:
+        return _SILO_MESSAGES[low]
     if provider_base == "SIMKL" and feature_key == "history":
         if low in _SIMKL_HISTORY_MESSAGES:
             return _SIMKL_HISTORY_MESSAGES[low]

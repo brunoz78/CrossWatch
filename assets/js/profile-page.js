@@ -558,7 +558,7 @@
 
   function setAvatar(url) {
     const normalized = window.CW?.AccountMenu?.normalizeAvatarUrl?.(url) || String(url || "").trim();
-    const nodes = [viewingAs() ? null : $("#profile-avatar-button"), $("#cw-nav-profile-avatar"), $("#profile-settings-avatar")].filter(Boolean);
+    const nodes = [viewingAs() ? null : $("#profile-avatar-button"), viewingAs() ? null : $("#cw-nav-profile-avatar"), $("#profile-settings-avatar")].filter(Boolean);
     for (const node of nodes) {
       if (window.CW?.AccountMenu?.setAvatarNode) {
         window.CW.AccountMenu.setAvatarNode(node, normalized);
@@ -675,7 +675,7 @@
     const viewed = viewingAs();
     $("#profile-display-name").textContent = viewed ? (viewAsState.label || viewAsState.id) : display;
     $("#profile-username").textContent = viewed ? `Opened by @${profile.username || ""}` : `@${profile.username || ""}`;
-    $("#profile-role").textContent = viewed ? "User profile" : (profile.is_admin ? "Administrator" : "Managed User");
+    $("#profile-role").textContent = viewed ? "Profile" : (profile.is_admin ? "Administrator" : "Managed User");
     $("#profile-display-input").value = display;
     renderTwoFactor(!!profile.totp_enabled);
     setAvatar(profile.avatar_url || "");
@@ -3683,7 +3683,7 @@
     },
   });
 
-  const PLAYBACK_PROVIDER_KEYS = ["crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "wetrakr", "punchplay", "flicklist", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy"];
+  const PLAYBACK_PROVIDER_KEYS = ["crosswatch", "trakt", "simkl", "mdblist", "publicmetadb", "wetrakr", "punchplay", "flicklist", "plex", "emby", "jellyfin", "nuvio", "kodi", "stremio", "floppy", "silo"];
 
   const playbackPanel = (() => {
     const DEFAULT_TIMEOUT = 20;

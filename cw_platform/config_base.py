@@ -294,6 +294,8 @@ DEFAULT_CFG: dict[str, Any] = {
         "history": {
             "libraries": [],                            # Whitelist of library GUIDs; empty = all
             "include_marked_watched": True,             # Include items manually marked as watched in Plex
+            "read_cloud_history": False,                # Include account-wide Plex cloud watch history when reading
+            "discover_fallback": False,                 # Include account-wide Plex cloud watch history when writing
         },
         "progress": {
             "libraries": [],                            # Whitelist for resumable items; empty = all
@@ -613,7 +615,6 @@ DEFAULT_CFG: dict[str, Any] = {
         "watchlist_shadow_ttl_hours": 168,              # Refresh ETag baseline weekly even if 304s keep coming
         "watchlist_batch_size": 100,                    # Chunk size for add/remove to avoid 429/rate spikes
         "watchlist_log_rate_limits": True,              # Log X-RateLimit-* and Retry-After when present
-        "watchlist_freeze_details": True,               # Persist last status & ids in freeze store for debugging
 
         # Ratings
         "ratings_per_page": 250,                        # Items per page when indexing (10–250; clamped to 250)
@@ -624,8 +625,6 @@ DEFAULT_CFG: dict[str, Any] = {
         "history_per_page": 250,
         "history_max_pages": 10000,                     # Safety cap for huge libraries; lower to bound runtime
         "history_chunk_size": 100,                      # Batch size for history add/remove writes
-        "history_unresolved": False,                    # bool, default false (enable the freeze file)
-        "history_number_fallback": False,               # episode number fallback (no S/E-based resolution when episode IDs are missing)
 
         "_pending_device": {
             "user_code": "",                            # Temporary device code state for PIN login
@@ -751,6 +750,16 @@ DEFAULT_CFG: dict[str, Any] = {
         },
     },
 
+    "silo": {
+        "server_url": "",
+        "verify_ssl": False,
+        "access_token": "",
+        "refresh_token": "",
+        "expires_at": 0,
+        "profile_id": "",
+        "profile_name": "",
+    },
+
     "kodi": {
         "server": "",                                   # http(s)://host:port (required)
         "username": "",                                 # Optional HTTP Basic Auth username
@@ -822,6 +831,7 @@ DEFAULT_CFG: dict[str, Any] = {
         "state_dir": "",                                # Optional override for state dir (defaults to CONFIG/state)  - this will break container setups!
         "telemetry": {"enabled": True},                 # Usage stats
         "max_profiles_per_provider": 10,                # Total profiles per provider incl. default (1-100)
+        "max_sync_users_per_connection": 25,            # Synced media server users per connection (1-100)
         "history_timestamp_tolerance_seconds": 60,      # Same-viewing history match window; 0 requires exact timestamps
 
         # progress
@@ -895,6 +905,7 @@ DEFAULT_CFG: dict[str, Any] = {
             "plex_mdblist_ratings": False,              # Watch mode: forward Plex ratings to MDblist
             "plex_flicklist_ratings": False,            # Watch mode: forward Plex ratings to FlickList
             "plex_scrob_ratings": False,                # Watch mode: forward Plex ratings to Scrob
+            "plex_silo_ratings": False,
             "pause_debounce_seconds": 5,                # Ignore micro-pauses just after start
             "suppress_start_at": 99,                    # Kill near-end "start" flaps (credits)
             "filters": {
@@ -914,6 +925,7 @@ DEFAULT_CFG: dict[str, Any] = {
             "plex_trakt_ratings": False,                # Watch mode: forward Plex ratings to Trakt
             "plex_flicklist_ratings": False,            # Watch mode: forward Plex ratings to FlickList
             "plex_scrob_ratings": False,                # Watch mode: forward Plex ratings to Scrob
+            "plex_silo_ratings": False,
             # Plex-only filters
             "filters_plex": {
                 "username_whitelist": [],               # Restrict accepted Account.title values (empty = allow all)
@@ -1028,6 +1040,7 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "trakt": {"access_token", "refresh_token", "client_secret"},
         "jellyfin": {"access_token", "api_key", "password"},
         "emby": {"access_token", "api_key", "password"},
+        "silo": {"access_token", "refresh_token", "profile_token", "_pending_device"},
         "kodi": {"password"},
         "tmdb": {"api_key"},
         "tmdb_sync": {"api_key", "session_id", "_pending_request_token", "read_token", "access_token", "_pending_access_token"},
@@ -1052,11 +1065,17 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
             _mask_leaf(blk, k)
 
         insts = blk.get("instances")
-        if isinstance(insts, dict):
-            for inst in insts.values():
-                if isinstance(inst, dict):
-                    for k in keys:
-                        _mask_leaf(inst, k)
+        parents = [blk, *(inst for inst in (insts.values() if isinstance(insts, dict) else []) if isinstance(inst, dict))]
+        for parent in parents:
+            if parent is not blk:
+                for k in keys:
+                    _mask_leaf(parent, k)
+            users = parent.get("sync_users")
+            if isinstance(users, dict):
+                for entry in users.values():
+                    if isinstance(entry, dict):
+                        for k in keys:
+                            _mask_leaf(entry, k)
 
     # App UI auth secrets.
     a = out.get("app_auth")
@@ -1131,6 +1150,7 @@ CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
     "plex",
     "jellyfin",
     "emby",
+    "silo",
     "kodi",
     "tautulli",
     "tracearr",
@@ -2897,6 +2917,7 @@ def _normalize_app_auth(cfg: dict[str, Any]) -> None:
                     "playback": perms.get("monitor") is not True and bool(perms.get("playback", True)),
                     "write": perms.get("monitor") is not True and bool(perms.get("write", False)),
                     "monitor": perms.get("monitor") is True,
+                    **{key: False for key in ("pairs", "scrobbler", "schedule", "connections") if perms.get(key) is False},
                 },
                 "password": upwd,
                 "totp": clean_totp,

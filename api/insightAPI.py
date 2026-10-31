@@ -75,12 +75,12 @@ def _env() -> tuple[
         return None, (lambda: {}), (lambda _cfg: None), (lambda *a, **k: None)
 
 
-def _load_state_features(features: set[str] | list[str] | tuple[str, ...]) -> dict[str, Any]:
+def _load_state_features(features: set[str] | list[str] | tuple[str, ...], include_sync_users: bool = True) -> dict[str, Any]:
     try:
         from cw_platform.config_base import CONFIG
         from cw_platform.orchestrator._state_store import StateStore
 
-        state = StateStore(CONFIG).load_state_features(features)
+        state = StateStore(CONFIG).load_state_features(features, include_sync_users=include_sync_users)
         return state if isinstance(state, dict) else {}
     except Exception:
         return {}
@@ -263,6 +263,9 @@ def _settings_auth_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         if provider == "nuvio":
             b = _dict(block)
             return bool(_txt(b.get("profile_id"))) and _has(b, "access_token", "refresh_token")
+        if provider == "silo":
+            b = _dict(block)
+            return bool(_txt(b.get("server_url")) and _txt(b.get("profile_id"))) and _has(b, "access_token", "refresh_token")
         return _has(block, *_AUTH_KEYS.get(provider, ("access_token", "api_key", "token")))
 
     profiles: list[dict[str, Any]] = []

@@ -16,7 +16,8 @@ from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from cw_platform.modules_registry import get_sync_module_path_by_name, sync_provider_names, sync_provider_supports_feature
-from cw_platform.access_policy import filter_pairs_for_user, managed_profile_id, managed_profile_instances, pair_ids_for_user, request_user, user_can_access_pair
+from cw_platform.access_policy import filter_pairs_for_user, managed_profile_id, managed_profile_instances, pair_ids_for_user, request_user, requested_assign_profile, user_can_access_pair
+from cw_platform.identity_links import clean_identity_map
 from cw_platform.provider_instances import list_user_profiles, normalize_user_profile_id
 from cw_platform.local_db.legacy_files import LAST_SYNC_JSON
 from cw_platform.memory_release import clear_caches, release_memory
@@ -213,6 +214,8 @@ def _normalize_features(f: dict | None) -> dict:
             f[k]["rewatches"] = coerce_bool(f[k].get("rewatches", False))
             if "use_source_status" in f[k]:
                 f[k]["use_source_status"] = coerce_bool(f[k].get("use_source_status", False))
+            if "undated_as_today" in f[k]:
+                f[k]["undated_as_today"] = coerce_bool(f[k].get("undated_as_today", False))
         if k in ("history", "ratings", "progress", "watchlist") and isinstance(f.get(k), dict) and "library_only" in f[k]:
             f[k]["library_only"] = coerce_bool(f[k].get("library_only", False))
         if k in ("history", "progress", "ratings") and isinstance(f.get(k), dict):
@@ -250,10 +253,16 @@ def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
     if not sync_provider_supports_feature(src, "ratings") or not sync_provider_supports_feature(dst, "ratings"):
         feats.pop("ratings", None)
     if "collection" in feats:
-        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
+        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "SILO", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
         collection_targets = {"TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
         if src not in collection_sources or dst not in collection_targets or str(pair.get("mode") or "").strip().lower().startswith("two"):
             feats.pop("collection", None)
+    raw_providers = pair.get("providers")
+    providers: Mapping[str, Any] = raw_providers if isinstance(raw_providers, Mapping) else {}
+    plex = next((v for k, v in providers.items() if str(k).strip().lower() == "plex"), None)
+    plex_history = plex.get("history") if isinstance(plex, Mapping) else None
+    if isinstance(plex_history, Mapping) and plex_history.get("discover_fallback") is True and isinstance(feats.get("history"), dict):
+        feats["history"]["library_only"] = False
 
 _DROPPED_SHOW_PROVIDERS = frozenset({"trakt", "mdblist", "simkl", "wetrakr", "flicklist"})
 
@@ -2268,6 +2277,8 @@ class PairIn(BaseModel):
     providers: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     profile_id: str | None = None
+    match_users: bool | None = None
+    user_matches: dict[str, Any] | None = None
 
 class PairPatch(BaseModel):
     source: str | None = None
@@ -2280,6 +2291,22 @@ class PairPatch(BaseModel):
     providers: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     profile_id: str | None = None
+    match_users: bool | None = None
+    user_matches: dict[str, Any] | None = None
+
+
+def _apply_pair_user_matching(pair: dict[str, Any], upd: dict[str, Any]) -> None:
+    if "match_users" in upd:
+        if coerce_bool(upd.pop("match_users"), False):
+            pair["match_users"] = True
+        else:
+            pair.pop("match_users", None)
+    if "user_matches" in upd:
+        clean = clean_identity_map(upd.pop("user_matches"))
+        if clean:
+            pair["user_matches"] = clean
+        else:
+            pair.pop("user_matches", None)
 
 
 class TopologyBaselineIn(BaseModel):
@@ -2384,7 +2411,7 @@ def _apply_pair_profile_scope(cfg: dict[str, Any], request: Request | None, item
     if user and not user.get("is_admin"):
         item["profile_id"] = managed_profile_id(user)
         return
-    pid = _normalize_pair_profile_id(cfg, item.get("profile_id"))
+    pid = _normalize_pair_profile_id(cfg, item.get("profile_id")) or requested_assign_profile(cfg, request)
     if pid:
         item["profile_id"] = pid
     else:
@@ -2441,6 +2468,20 @@ def api_pairs_list(request: Request = cast(Request, None)) -> JSONResponse:
             pass
         return JSONResponse({"ok": False, "error": _public_error("pairs_list_failed")}, status_code=500)
 
+def _default_pair_library_only(item: dict[str, Any]) -> None:
+    from cw_platform import library_presence
+    from cw_platform.modules_registry import load_sync_ops
+
+    sides = [item.get("target")] + ([item.get("source")] if str(item.get("mode") or "").lower().startswith("two") else [])
+    ops = [o for o in (load_sync_ops(str(name or "").upper()) for name in sides) if o is not None]
+    raw = item.get("features")
+    features: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    for feature in ("history", "ratings", "progress", "watchlist"):
+        block = features.get(feature)
+        if isinstance(block, dict) and "library_only" not in block and any(library_presence.supported(o, feature) for o in ops):
+            block["library_only"] = True
+
+
 def _default_pair_anime_mapping(cfg: Mapping[str, Any], item: dict[str, Any]) -> None:
     source = str(item.get("source") or "").strip().lower()
     target = str(item.get("target") or "").strip().lower()
@@ -2468,6 +2509,8 @@ def api_pairs_add(payload: PairIn = Body(...), request: Request = cast(Request, 
         arr = _cfg_pairs(cfg)
 
         item = payload.model_dump()
+        matching = {k: item.pop(k, None) for k in ("match_users", "user_matches")}
+        _apply_pair_user_matching(item, {k: v for k, v in matching.items() if v is not None})
         item.setdefault("mode", "one-way")
         item["source_instance"] = _norm_instance_id(item.get("source_instance"))
         item["target_instance"] = _norm_instance_id(item.get("target_instance"))
@@ -2477,6 +2520,7 @@ def api_pairs_add(payload: PairIn = Body(...), request: Request = cast(Request, 
         item["features"] = _normalize_features(item.get("features") or {"watchlist": True})
         _apply_pair_profile_scope(cfg, request, item)
         _default_pair_anime_mapping(cfg, item)
+        _default_pair_library_only(item)
         _enforce_pair_feature_constraints(item)
         if _managed_pair_blocked(cfg, request, item):
             return {"ok": False, "error": "profile_scope_denied"}
@@ -2568,6 +2612,7 @@ def api_pairs_update(pair_id: str, payload: PairPatch = Body(...), request: Requ
                     upd["source_instance"] = _norm_instance_id(upd.get("source_instance"))
                 if "target_instance" in upd:
                     upd["target_instance"] = _norm_instance_id(upd.get("target_instance"))
+                _apply_pair_user_matching(it, upd)
                 for k, v in upd.items():
                     it[k] = v
                 if "profile_id" in upd:
@@ -2854,12 +2899,35 @@ def _provider_counts_fast(*, max_age: int = 30, force: bool = False) -> dict:
     _PROVIDER_COUNTS_CACHE["data"] = counts
     return counts
 
+def _provider_counts_for_user(cfg: Mapping[str, Any], user: Mapping[str, Any]) -> dict[str, int]:
+    instances = managed_profile_instances(cfg, user)
+    out = _provider_count_defaults()
+    if not instances:
+        return out
+    try:
+        from cw_platform.config_base import CONFIG
+        from cw_platform.orchestrator._state_store import StateStore
+
+        counts = StateStore(CONFIG).provider_feature_counts("watchlist", instances=instances) or {}
+    except Exception:
+        return out
+    for key, value in counts.items():
+        name = str(key or "").strip().upper()
+        if name:
+            out[name] = int(value or 0)
+    return out
+
+
 @router.get("/sync/providers/counts")
 def api_provider_counts(
     max_age: int = 30,
     force: bool = False,
     source: str = "state",
+    request: Request = cast(Request, None),
 ) -> dict:
+    user = _request_user(request)
+    if user and not user.get("is_admin"):
+        return _provider_counts_for_user(_env()[0]() or {}, user)
     src = (source or "state").lower().strip()
     if src in ("state", "auto"):
         return _provider_counts_current()
@@ -2933,6 +3001,11 @@ def api_run_sync(payload: dict | None = Body(None), request: Request = cast(Requ
         user = _request_user(request)
         if user and not user.get("is_admin"):
             pairs = filter_pairs_for_user(cfg, user, pairs)
+        requested_scope = (payload or {}).get("pair_scope_ids") if isinstance(payload, dict) else None
+        scheduler_scope = isinstance(requested_scope, list) and str((payload or {}).get("source") or "").strip().lower() == "scheduler"
+        if scheduler_scope:
+            wanted = {str(value or "").strip() for value in (requested_scope or []) if str(value or "").strip()}
+            pairs = [p for p in pairs if str(p.get("id") or "") in wanted]
 
         pair_id = ""
         try:
@@ -2968,7 +3041,7 @@ def api_run_sync(payload: dict | None = Body(None), request: Request = cast(Requ
         }
         if pair_id:
             overrides["pair_id"] = pair_id
-        if user and not user.get("is_admin"):
+        if (user and not user.get("is_admin")) or scheduler_scope:
             overrides["pair_scope_ids"] = [str(pair.get("id") or "") for pair in pairs if str(pair.get("id") or "")]
         th = threading.Thread(
             target=_run_pairs_thread_entry,

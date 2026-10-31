@@ -10,6 +10,7 @@ from collections import OrderedDict
 from typing import Any, cast
 from fastapi import FastAPI, Query, Request
 
+from cw_platform.access_policy import scope_state_to_instances
 from cw_platform.config_base import CONFIG, config_path, load_config
 from cw_platform.local_db import manual_policy as sqlite_manual_policy
 from cw_platform.local_db import state as sqlite_state
@@ -100,9 +101,9 @@ def _tmdb_api_key(cfg: dict[str, Any]) -> str:
     return ""
 
 
-def _load_state() -> dict[str, Any]:
+def _load_state(include_sync_users: bool = True) -> dict[str, Any]:
     try:
-        st = StateStore(CONFIG).load_state_features({"watchlist"}) or {}
+        st = StateStore(CONFIG).load_state_features({"watchlist"}, include_sync_users=include_sync_users) or {}
         return st if isinstance(st, dict) else {}
     except Exception:
         return {}
@@ -218,14 +219,14 @@ def register_wall(app: FastAPI) -> None:
         if cached is not None:
             return cached
 
-        st = media_scope.state(_load_state())
         api_key = _tmdb_api_key(cfg)
         scoped = bool(str(profile or "").strip())
         user_filter = instances_for_user_profile(cfg, profile) if scoped else {}
         if scoped and not user_filter:
             user_filter = {"__NONE__": ["__NONE__"]}
+        st = media_scope.state(_load_state())
 
-        items = build_watchlist(st, tmdb_ok=bool(api_key)) or []
+        items = build_watchlist(scope_state_to_instances(st, user_filter), tmdb_ok=bool(api_key)) or []
         active = {pid.lower(): True for pid in _configured_provider_ids(cfg)}
 
         def keep(it: dict[str, Any]) -> bool:

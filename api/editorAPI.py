@@ -35,6 +35,7 @@ from cw_platform.provider_instances import (
 )
 from services import playlists as playlist_svc
 from services.editor_mapping import MappingRequest as EditorMappingRequest, BlockRequest
+from services.editor_origin import OriginRequest
 from services.mapping_transfer import RuleIdentity
 from services.episode_groups import GroupRequest
 from services.episode_alignment import AlignmentRequest, ApplyRequest
@@ -75,6 +76,12 @@ def api_apply_episode_alignment(payload: ApplyRequest, request: Request):
 def api_editor_mapping(payload: EditorMappingRequest, request: Request):
     from services.editor_mapping import handle_mapping
     return handle_mapping(payload, request)
+
+
+@router.post("/origin")
+def api_editor_origin(payload: OriginRequest, request: Request):
+    from services.editor_origin import item_origin
+    return item_origin(payload, request)
 
 
 @router.post("/mapping-block")
@@ -1344,7 +1351,7 @@ def _editor_send_targets(cfg: dict[str, Any], feature: str) -> list[dict[str, An
 
     targets: list[dict[str, Any]] = []
     for provider in sync_provider_names(upper=True):
-        if feat == "collection" and str(provider or "").strip().upper() in {"PLEX", "EMBY", "JELLYFIN", "KODI"}:
+        if feat == "collection" and str(provider or "").strip().upper() in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO"}:
             continue
         ops = load_sync_ops(provider)
         if not ops:
@@ -1480,7 +1487,9 @@ def _items_confirmed_by_send(feature: Kind, items: list[dict[str, Any]], result:
         values = result.get(field)
         if isinstance(values, list):
             keep.update(str(v) for v in values if v)
-    if keep:
+    cloud = set(result.get("cloud_confirmed_keys") or [])
+    if keep or cloud:
+        keep -= cloud
         out: list[dict[str, Any]] = []
         for item in items:
             key = _editor_item_key(feature, str(item.get("_cw_event_key") or ""), item)
@@ -1602,6 +1611,11 @@ def api_editor_send(payload: dict[str, Any] = Body(...), request: Request = cast
             continue
 
         cfg_view = build_provider_config_view(cfg, provider, instance)
+        if provider == "PLEX" and feature == "history":
+            from copy import deepcopy
+
+            cfg_view = deepcopy(cfg_view)
+            cfg_view.setdefault("plex", {}).setdefault("history", {})["discover_fallback"] = payload.get("plex_discover_fallback") is True
         try:
             res = apply_add(
                 dst_ops=ops,

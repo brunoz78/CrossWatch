@@ -5,22 +5,31 @@ from __future__ import annotations
 
 import copy
 import re
+import secrets
+import time
 from collections.abc import Mapping
 from functools import lru_cache
 from typing import Any, cast
 
 from fastapi import APIRouter, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from api.provider_guard import usage_conflict_response
+from cw_platform.access_policy import view_as_scope_profile
 from cw_platform.config_base import load_config, save_config, update_config
+from cw_platform.identity_links import IDENTITY_PROVIDERS, identities_by_key, identity_links
 from cw_platform.provider_instances import (
     assign_instance_to_user_profile,
     assign_instance_to_user_profile_id,
     apply_instance_defaults,
     delete_user_profile,
     generate_user_profile_id,
+    get_instance_block,
+    is_sync_user_instance,
     list_instance_ids,
+    list_sync_user_ids,
+    split_sync_user_id,
+    sync_user_instance_id,
     list_user_profiles,
     normalize_instance_id,
     normalize_user_profile_id,
@@ -33,8 +42,10 @@ from cw_platform.provider_instances import (
     sanitize_user_profile_label,
     upsert_user_profile,
     user_profiles_for_instance,
+    user_profiles_root,
 )
 from cw_platform.tracker_storage import remove_crosswatch_storage
+from cw_platform.user_profile_avatars import avatar_dir, profile_avatar, profile_avatar_url, remove_avatar_file
 from cw_platform.user_profile_resources import (
     apply_profile_resource_assignments,
     clear_profile_resource_assignments,
@@ -67,6 +78,21 @@ def _max_profiles_per_provider(cfg: Mapping[str, Any] | None = None) -> int:
 
 def _max_generated_profiles(cfg: Mapping[str, Any] | None = None) -> int:
     return _max_profiles_per_provider(cfg) - 1
+
+
+_DEFAULT_MAX_SYNC_USERS = 25
+_SYNC_USER_PROVIDERS = frozenset({"plex", "emby", "jellyfin", "silo"})
+
+
+def _max_sync_users_per_connection(cfg: Mapping[str, Any] | None = None) -> int:
+    try:
+        src = cfg if isinstance(cfg, Mapping) else (load_config() or {})
+        rt = src.get("runtime")
+        raw = rt.get("max_sync_users_per_connection") if isinstance(rt, Mapping) else None
+        total = _DEFAULT_MAX_SYNC_USERS if raw is None else int(raw)
+    except Exception:
+        total = _DEFAULT_MAX_SYNC_USERS
+    return max(1, min(100, total))
 
 
 def _cfg_key(provider: str) -> str:
@@ -265,9 +291,14 @@ def _authenticated_request_user(cfg: dict[str, Any], request: Request | None) ->
 
 def _managed_user_instance_scope(cfg: dict[str, Any], request: Request | None) -> dict[str, set[str]] | None:
     user = _authenticated_request_user(cfg, request)
-    if not isinstance(user, Mapping) or user.get("is_admin"):
+    if not isinstance(user, Mapping):
         return None
-    pid = normalize_user_profile_id(user.get("profile_id"))
+    if user.get("is_admin"):
+        pid = view_as_scope_profile(cfg, request)
+        if not pid:
+            return None
+    else:
+        pid = normalize_user_profile_id(user.get("profile_id"))
     if not pid:
         return {}
     for row in list_user_profiles(cfg):
@@ -302,6 +333,7 @@ def _decorate_user_profile_rows(cfg: dict[str, Any], rows: list[dict[str, Any]])
         pid = normalize_user_profile_id(item.get("id"))
         item["resources"] = profile_resource_ids_for_profile(cfg, pid)
         item["resource_counts"] = resource_counts_for_profile(cfg, pid)
+        item["avatar_url"] = profile_avatar_url(cfg, pid)
         out.append(item)
     return out
 
@@ -333,6 +365,32 @@ def _profile_value_error(exc: ValueError) -> str:
     if code in {"invalid_user_profile", "duplicate_user_profile_label"}:
         return code
     return "invalid_user_profile"
+
+
+def _profile_login_payload(payload: Any) -> dict[str, Any] | None:
+    raw = payload.get("login") if isinstance(payload, Mapping) else None
+    return dict(raw) if isinstance(raw, Mapping) else None
+
+
+def _apply_profile_login(latest: dict[str, Any], profile: Mapping[str, Any], login: dict[str, Any] | None) -> Any:
+    if login is None:
+        return None
+    from api.appAuthAPI import apply_profile_login
+
+    return apply_profile_login(latest, profile.get("id"), login)
+
+
+def _profile_login_error(exc: Any) -> JSONResponse:
+    return JSONResponse({"ok": False, "error": exc.message}, status_code=exc.status_code, headers={"Cache-Control": "no-store"})
+
+
+def _profile_saved_response(request: Request, cfg: dict[str, Any], profile: dict[str, Any], login_result: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"ok": True, "profile": profile}
+    if login_result is not None:
+        from api.appAuthAPI import finish_profile_login
+
+        out["login"] = finish_profile_login(request, cfg, login_result)
+    return out
 
 
 @router.get("/provider-instances")
@@ -462,6 +520,324 @@ def api_provider_instances_update(provider: str, instance_id: str, payload: dict
     return {"ok": True, "id": inst, "uid": uid, "user_profile": owners[0] if owners else None, "user_profiles": owners}
 
 
+def _identity_usage(cfg: Mapping[str, Any]) -> dict[tuple[str, str, str], list[str]]:
+    usage: dict[tuple[str, str, str], list[str]] = {}
+    for link in identity_links(cfg):
+        for end in (link["source"], link["target"]):
+            labels = usage.setdefault((end["provider"], end["instance"], end["key"]), [])
+            if link["label"] not in labels:
+                labels.append(link["label"])
+    return usage
+
+
+def _sync_user_rows(cfg: Mapping[str, Any], provider: str, inst: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    usage = _identity_usage(cfg)
+    for user_inst in list_sync_user_ids(cfg, provider, inst):
+        ref = split_sync_user_id(user_inst)
+        entry = get_instance_block(cfg, provider, user_inst)
+        if ref is None:
+            continue
+        row: dict[str, Any] = {"key": ref[1], "id": user_inst, "username": str(entry.get("username") or ""), "added_at": entry.get("added_at"), "used_in": usage.get((provider, inst, ref[1]), [])}
+        if provider == "plex":
+            row["has_pin"] = bool(str(entry.get("home_pin") or "").strip())
+        if provider == "silo":
+            row["has_pin"] = bool(str(entry.get("profile_token") or "").strip())
+            row["needs_pin"] = bool(entry.get("profile_has_pin")) and not row["has_pin"]
+        rows.append(row)
+    rows.sort(key=lambda row: row["username"].casefold())
+    return rows
+
+
+def _build_sync_user_entry(provider: str, key: str, raw: Mapping[str, Any], existing: Mapping[str, Any], now: int) -> dict[str, Any]:
+    name = " ".join(str(raw.get("username") or existing.get("username") or "").split())[:80]
+    if provider == "plex":
+        entry: dict[str, Any] = {"username": name, "account_id": int(key) if key.isdigit() else key, "home_pin": str(existing.get("home_pin") or "")}
+        if "home_pin" in raw:
+            entry["home_pin"] = str(raw.get("home_pin") or "").strip()
+        cloud_id = str(raw.get("cloud_account_id") or existing.get("cloud_account_id") or "").strip()
+        if cloud_id and cloud_id != key:
+            entry["cloud_account_id"] = cloud_id
+    elif provider == "silo":
+        entry = {"profile_id": key, "profile_name": name, "username": name, "user": name,
+                 "profile_has_pin": bool(raw.get("profile_has_pin", existing.get("profile_has_pin")))}
+        token = str(raw.get("profile_token") or existing.get("profile_token") or "") if entry["profile_has_pin"] else ""
+        entry["profile_token"] = token
+        entry["profile_token_expires_at"] = int(raw.get("profile_token_expires_at") or existing.get("profile_token_expires_at") or 0) if token else 0
+    else:
+        entry = {"user_id": key, "username": name, "user": name}
+    entry["added_at"] = existing.get("added_at") or now
+    return entry
+
+
+def _silo_prepare_sync_users(cfg: Mapping[str, Any], inst: str, wanted: dict[str, Mapping[str, Any]]) -> str:
+    from providers.auth._auth_SILO import SiloClient, SiloError, SiloRateLimited
+
+    client = SiloClient(cfg, instance_id=inst)
+    try:
+        profiles = {p["id"]: p for p in client.list_profiles()}
+    except SiloError:
+        return "silo_unavailable"
+    for key, raw in list(wanted.items()):
+        profile = profiles.get(key)
+        if profile is None:
+            return "not_found"
+        row = {k: v for k, v in raw.items() if k != "home_pin"}
+        row["profile_has_pin"] = bool(profile["has_pin"])
+        pin = str(raw.get("home_pin") or "").strip()
+        if profile["has_pin"] and pin:
+            try:
+                row["profile_token"], row["profile_token_expires_at"] = client.verify_pin(key, pin)
+            except SiloRateLimited:
+                return "pin_locked"
+            except SiloError:
+                return "invalid_pin"
+        wanted[key] = row
+    return ""
+
+
+def _profile_identity(cfg: Mapping[str, Any], provider: str, user_inst: str) -> tuple[str, str]:
+    entry = get_instance_block(cfg, provider, user_inst)
+    full = " ".join(str(entry.get("username") or entry.get("user") or "").split())
+    label = sanitize_user_profile_label(full)
+    if not label or label != full:
+        return "", ""
+    return label, label.casefold()
+
+
+_SYNC_USER_ERRORS: dict[str, str] = {
+    "not_found": "not_found",
+    "unsupported_provider": "unsupported_provider",
+    "invalid_instance_id": "invalid_instance_id",
+    "sync_user_limit_reached": "sync_user_limit_reached",
+    "invalid_user_profile": "invalid_user_profile",
+    "duplicate_user_profile_label": "duplicate_user_profile_label",
+}
+
+
+def _sync_user_error(exc: Exception) -> str:
+    raw = str(exc.args[0] if exc.args else "").split(":", 1)[0].strip()
+    return _SYNC_USER_ERRORS.get(raw, "sync_users_failed")
+
+
+def _sync_users_target(cfg: Mapping[str, Any], provider: str, inst: str) -> tuple[str, str | None]:
+    prov = _cfg_key(provider)
+    if prov not in _SYNC_USER_PROVIDERS:
+        return prov, "unsupported_provider"
+    if is_sync_user_instance(inst):
+        return prov, "invalid_instance_id"
+    if inst != "default" and inst not in list_instance_ids(cfg, prov):
+        return prov, "not_found"
+    return prov, None
+
+
+@router.get("/sync-user-labels")
+def api_sync_user_labels(request: Request = cast(Request, None)) -> JSONResponse:
+    cfg = dict(load_config() or {})
+    scope = _managed_user_instance_scope(cfg, request)
+    out: dict[str, dict[str, str]] = {}
+    for prov in sorted(_SYNC_USER_PROVIDERS):
+        allowed = scope.get(_profile_scope_provider_key(prov), set()) if scope is not None else None
+        labels = {
+            user_inst: str(get_instance_block(cfg, prov, user_inst).get("username") or "")
+            for user_inst in list_sync_user_ids(cfg, prov)
+            if allowed is None or user_inst in allowed
+        }
+        if labels:
+            out[prov.upper()] = labels
+    return JSONResponse(out, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/provider-instances/{provider}/{instance_id}/sync-users")
+def api_provider_sync_users(provider: str, instance_id: str, request: Request = cast(Request, None)) -> Any:
+    inst = normalize_instance_id(instance_id)
+    cfg = dict(load_config() or {})
+    blocked = _admin_required_response(request, cfg)
+    if blocked is not None:
+        return blocked
+    prov, error = _sync_users_target(cfg, provider, inst)
+    if error:
+        return {"ok": False, "error": error}
+    rows = _sync_user_rows(cfg, prov, inst)
+    return {"ok": True, "users": rows, "count": len(rows), "limit": _max_sync_users_per_connection(cfg)}
+
+
+def _identity_side(cfg: Mapping[str, Any], provider: Any, instance: Any) -> tuple[str, str, list[dict[str, str]]]:
+    prov = str(provider or "").strip().lower()
+    inst = normalize_instance_id(instance)
+    if prov not in IDENTITY_PROVIDERS or is_sync_user_instance(inst):
+        return prov, inst, []
+    rows = [{"key": key, "username": row["username"]} for key, row in identities_by_key(cfg, prov, inst).items()]
+    rows.sort(key=lambda row: row["username"].casefold())
+    return prov, inst, rows
+
+
+@router.get("/identities/suggestions")
+def api_identity_suggestions(
+    source: str = "",
+    source_instance: str = "default",
+    target: str = "",
+    target_instance: str = "default",
+    exclude: str = "",
+    request: Request = cast(Request, None),
+) -> Any:
+    cfg = dict(load_config() or {})
+    blocked = _admin_required_response(request, cfg)
+    if blocked is not None:
+        return blocked
+    src, src_inst, src_rows = _identity_side(cfg, source, source_instance)
+    dst, dst_inst, dst_rows = _identity_side(cfg, target, target_instance)
+    dst_keys = {row["key"] for row in dst_rows}
+    linked: dict[str, dict[str, str]] = {}
+    for link in identity_links(cfg):
+        if f"{link['kind']}:{link['id']}" == exclude:
+            continue
+        for a, b in ((link["source"], link["target"]), (link["target"], link["source"])):
+            if (a["provider"], a["instance"]) == (src, src_inst) and (b["provider"], b["instance"]) == (dst, dst_inst) and b["key"] in dst_keys:
+                linked.setdefault(a["key"], {"key": b["key"], "reason": "linked", "where": link["label"]})
+    def _folded(rows: list[dict[str, str]]) -> dict[str, list[str]]:
+        names: dict[str, list[str]] = {}
+        for row in rows:
+            names.setdefault(row["username"].casefold(), []).append(row["key"])
+        return names
+    src_names = _folded(src_rows)
+    dst_names = _folded(dst_rows)
+    suggestions: dict[str, dict[str, str]] = {}
+    for row in src_rows:
+        if row["key"] in linked:
+            suggestions[row["key"]] = linked[row["key"]]
+            continue
+        folded = row["username"].casefold()
+        if len(src_names.get(folded, [])) == 1 and len(dst_names.get(folded, [])) == 1:
+            suggestions[row["key"]] = {"key": dst_names[folded][0], "reason": "same_name", "where": ""}
+    return {
+        "ok": True,
+        "source": {"provider": src, "instance": src_inst, "identities": src_rows},
+        "target": {"provider": dst, "instance": dst_inst, "identities": dst_rows},
+        "suggestions": suggestions,
+    }
+
+
+@router.put("/provider-instances/{provider}/{instance_id}/sync-users")
+def api_provider_sync_users_update(provider: str, instance_id: str, payload: dict[str, Any] = Body(default_factory=dict), request: Request = cast(Request, None)) -> Any:
+    inst = normalize_instance_id(instance_id)
+    cfg = dict(load_config() or {})
+    blocked = _admin_required_response(request, cfg)
+    if blocked is not None:
+        return blocked
+    raw_users = (payload or {}).get("users")
+    if not isinstance(raw_users, list):
+        return {"ok": False, "error": "invalid_users"}
+    wanted: dict[str, Mapping[str, Any]] = {}
+    for raw in raw_users:
+        if not isinstance(raw, Mapping):
+            continue
+        key = str(raw.get("key") or "").strip()
+        if key and "~" not in key and str(raw.get("username") or "").strip():
+            wanted.setdefault(key, raw)
+    if _cfg_key(provider) == "silo" and wanted:
+        silo_error = _silo_prepare_sync_users(cfg, inst, wanted)
+        if silo_error:
+            return {"ok": False, "error": silo_error}
+
+    def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
+        prov, error = _sync_users_target(latest, provider, inst)
+        if error:
+            raise KeyError(error)
+        limit = _max_sync_users_per_connection(latest)
+        if len(wanted) > limit:
+            raise ValueError(f"sync_user_limit_reached:{limit}")
+        parent = latest.get(prov) if inst == "default" else ((latest.get(prov) or {}).get("instances") or {}).get(inst)
+        if not isinstance(parent, dict):
+            raise KeyError("not_found")
+        raw_current = parent.get("sync_users")
+        current: dict[str, Any] = raw_current if isinstance(raw_current, dict) else {}
+        now = int(time.time())
+        updated = {key: _build_sync_user_entry(prov, key, raw, current.get(key) or {}, now) for key, raw in wanted.items()}
+        for key in set(current) - set(updated):
+            user_inst = sync_user_instance_id(inst, key)
+            remove_instance_from_user_profiles(latest, prov, user_inst)
+            remove_provider_instance_uid(latest, prov, user_inst)
+        if updated:
+            parent["sync_users"] = updated
+        else:
+            parent.pop("sync_users", None)
+        profiles_by_label = {str(row.get("label") or "").casefold(): str(row.get("id") or "") for row in list_user_profiles(latest)}
+        identities = {key: _profile_identity(latest, prov, sync_user_instance_id(inst, key))[1] for key in updated}
+        counts: dict[str, int] = {}
+        for folded in identities.values():
+            if folded:
+                counts[folded] = counts.get(folded, 0) + 1
+        for key in updated:
+            user_inst = sync_user_instance_id(inst, key)
+            provider_instance_uid_for(latest, prov, user_inst, create=True)
+            folded = identities[key]
+            pid = profiles_by_label.get(folded) if folded and counts.get(folded) == 1 else None
+            if pid and not user_profiles_for_instance(latest, prov, user_inst):
+                assign_instance_to_user_profile_id(latest, pid, prov, user_inst)
+        return {"users": _sync_user_rows(latest, prov, inst), "limit": limit}
+
+    try:
+        _, result = update_config(_mutate)
+    except (KeyError, ValueError) as exc:
+        code = _sync_user_error(exc)
+        if code == "sync_user_limit_reached":
+            return {"ok": False, "error": code, "limit": _max_sync_users_per_connection(load_config() or {})}
+        return {"ok": False, "error": code}
+    _invalidate_provider_cache(provider)
+    return {"ok": True, **result, "count": len(result["users"])}
+
+
+@router.post("/provider-instances/{provider}/{instance_id}/sync-users/profiles")
+def api_provider_sync_users_create_profiles(provider: str, instance_id: str, request: Request = cast(Request, None)) -> Any:
+    inst = normalize_instance_id(instance_id)
+    cfg = dict(load_config() or {})
+    blocked = _admin_required_response(request, cfg)
+    if blocked is not None:
+        return blocked
+
+    def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
+        prov, error = _sync_users_target(latest, provider, inst)
+        if error:
+            raise KeyError(error)
+        everyone: list[tuple[str, str, str, str, str]] = []
+        for other in sorted(_SYNC_USER_PROVIDERS):
+            for user_inst in list_sync_user_ids(latest, other):
+                ref = split_sync_user_id(user_inst)
+                label, folded = _profile_identity(latest, other, user_inst)
+                everyone.append((other, ref[0] if ref else "", user_inst, label, folded))
+        per_connection: dict[tuple[str, str, str], int] = {}
+        for other, parent, _user_inst, _label, folded in everyone:
+            if folded:
+                per_connection[(other, parent, folded)] = per_connection.get((other, parent, folded), 0) + 1
+        ambiguous = {folded for (_other, _parent, folded), count in per_connection.items() if count > 1}
+        own = [(label, folded) for other, parent, _user_inst, label, folded in everyone if other == prov and parent == inst]
+        skipped = sum(1 for _label, folded in own if not folded or folded in ambiguous)
+        names = {folded: label for label, folded in own if folded and folded not in ambiguous}
+        profiles_by_label = {str(row.get("label") or "").casefold(): str(row.get("id") or "") for row in list_user_profiles(latest)}
+        created = linked = 0
+        for folded, label in names.items():
+            eligible = [(other, user_inst) for other, _parent, user_inst, _label, name in everyone if name == folded and not user_profiles_for_instance(latest, other, user_inst)]
+            if not eligible:
+                continue
+            pid = profiles_by_label.get(folded)
+            if not pid:
+                pid = generate_user_profile_id(latest)
+                upsert_user_profile(latest, pid, label=label)
+                profiles_by_label[folded] = pid
+                created += 1
+            for other, user_inst in eligible:
+                assign_instance_to_user_profile_id(latest, pid, other, user_inst)
+                linked += 1
+        return {"created": created, "linked": linked, "skipped": skipped}
+
+    try:
+        _, result = update_config(_mutate)
+    except (KeyError, ValueError) as exc:
+        return {"ok": False, "error": _sync_user_error(exc)}
+    return {"ok": True, **result}
+
+
 @router.delete("/provider-instances/{provider}/{instance_id}")
 def api_provider_instances_delete(provider: str, instance_id: str, request: Request = cast(Request, None)) -> Any:
     inst = normalize_instance_id(instance_id)
@@ -554,8 +930,15 @@ def api_user_profiles_create(payload: dict[str, Any] = Body(default_factory=dict
     label = sanitize_user_profile_label((payload or {}).get("label") or (payload or {}).get("name"))
     if not label:
         return {"ok": False, "error": "invalid_user_profile"}
+    from api.appAuthAPI import ProfileLoginError
 
-    def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
+    login = _profile_login_payload(payload)
+
+    def _mutate(latest: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+        profile = _save(latest)
+        return profile, _apply_profile_login(latest, profile, login)
+
+    def _save(latest: dict[str, Any]) -> dict[str, Any]:
         profile_id = generate_user_profile_id(latest)
         resource_payload = payload or {}
         raw_instances = resource_payload.get("instances")
@@ -580,10 +963,12 @@ def api_user_profiles_create(payload: dict[str, Any] = Body(default_factory=dict
         )
 
     try:
-        _, profile = update_config(_mutate)
+        saved_cfg, (profile, login_result) = update_config(_mutate)
+    except ProfileLoginError as exc:
+        return _profile_login_error(exc)
     except ValueError as exc:
         return {"ok": False, "error": _profile_value_error(exc)}
-    return {"ok": True, "profile": profile}
+    return _profile_saved_response(request, saved_cfg, profile, login_result)
 
 
 @router.put("/user-profiles/{profile_id}")
@@ -593,8 +978,15 @@ def api_user_profiles_update(profile_id: str, payload: dict[str, Any] = Body(def
     if blocked is not None:
         return blocked
     pid = normalize_user_profile_id(profile_id)
+    from api.appAuthAPI import ProfileLoginError
 
-    def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
+    login = _profile_login_payload(payload)
+
+    def _mutate(latest: dict[str, Any]) -> tuple[dict[str, Any], Any]:
+        profile = _save(latest)
+        return profile, _apply_profile_login(latest, profile, login)
+
+    def _save(latest: dict[str, Any]) -> dict[str, Any]:
         if not pid or not any(row.get("id") == pid for row in list_user_profiles(latest)):
             raise KeyError("not_found")
         resource_payload = payload or {}
@@ -620,57 +1012,108 @@ def api_user_profiles_update(profile_id: str, payload: dict[str, Any] = Body(def
         )
 
     try:
-        _, profile = update_config(_mutate)
+        saved_cfg, (profile, login_result) = update_config(_mutate)
+    except ProfileLoginError as exc:
+        return _profile_login_error(exc)
     except KeyError:
         return {"ok": False, "error": "not_found"}
     except ValueError as exc:
         return {"ok": False, "error": _profile_value_error(exc)}
-    return {"ok": True, "profile": profile}
+    return _profile_saved_response(request, saved_cfg, profile, login_result)
 
 
-def _managed_usernames_for_profile(cfg: dict[str, Any], profile_id: str) -> list[str]:
+@router.get("/user-profiles/{profile_id}/avatar")
+def api_user_profile_avatar(profile_id: str, request: Request = cast(Request, None)) -> Any:
+    from api.appAuthAPI import auth_required
+
+    cfg = dict(load_config() or {})
     pid = normalize_user_profile_id(profile_id)
-    app_auth = cfg.get("app_auth")
-    if not isinstance(app_auth, dict):
-        return []
-    users = app_auth.get("users")
-    if not isinstance(users, dict):
-        return []
-    names: list[str] = []
-    for raw in users.values():
-        if not isinstance(raw, dict):
-            continue
-        if normalize_user_profile_id(raw.get("profile_id")) != pid:
-            continue
-        username = str(raw.get("username") or "").strip()
-        names.append(username or "Unnamed user")
-    return names
+    if request is not None and auth_required(cfg):
+        user = _authenticated_request_user(cfg, request)
+        if user is None:
+            return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+        if not user.get("is_admin") and normalize_user_profile_id(user.get("profile_id")) != pid:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    avatar = profile_avatar(cfg, pid)
+    if avatar is None:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    return FileResponse(avatar["path"], media_type=str(avatar.get("content_type") or "image/png"), headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+
+@router.post("/user-profiles/{profile_id}/avatar")
+def api_user_profile_avatar_save(profile_id: str, payload: dict[str, Any] = Body(default_factory=dict), request: Request = cast(Request, None)) -> Any:
+    from api.profileAPI import AVATAR_TYPES, _decode_avatar
+
+    cfg = dict(load_config() or {})
+    blocked = _admin_required_response(request, cfg)
+    if blocked is not None:
+        return blocked
+    pid = normalize_user_profile_id(profile_id)
+    decoded = _decode_avatar(payload or {})
+    if isinstance(decoded, JSONResponse):
+        return decoded
+    data, content_type = decoded
+    filename = f"{secrets.token_hex(16)}{AVATAR_TYPES[content_type][0]}"
+    path = avatar_dir() / filename
+    path.write_bytes(data)
+
+    def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
+        block = user_profiles_root(latest).get(pid) if pid else None
+        if not isinstance(block, dict):
+            return {"missing": True}
+        old = block.get("avatar")
+        block["avatar"] = {"file": filename, "content_type": content_type, "updated_at": int(time.time() * 1000)}
+        return {"old": old}
+
+    saved, result = update_config(_mutate)
+    if result.get("missing"):
+        path.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    remove_avatar_file(result.get("old"))
+    return {"ok": True, "avatar_url": profile_avatar_url(saved, pid)}
+
+
+@router.delete("/user-profiles/{profile_id}/avatar")
+def api_user_profile_avatar_delete(profile_id: str, request: Request = cast(Request, None)) -> Any:
+    cfg = dict(load_config() or {})
+    blocked = _admin_required_response(request, cfg)
+    if blocked is not None:
+        return blocked
+    pid = normalize_user_profile_id(profile_id)
+
+    def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
+        block = user_profiles_root(latest).get(pid) if pid else None
+        if not isinstance(block, dict):
+            return {"missing": True}
+        return {"old": block.pop("avatar", None)}
+
+    _, result = update_config(_mutate)
+    if result.get("missing"):
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    remove_avatar_file(result.get("old"))
+    return {"ok": True, "avatar_url": ""}
 
 
 @router.delete("/user-profiles/{profile_id}")
 def api_user_profiles_delete(profile_id: str, request: Request = cast(Request, None)) -> Any:
+    from api.appAuthAPI import audit_removed_logins, remove_profile_logins
+
     cfg = dict(load_config() or {})
     blocked = _admin_required_response(request, cfg)
     if blocked is not None:
         return blocked
 
     def _mutate(latest: dict[str, Any]) -> dict[str, Any]:
-        linked_users = _managed_usernames_for_profile(latest, profile_id)
-        if linked_users:
-            return {"conflict": linked_users}
+        block = user_profiles_root(latest).get(normalize_user_profile_id(profile_id))
+        avatar = block.get("avatar") if isinstance(block, dict) else None
+        removed = remove_profile_logins(latest, profile_id)
         clear_profile_resource_assignments(latest, profile_id)
-        return {"deleted": delete_user_profile(latest, profile_id)}
+        return {"deleted": delete_user_profile(latest, profile_id), "removed_logins": removed, "avatar": avatar}
 
-    _, result = update_config(_mutate)
-    linked_users = result.get("conflict") if isinstance(result, dict) else None
-    if isinstance(linked_users, list) and linked_users:
-        label = ", ".join(linked_users[:3])
-        if len(linked_users) > 3:
-            label = f"{label} and {len(linked_users) - 3} more"
-        plural = "accounts" if len(linked_users) != 1 else "account"
-        return JSONResponse(
-            {"ok": False, "error": f"Cannot delete this profile because it is assigned to user {plural}: {label}. Reassign or delete the user first."},
-            status_code=409,
-        )
+    saved, result = update_config(_mutate)
+    if isinstance(result, dict) and result.get("deleted"):
+        remove_avatar_file(result.get("avatar"))
+    removed = result.get("removed_logins") if isinstance(result, dict) else []
+    audit_removed_logins(request, saved if isinstance(saved, dict) else cfg, removed or [])
     deleted = bool(result.get("deleted")) if isinstance(result, dict) else False
-    return {"ok": True, "deleted": deleted}
+    return {"ok": True, "deleted": deleted, "removed_logins": [username for _, username in removed or []]}

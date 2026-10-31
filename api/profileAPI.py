@@ -57,11 +57,12 @@ from cw_platform.config_base import CONFIG as CONFIG_DIR, load_config, update_co
 from cw_platform.id_map import canonical_key
 from cw_platform.orchestrator._state_store import StateStore
 from cw_platform.profile_preferences import display_timezone
+from cw_platform.user_profile_avatars import profile_avatar_url
 from cw_platform.provider_instances import instances_for_user_profile, list_user_profiles, normalize_instance_id, provider_display_key
 from api.dashboardAPI import _dashboard_widgets_version
 from api.watchlistAPI import _item_for_user_filter as _watchlist_item_for_user_filter
 from api.watchlistAPI import _load_watchlist_state, _tmdb_api_key, _watchlist_version
-from cw_platform.access_policy import clean_managed_permissions
+from cw_platform.access_policy import clean_managed_permissions, scope_state_to_instances
 from services import profile_history
 from services.media_scope import MediaScope
 from services.dashboard_widgets import _tracker_feature_items
@@ -282,7 +283,7 @@ def _public_profile(cfg: dict[str, Any], a: dict[str, Any], uid: str, raw: dict[
     user = _admin_identity(a) if uid == ADMIN_USER_ID else _public_user(uid, raw)
     user["display_name"] = str(raw.get("display_name") or user.get("display_name") or user.get("username") or "").strip()
     user["label"] = user["display_name"] or str(user.get("username") or "")
-    user["avatar_url"] = _avatar_url(raw, uid)
+    user["avatar_url"] = _avatar_url(raw, uid) or ("" if uid == ADMIN_USER_ID else profile_avatar_url(cfg, user.get("profile_id")))
     user["profile_label"] = "Administrator" if uid == ADMIN_USER_ID else _profile_label(cfg, user.get("profile_id"))
     current_session, other_sessions = _public_session_state(a, token)
     other_sessions = [
@@ -343,9 +344,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _collection_state() -> dict[str, Any]:
+def _collection_state(include_sync_users: bool = True) -> dict[str, Any]:
     try:
-        state = StateStore(CONFIG_DIR).load_state_features({"collection"}) or {}
+        state = StateStore(CONFIG_DIR).load_state_features({"collection"}, include_sync_users=include_sync_users) or {}
         return state if isinstance(state, dict) else {}
     except Exception:
         return {}
@@ -800,9 +801,9 @@ def api_profile_collection(
     return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
 
-def _feature_state(feature: str) -> dict[str, Any]:
+def _feature_state(feature: str, include_sync_users: bool = True) -> dict[str, Any]:
     try:
-        state = StateStore(CONFIG_DIR).load_state_features({feature}) or {}
+        state = StateStore(CONFIG_DIR).load_state_features({feature}, include_sync_users=include_sync_users) or {}
         return state if isinstance(state, dict) else {}
     except Exception:
         return {}
@@ -824,7 +825,7 @@ def _history_user_filter(cfg: dict[str, Any], profile_id: str) -> dict[str, Any]
 
 def _watchlist_items(cfg: dict[str, Any], user_filter: dict[str, Any]) -> list[dict[str, Any]]:
     try:
-        items = build_watchlist(MediaScope(cfg).state(_load_watchlist_state()), tmdb_ok=bool(_tmdb_api_key(cfg))) or []
+        items = build_watchlist(scope_state_to_instances(MediaScope(cfg).state(_load_watchlist_state()), user_filter), tmdb_ok=bool(_tmdb_api_key(cfg))) or []
     except Exception:
         return []
     if not user_filter:

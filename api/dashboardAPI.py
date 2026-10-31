@@ -77,7 +77,7 @@ def _feature_library_totals(base_path: Any, requested: set[str], user_filter: Ma
     totals: dict[str, int] = {}
     for feature in sorted(wanted):
         try:
-            counts = store.provider_feature_counts(feature) or {}
+            counts = (store.provider_feature_counts(feature, instances=user_filter) if user_filter else store.provider_feature_counts(feature, include_sync_users=True)) or {}
         except Exception:
             continue
         values = [
@@ -274,14 +274,18 @@ def dashboard_widgets(
                 if payload is None:
                     media_scope = MediaScope(cfg)
                     scoped_features = {feature for feature in state_features if media_scope.active({feature})}
-                    state = (
-                        StateStore(CONFIG).load_state_features(state_features, recent_limit=None if scoped_features else _STATE_RECENT_LIMIT)
-                        if state_features
-                        else {}
-                    )
                     user_filter = instances_for_user_profile(cfg, profile) if scoped else {}
                     if scoped and not user_filter:
                         user_filter = {"__NONE__": ["__NONE__"]}
+                    state = (
+                        StateStore(CONFIG).load_state_features(
+                            state_features,
+                            recent_limit=None if scoped_features else _STATE_RECENT_LIMIT,
+                            include_sync_users=True,
+                        )
+                        if state_features
+                        else {}
+                    )
                     state = media_scope.state(state)
                     payload = dashboard_widgets_payload(
                         state,

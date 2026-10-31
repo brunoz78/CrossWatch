@@ -46,7 +46,7 @@
   }
 
   const AUTH_GROUPS = Object.freeze([
-    { id: "sec-auth-media", title: "Media servers", keys: ["PLEX", "JELLYFIN", "EMBY"] },
+    { id: "sec-auth-media", title: "Media servers", keys: ["PLEX", "JELLYFIN", "EMBY", "SILO"] },
     { id: "sec-auth-trackers", title: "Trackers", keys: ["CROSSWATCH", "TRAKT", "SIMKL", "TMDB", "MDBLIST", "PUBLICMETADB", "ANILIST", "MYANIMELIST", "KITSU", "WETRAKR", "PUNCHPLAY", "BINGEBASE", "FLICKLIST", "FLOPPY", "SCROB"] },
     { id: "sec-auth-clients", title: "Media clients", keys: ["NUVIO", "KODI", "STREMIO"] },
     { id: "sec-auth-others", title: "Others", keys: ["TAUTULLI", "TRACEARR"] },
@@ -113,7 +113,34 @@
     return !profileConfigured("stremio", source, cfg);
   }
 
+  let managedInstances = {};
+
+  function managedUser() {
+    return document.documentElement.dataset.cwRole === "user";
+  }
+
+  async function loadManagedInstances() {
+    if (!managedUser()) return;
+    try { await window.__cwAuthBootstrapPromise; } catch {}
+    try {
+      const res = await fetch(`/api/provider-instances?configured_only=true&ts=${Date.now()}`, { cache: "no-store", credentials: "same-origin" });
+      const data = res.ok ? await res.json() : {};
+      managedInstances = data && typeof data === "object" ? data : {};
+    } catch {
+      managedInstances = {};
+    }
+  }
+
+  function managedInstanceIds(provider) {
+    const key = String(provider || "").toUpperCase() === "TMDB_SYNC" ? "TMDB" : String(provider || "").toUpperCase();
+    const rows = Array.isArray(managedInstances[key]) ? managedInstances[key] : [];
+    return rows.filter((row) => row && row.id && row.id !== "default" && row.configured !== false).map((row) => String(row.id));
+  }
+
   function configuredProviderKeys(cfg = getCachedConfig()) {
+    if (managedUser()) {
+      return new Set(Object.keys(managedInstances).filter((key) => managedInstanceIds(key).length).map((key) => authProviderInfo(key).key).filter(Boolean));
+    }
     let set = new Set();
     try {
       if (typeof window.getConfiguredProviders === "function") {
@@ -158,6 +185,16 @@
     return found ? inst[found] : null;
   }
 
+  function settingsScope() {
+    const scope = window.CW?.SettingsScope;
+    return scope && typeof scope.active === "function" && scope.active() ? scope : null;
+  }
+
+  function scopedProfileIds(provider, ids) {
+    const scope = settingsScope();
+    return scope ? ids.filter((id) => scope.allowsInstance(provider, id)) : ids;
+  }
+
   function authProfileIds(cfg, provider, data = null, connected = false) {
     const ids = configuredProfileIds(cfg, provider, connected);
     const inst = data?.instances;
@@ -166,7 +203,7 @@
         if (String(id || "").trim()) ids.push(String(id));
       });
     }
-    return sortProfileIds(ids);
+    return scopedProfileIds(provider, sortProfileIds(ids));
   }
 
   function authProfileState(cfg, provider, id, data = statusProviderData(provider), connected = false) {
@@ -257,6 +294,7 @@
     if (p === "floppy") return hasConfiguredValue(b.server_url || b.server) && hasConfiguredValue(b.api_token || b.token);
     if (p === "scrob") return hasConfiguredValue(b.server_url) && hasConfiguredValue(b.api_key) && hasConfiguredValue(b.username) && hasConfiguredValue(b.password);
     if (p === "nuvio") return (hasConfiguredValue(b.access_token) || hasConfiguredValue(b.refresh_token)) && hasConfiguredValue(b.profile_id);
+    if (p === "silo") return hasConfiguredValue(b.server_url) && (hasConfiguredValue(b.access_token) || hasConfiguredValue(b.refresh_token)) && hasConfiguredValue(b.profile_id) && b.auth_error !== "reconnect_required";
     if (p === "kodi") return hasConfiguredValue(b.server) && b.connection_verified === true;
     if (p === "stremio") return hasConfiguredValue(b.auth_key) || hasConfiguredValue(b.authKey);
     if (p === "tracearr") return hasConfiguredValue(b.server_url || b.server) && hasConfiguredValue(b.api_key);
@@ -274,6 +312,7 @@
   }
 
   function configuredProfileIds(cfg, provider, connected = false) {
+    if (managedUser()) return scopedProfileIds(provider, sortProfileIds(managedInstanceIds(provider)));
     const block = providerConfigBlock(cfg, provider);
     const out = [];
     if (profileConfigured(provider, block, cfg)) out.push("default");
@@ -285,11 +324,16 @@
     }
     if (String(provider || "").toLowerCase() === "stremio") out.push(...stremioAddonIds(cfg));
     if (!out.length && connected) out.push("default");
-    return sortProfileIds(out);
+    return scopedProfileIds(provider, sortProfileIds(out));
   }
 
   function profileFriendlyName(cfg, provider, id) {
     const raw = String(id || "").trim();
+    if (managedUser()) {
+      const key = String(provider || "").toUpperCase() === "TMDB_SYNC" ? "TMDB" : String(provider || "").toUpperCase();
+      const row = (Array.isArray(managedInstances[key]) ? managedInstances[key] : []).find((item) => String(item?.id) === raw);
+      return String(row?.display_label || row?.label || profileDisplayName(raw));
+    }
     const isDefault = raw.toLowerCase() === "default";
     const block = providerConfigBlock(cfg, provider);
     const instances = block?.instances;
@@ -318,7 +362,7 @@
       return { text: `${okCount} of ${names.length} connected`, detail: "", title, dot: "warn" };
     }
     if (!card.status.ok) return { ...base, title };
-    const detail = names.length > PROFILE_NAME_LIMIT ? `${names.length} profiles` : names.map((item) => item.name).join(", ");
+    const detail = names.length > PROFILE_NAME_LIMIT ? `${names.length} instances` : names.map((item) => item.name).join(", ");
     return { ...base, detail, title };
   }
 
@@ -515,17 +559,18 @@
       "sec-auth-metadata": "database",
       "sec-user-profiles": "groups",
     };
+    const scope = settingsScope();
     const groupData = AUTH_GROUPS.map((group) => {
       const supported = group.keys.filter((key) => !!authProviderInfo(key).sectionId);
-      const visible = supported.filter((key) => configured.has(key));
+      const visible = supported.filter((key) => configured.has(key) && (!scope || scope.hasProvider(key)));
       const cards = visible.map((key) => {
         const info = authProviderInfo(key);
         const status = authStatusFor(key, configured.has(key), cfg);
         return { type: "provider", key: info.key, provider: String(info.key || "").toLowerCase(), label: info.label, status, logo: authProviderLogo(info.key) };
       });
       const okCount = cards.filter((card) => card.status.ok).length;
-      return { ...group, supported, cards, okCount, total: supported.length, copy: sectionCopy[group.id] || "" };
-    }).filter((group) => group.id !== "sec-auth-others" || group.cards.length);
+      return { ...group, supported, cards, okCount, total: scope ? cards.length : supported.length, copy: sectionCopy[group.id] || "" };
+    }).filter((group) => (group.id !== "sec-auth-others" && !scope) || group.cards.length);
     const metadataVisible = META_GROUP.keys.filter((key) => metadataConfigured(key, cfg));
     const metadataCards = metadataVisible.map((key) => {
       const info = metadataProviderInfo(key);
@@ -541,7 +586,7 @@
     const userProfileCount = userProfilesRaw && typeof userProfilesRaw === "object" ? Object.keys(userProfilesRaw).length : 0;
     const summarySections = [
       ...sections.filter((section) => section.id !== "sec-auth-others"),
-      { id: "sec-user-profiles", title: "User profiles", okCount: userProfileCount, total: userProfileCount || 0 },
+      { id: "sec-user-profiles", title: "Profiles", okCount: userProfileCount, total: userProfileCount || 0 },
     ];
     const summaryCards = summarySections.map((section) => `<div class="cw-auth-summary-card ${section.okCount ? "" : "is-empty"}" data-cw-auth-summary="${section.id}">
       <span class="cw-auth-summary-icon material-symbols-rounded" aria-hidden="true">${summaryIcon[section.id] || "hub"}</span>
@@ -580,7 +625,7 @@
     };
     const userProfileSection = `<section class="cw-auth-service-section cw-user-profile-section" data-cw-auth-group="sec-user-profiles">
         <div class="cw-auth-service-head">
-          <h4>User profiles</h4>
+          <h4>Profiles</h4>
           <p>Manage people and provider instances linked to Managed User accounts.</p>
           <span class="material-symbols-rounded cw-auth-section-chevron" aria-hidden="true">expand_more</span>
         </div>
@@ -603,7 +648,7 @@
         <div class="cw-auth-summary-row">
           ${summaryCards}
         </div>
-        <div class="cw-auth-service-list">${userProfileSection}${serviceSections}</div>
+        <div class="cw-auth-service-list">${serviceSections}${userProfileSection}</div>
       </div>`;
     if (shell.__cwAuthCardsHtml !== dashboardHtml) {
       updateAuthDashboard(shell, dashboardHtml);
@@ -651,7 +696,7 @@
   const CONNECTION_MODAL_INFO = Object.freeze({
     PLEX: {
       provider: "plex", logo: "PLEX", size: "wide", help: window.CW.HelpLinks.url("plex"), deleteSelector: "#btn-delete-plex",
-      tabs: { auth: ["lock", "Authentication", "Connect your Plex account using a secure link code"], settings: ["tune", "Settings", "Configure server and sync preferences"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"] },
+      tabs: { auth: ["lock", "Authentication", "Connect your Plex account using a secure link code"], settings: ["tune", "Settings", "Configure server and sync preferences"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"], users: ["group", "Identities", "Optional: who can be synced"] },
       copy: { auth: ["Plex Authentication", "Connect your Plex account to CrossWatch using a secure link code."], settings: ["Plex Settings", "Configure your server URL, selected profile and sync preferences."], whitelist: ["Plex Whitelisting", "Choose which libraries CrossWatch can use for history, ratings, progress, collections and scrobbling."] },
       journey: ["Link Plex, then tune the server", "Click Connect Plex to get a link code. CrossWatch shows the code, then opens plex.tv/link so you can enter it and approve access. Next, validate the server URL and optionally whitelist libraries.", "229,160,13", "229,160,13", "PLEX"],
       steps: [["1", "Get link code", "Generate a code in CrossWatch"], ["2", "Approve on Plex", "Open plex.tv/link and approve the connection"], ["3", "Validate server", "Confirm your server URL and complete setup"]],
@@ -659,7 +704,7 @@
     },
     JELLYFIN: {
       provider: "jellyfin", logo: "JELLYFIN", size: "wide", help: window.CW.HelpLinks.url("jellyfin"), deleteSelector: ".cw-jfy-delete",
-      tabs: { auth: ["lock", "Authentication", "Connect with Quick Connect or password"], settings: ["tune", "Settings", "Configure server and user details"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"] },
+      tabs: { auth: ["lock", "Authentication", "Connect with Quick Connect or password"], settings: ["tune", "Settings", "Configure server and user details"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"], users: ["group", "Identities", "Optional: who can be synced"] },
       copy: { auth: ["Jellyfin Authentication", "Connect your Jellyfin server to CrossWatch."], settings: ["Jellyfin Settings", "Configure server URL, user details and sync preferences."], whitelist: ["Jellyfin Whitelisting", "Choose which libraries CrossWatch can use for sync."] },
       journey: ["Connect to Jellyfin", "Enter your Jellyfin server URL, then connect with Quick Connect (recommended) or your username and password. CrossWatch will move you to Settings next so you can validate the server, pick the user, and optionally whitelist libraries.", "0,164,220", "0,124,220", "JELLYFIN"],
       steps: [["1", "Enter server", "Add your Jellyfin server URL"], ["2", "Authorize", "Use Quick Connect or password"], ["3", "Validate", "Confirm the account and server"]],
@@ -667,11 +712,21 @@
     },
     EMBY: {
       provider: "emby", logo: "EMBY", size: "wide", help: window.CW.HelpLinks.url("emby"), deleteSelector: "#btn-emby-delete",
-      tabs: { auth: ["lock", "Authentication", "Connect with your Emby credentials"], settings: ["tune", "Settings", "Configure server and user details"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"] },
+      tabs: { auth: ["lock", "Authentication", "Connect with your Emby credentials"], settings: ["tune", "Settings", "Configure server and user details"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"], users: ["group", "Identities", "Optional: who can be synced"] },
       copy: { auth: ["Emby Authentication", "Connect your Emby server to CrossWatch."], settings: ["Emby Settings", "Configure server URL, user details and sync preferences."], whitelist: ["Emby Whitelisting", "Choose which libraries CrossWatch can use for sync."] },
       journey: ["Connect to Emby", "Enter your Emby server URL, username and password, then sign in. CrossWatch will move you to Settings next so you can validate the server, pick the user, and optionally whitelist libraries.", "82,181,75", "82,181,75", "EMBY"],
       steps: [["1", "Enter server", "Add your Emby server URL"], ["2", "Sign in", "Authorize with user credentials"], ["3", "Validate", "Confirm the account and server"]],
       order: [".grid2", ".inline"]
+    },
+    SILO: {
+      provider: "silo", logo: "SILO", help: window.CW.HelpLinks.url("silo"), deleteSelector: "#silo_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect with a device code"], whitelist: ["verified_user", "Whitelisting", "Choose libraries and content to sync"], users: ["group", "Identities", "Optional: which household profiles can be synced"] },
+      copy: { auth: ["Silo Authentication", "Sign in to your Silo server and select a household profile."], whitelist: ["Silo Whitelisting", "Choose which libraries CrossWatch can use for history, ratings, progress, collections and scrobbling."], users: ["Silo Users", "Tick other household profiles to sync them as users of this connection."] },
+      journey: ["Connect to Silo", "Enter your Silo server URL, approve the code on its activate page, then choose a household profile.", "20,135,254", "245,11,79", "SILO"],
+      steps: [["1", "Enter server", "Add your Silo server URL"], ["2", "Approve code", "Approve the code while signed in to Silo"], ["3", "Select profile", "Choose the household profile for this instance"]],
+      order: [".silo-server-row", ".silo-actions", "#silo_login_state", "#silo_profile_state"],
+      code: ["#silo_login_state"],
+      actions: [{ row: ".silo-actions", status: "#silo_msg", buttons: "#silo_connect, #silo_cancel" }]
     },
     TRAKT: {
       provider: "trakt", logo: "TRAKT", help: window.CW.HelpLinks.url("trakt"), deleteSelector: "#btn-delete-trakt",
@@ -854,9 +909,9 @@
     CROSSWATCH: {
       provider: "crosswatch", logo: "CROSSWATCH", help: window.CW.HelpLinks.url("crosswatch"), deleteSelector: "#cw_crosswatch_disconnect",
       tabs: { auth: ["lock", "Authentication", "Connect local tracker"], settings: ["database", "Settings", "Storage and restore"] },
-      copy: { auth: ["CrossWatch Authentication", "Connect this local tracker profile."], settings: ["CrossWatch Local Tracker", "Configure storage and restore snapshots for this tracker profile."] },
-      journey: ["Connect Local Tracker", "Enable the built-in CrossWatch tracker as a normal connection. Use profiles when you want separate local watchlist, ratings, history, progress or collection data.", "124,92,255", "98,194,255", "CROSSWATCH"],
-      steps: [["1", "Choose profile", "Use Default or create CW-P profiles"], ["2", "Connect locally", "Enable the selected profile as a connection"], ["3", "Sync locally", "Use the profile in normal sync pairs"]],
+      copy: { auth: ["CrossWatch Authentication", "Connect this local tracker instance."], settings: ["CrossWatch Local Tracker", "Configure storage and restore snapshots for this tracker instance."] },
+      journey: ["Connect Local Tracker", "Enable the built-in CrossWatch tracker as a normal connection. Use instances when you want separate local watchlist, ratings, history, progress or collection data.", "124,92,255", "98,194,255", "CROSSWATCH"],
+      steps: [["1", "Choose instance", "Use Default or create CW-P instances"], ["2", "Connect locally", "Enable the selected instance as a connection"], ["3", "Sync locally", "Use the instance in normal sync pairs"]],
       introSubs: ["auth"],
       order: [".cw-tracker-auth-card", ".cw-tracker-settings-stack"],
       actions: [{ row: ".cw-tracker-auth-actions", status: "#cw_tracker_auth_msg", buttons: "#cw_crosswatch_connect" }]
@@ -1151,6 +1206,10 @@
       const profileRow = panel?.querySelector("#nuvio_profile_state");
       if (profileRow && !profileRow.classList.contains("hidden") && String(panel?.querySelector("#nuvio_profile_select")?.value || "").trim()) return true;
     }
+    if (info.key === "SILO") {
+      const profileRow = panel?.querySelector("#silo_profile_state");
+      if (profileRow && !profileRow.classList.contains("hidden") && String(panel?.querySelector("#silo_profile_select")?.value || "").trim()) return true;
+    }
     if (connectionModalStatusTarget(panel)) return true;
     const inst = String(panel?.querySelector(".cw-profile-switcher select")?.value || "default");
     return configuredProfileIds(cfg, info.provider).some((id) => String(id) === inst);
@@ -1164,7 +1223,7 @@
     save.disabled = !canSave;
     save.classList.toggle("is-disabled", !canSave);
     if (canSave) save.removeAttribute("title");
-    else save.title = "Connect this profile before saving.";
+    else save.title = "Connect this instance before saving.";
   }
 
   function syncConnectionSuccessState(panel, info, cfg = getCachedConfig()) {
@@ -1193,7 +1252,7 @@
     const capped = count >= limit;
     newBtn.disabled = capped;
     newBtn.setAttribute("aria-disabled", capped ? "true" : "false");
-    if (capped) newBtn.title = `Maximum ${limit} profiles reached.`;
+    if (capped) newBtn.title = `Maximum ${limit} instances reached.`;
     else newBtn.removeAttribute("title");
   }
 
@@ -1206,7 +1265,7 @@
     const newBtn = toolbar.querySelector(".cw-profile-new");
     const delBtn = toolbar.querySelector(".cw-profile-delete");
     if (select) {
-      select.setAttribute("aria-label", `${info?.copy?.auth?.[0] || info?.key || "Connection"} profile`);
+      select.setAttribute("aria-label", `${info?.copy?.auth?.[0] || info?.key || "Connection"} instance`);
       Array.from(select.options || []).forEach((option) => {
         const fullName = connectionProfileFullName(option);
         option.dataset.cwProfileFullName = fullName;
@@ -1230,12 +1289,12 @@
     }
     if (newBtn && !newBtn.__cwConnectionProfileDecorated) {
       newBtn.__cwConnectionProfileDecorated = true;
-      newBtn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">add</span><span>New profile</span>`;
+      newBtn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">add</span><span>New instance</span>`;
     }
     refreshConnectionProfileCreateState(select, newBtn);
     if (delBtn && !delBtn.__cwConnectionProfileDecorated) {
       delBtn.__cwConnectionProfileDecorated = true;
-      delBtn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">delete</span><span>Delete profile</span>`;
+      delBtn.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">delete</span><span>Delete instance</span>`;
     }
   }
 
@@ -1253,8 +1312,8 @@
       card.innerHTML = `
         <div class="cw-connection-profile-head">
           <span class="material-symbols-rounded" aria-hidden="true">group</span>
-          <strong>Connection profiles</strong>
-          <a class="material-symbols-rounded cw-connection-profile-help" href="${window.CW.HelpLinks.url("connection-profiles")}" target="_blank" rel="noopener noreferrer" aria-label="Open connection profiles guide" title="Open connection profiles guide">help</a>
+          <strong>Connection instances</strong>
+          <a class="material-symbols-rounded cw-connection-profile-help" href="${window.CW.HelpLinks.url("connection-instances")}" target="_blank" rel="noopener noreferrer" aria-label="Open connection instances guide" title="Open connection instances guide">help</a>
         </div>
         <div class="cw-connection-profile-body">
           <div class="cw-connection-profile-slot"></div>
@@ -1761,7 +1820,9 @@
     }
     try {
       await window.CW?.AuthShared?.saveVisibleProfileLabels?.(panel);
+      await window.CW?.SyncUsers?.saveDirty?.(panel);
       if (info.key === "NUVIO") await window.cwAuth?.nuvio?.saveSelectedProfile?.({ silent: true });
+      if (info.key === "SILO") await window.cwAuth?.silo?.saveSelectedProfile?.({ silent: true });
       const ret = window.saveSettings?.();
       if (ret && typeof ret.then === "function") await ret;
       if (btn) flashConnectionResult(btn, true);
@@ -1784,7 +1845,7 @@
         const trigger = ev.currentTarget;
         if (connectionDeleteBlockedByProfiles(panel, info)) {
           resetConnectionDeleteConfirm(trigger);
-          try { window.CW.AuthShared.showConnectionWarning("Remove the additional profiles before deleting the main connection."); } catch {}
+          try { window.CW.AuthShared.showConnectionWarning("Remove the additional instances before deleting the main connection."); } catch {}
           return;
         }
         if (trigger?.dataset?.cwConfirmDelete !== "1") {
@@ -1814,15 +1875,36 @@
       });
       footer.querySelector(".cw-connection-footer-save")?.addEventListener("click", async () => {
         resetConnectionDeleteConfirm(footer.querySelector(".cw-connection-footer-delete"));
-        const keepOpen = ["PLEX", "JELLYFIN", "EMBY"].includes(info.key);
         if (!await runConnectionSave(panel, info, footer)) return;
         loadConfig(true).then((cfg) => syncConnectionSuccessState(panel, info, cfg)).catch(() => {});
-        if (!keepOpen) setTimeout(closeAuthProviderOverlay, 1100);
+        setTimeout(closeAuthProviderOverlay, 1100);
       });
     }
     const deleteBtn = panel.querySelector(".cw-connection-footer-delete");
     if (!info.deleteSelector) resetConnectionDeleteConfirm(deleteBtn);
     deleteBtn?.classList.toggle("hidden", !info.deleteSelector);
+  }
+
+  function applyConnectionMirror(overlay, panel, info) {
+    const root = document.documentElement;
+    const mirror = root.dataset.cwRole === "user" || root.dataset.cwViewAs === "1";
+    const keys = String(root.dataset.cwReconnect || "").split(" ").filter(Boolean);
+    const state = mirror ? (keys.includes(info.key) ? "reconnect" : "locked") : "";
+    if (state) overlay.dataset.cwMirror = state;
+    else delete overlay.dataset.cwMirror;
+    let note = panel.querySelector(":scope > .cw-connection-locked-note");
+    if (state !== "locked") {
+      note?.remove();
+      return;
+    }
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "cw-connection-locked-note";
+      note.textContent = "Only the administrator can change this connection.";
+      const anchor = panel.querySelector(":scope > .cw-subpanels") || panel.querySelector(":scope > .auth-card");
+      if (anchor) anchor.before(note);
+      else panel.appendChild(note);
+    }
   }
 
   function enhanceConnectionModal(section, overlay, key) {
@@ -1847,6 +1929,7 @@
     applyConnectionModalOrder(panel, info);
     normalizeConnectionModalActions(panel, info);
     ensureConnectionModalFooter(panel, info);
+    applyConnectionMirror(overlay, panel, info);
     if (["PLEX", "JELLYFIN", "EMBY", "KODI"].includes(info.key)) selectConnectionModalSub(panel, info, "auth", overlay);
     syncConnectionModalCopy(panel, info, overlay);
     panel.__cwConnectionProfileSeen = connectionModalProfileId(panel);
@@ -2120,12 +2203,16 @@
   let authHtml = "";
   let authInflight = null;
   async function mountAuthProviders(force = false) {
-    if (authSetupPending()) return;
+    if (authSetupPending()) {
+      try { await window.__cwAuthBootstrapPromise; } catch {}
+      if (authSetupPending()) return;
+    }
     if (authInflight) return authInflight;
     authInflight = (async () => {
       try {
         const slot = document.getElementById("auth-providers");
         if (!slot) return;
+        await loadManagedInstances();
         if (!authHtml || force) authHtml = await apiText("/api/auth/providers/html");
         const main = slot.querySelector(":scope > .cw-auth-main");
         if (main && slot.__cwAuthSourceHtml === authHtml) {
@@ -2157,6 +2244,7 @@
         window.initPublicMetaDBAuthUI?.();
         window.cwAuth?.floppy?.init?.();
         window.initNuvioAuthUI?.();
+        window.initSiloAuthUI?.();
         window.initTautulliAuthUI?.();
         window.initTracearrAuthUI?.();
         window.initAniListAuthUI?.();
@@ -2313,7 +2401,10 @@
   }
 
   async function ensureProvidersPaneReady(force = false) {
-    if (authSetupPending()) return;
+    if (authSetupPending()) {
+      try { await window.__cwAuthBootstrapPromise; } catch {}
+      if (authSetupPending()) return;
+    }
     const page = document.getElementById("page-settings");
     const settingsVisible = !!(page && !page.classList.contains("hidden"));
     const pane = currentSettingsPane();
@@ -2346,6 +2437,12 @@
   document.addEventListener("cw-settings-pane-changed", (ev) => {
     if (!["providers", "sync"].includes(String(ev?.detail?.pane || "").toLowerCase())) return;
     try { ensureProvidersPaneReady(); } catch {}
+  });
+
+  window.addEventListener("cw:settings-scope-changed", () => {
+    const slot = document.getElementById("auth-providers");
+    if (!slot?.querySelector(".cw-auth-dashboard")) return;
+    try { renderAuthCards(slot, getCachedConfig()); } catch {}
   });
 
   document.addEventListener("tab-changed", (ev) => {

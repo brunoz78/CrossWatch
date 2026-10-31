@@ -117,6 +117,15 @@
     return wrap;
   }
 
+  function cloudHistoryLabel(rows, kind) {
+    if (kind !== "history" || !rows.some(row => row.raw?._plex_cloud_history === true)) return null;
+    const source = document.createElement("div");
+    source.className = "cw-title-sub";
+    source.textContent = "Source: Plex cloud history";
+    source.title = "Read from Plex account history. This does not confirm presence in a Plex server library.";
+    return source;
+  }
+
   function createRowElement(row, ctx = {}) {
     const state = ctx.state || {};
     const anilistMode = !!ctx.anilistMode;
@@ -331,6 +340,18 @@
     };
     if (searchUsesCorrection) actionWrap.appendChild(searchBtn);
     else if (!ctx.merged) titleRow.appendChild(searchBtn);
+    if (!ctx.merged && call(ctx, "canTraceOrigin", row)) {
+      const originBtn = document.createElement("button");
+      originBtn.type = "button";
+      originBtn.className = "cw-title-search-btn cw-btn-origin";
+      originBtn.innerHTML = '<span class="material-symbol" aria-hidden="true">alt_route</span>';
+      originBtn.title = "Where does this come from?";
+      originBtn.setAttribute("aria-label", originBtn.title);
+      originBtn.onclick = () => call(ctx, "openItemOrigin", row, originBtn);
+      titleRow.appendChild(originBtn);
+    }
+    const cloudLabel = cloudHistoryLabel([row], state.kind);
+    if (cloudLabel) titleCell.appendChild(cloudLabel);
     if (ctx.merged) titleCell.appendChild(presenceChips(row, ctx));
     if (row._episodeGroups?.length) titleCell.appendChild(episodeGroupBadges(row, ctx));
 
@@ -482,6 +503,8 @@
     const title = document.createElement("strong");
     title.textContent = call(ctx, "formatEpisodeVisualTitle", latest) || latest.title || latest.key || "";
     summary.appendChild(title);
+    const cloudLabel = cloudHistoryLabel(rows, state.kind);
+    if (cloudLabel) summary.appendChild(cloudLabel);
     if (latest._episodeGroups?.length) summary.appendChild(episodeGroupBadges(latest, ctx));
     if (latest.year) {
       const year = document.createElement("span");

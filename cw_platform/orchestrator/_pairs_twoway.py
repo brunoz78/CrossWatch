@@ -79,6 +79,7 @@ from ._episode_groups import HistoryGroups, note_identity_conflicts
 from ._progress_completion import fcfg_for_progress_target
 from ._specials import filter_specials_index, specials_excluded
 from ._scope import provider_call
+from ._pairs_oneway import filter_provider_adds
 from .. import library_presence as _library_presence
 try:
     from ._pairs_oneway import _media_type_filter_index as _media_filter
@@ -101,6 +102,7 @@ from ..anime_mapping.service import (
 from ..anime_mapping.history_coords import build_history_coordinate_aliases as _build_history_coordinate_aliases
 from ._snapshots import (
     build_snapshots_for_feature,
+    emit_cloud_history_read,
     bust_snapshot_cache,
     coerce_suspect_snapshot,
     module_checkpoint,
@@ -109,6 +111,7 @@ from ._snapshots import (
     provider_index_semantics,
     prev_checkpoint,
     refresh_destination_after_apply,
+    require_snapshot,
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
@@ -474,10 +477,14 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         except Exception:
             pass
 
-    emit("two:start", a=a, b=b, feature=feature, removals=allow_removals)
-
     a_cfg = pair_endpoint_config(provider_cfg, a, src_inst)
     b_cfg = pair_endpoint_config(provider_cfg, b, dst_inst)
+    reads_cloud_history = feature == "history" and any(provider == "PLEX" and ((view.get("plex") or {}).get("history") or {}).get("read_cloud_history") is True for provider, view in ((a, a_cfg), (b, b_cfg)))
+    if reads_cloud_history:
+        allow_removals = False
+    emit("two:start", a=a, b=b, feature=feature, removals=allow_removals)
+    if reads_cloud_history:
+        emit("history:cloud_read", feature=feature, provider="PLEX", reason="Plex cloud history reads enabled; History removals are disabled for this pair.")
     pair_providers = {a: aops, b: bops}
 
     if str(a).strip().upper() == "SIMKL" and str(b).strip().upper() != "SIMKL":
@@ -497,12 +504,14 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             feature=feature, config=a_cfg, providers={a: aops},
             snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
             dbg=dbg, emit_info=info, on_snapshot=_on_snapshot,
-        ).get(a) or {}
+        )
+        A_cur = require_snapshot(A_cur, a, feature)
         B_cur = build_snapshots_for_feature(
             feature=feature, config=b_cfg, providers={b: bops},
             snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
             dbg=dbg, emit_info=info,
-        ).get(b) or {}
+        )
+        B_cur = require_snapshot(B_cur, b, feature)
     else:
         snaps = build_snapshots_for_feature(
             feature=feature, config=provider_cfg, providers=pair_providers,
@@ -510,8 +519,11 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             dbg=dbg, emit_info=info,
             build_order=build_order, on_snapshot=_on_snapshot,
         )
-        A_cur = snaps.get(a) or {}
-        B_cur = snaps.get(b) or {}
+        A_cur = require_snapshot(snaps, a, feature)
+        B_cur = require_snapshot(snaps, b, feature)
+
+    emit_cloud_history_read(emit, a, feature, a_cfg, A_cur)
+    emit_cloud_history_read(emit, b, feature, b_cfg, B_cur)
     cancelled = bool(cancel_requested())
 
 
@@ -700,6 +712,10 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             A_eff = _comparison_view(aops, a_cfg, feature, A_eff, side=a, dbg=dbg)
             B_eff = _comparison_view(bops, b_cfg, feature, B_eff, side=b, dbg=dbg)
 
+    A_server_history = {k: v for k, v in A_eff.items() if not v.get("_plex_cloud_history")}
+    B_server_history = {k: v for k, v in B_eff.items() if not v.get("_plex_cloud_history")}
+    A_cloud_history = {k: v for k, v in A_eff.items() if v.get("_plex_cloud_history") is True}
+    B_cloud_history = {k: v for k, v in B_eff.items() if v.get("_plex_cloud_history") is True}
     if feature == "history":
         A_cur = filter_history_events(A_cur, event_mode=history_event_mode)
         B_cur = filter_history_events(B_cur, event_mode=history_event_mode)
@@ -810,7 +826,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     show_v = show_ids.get(k)
                     if show_v is not None and str(show_v).lower() == str(v).lower():
                         continue
-                    toks.add(f"{str(k).lower()}:{str(v).lower()}")
+                    toks.add(f"{str(k).lower()}:{str(v).lower()}#episode")
             try:
                 season_raw = it.get("season") if it.get("season") is not None else it.get("season_number")
                 episode_raw = it.get("episode") if it.get("episode") is not None else it.get("episode_number")
@@ -929,12 +945,17 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         if ck and ck in idx:
             v = idx.get(ck)
             return v if isinstance(v, Mapping) else None
+        is_episode = _norm_type(it.get("type")) == "episode"
         for tok in _typed_tokens(it):
             dk = alias.get(tok)
             if not dk:
                 continue
             v = idx.get(dk)
-            return v if isinstance(v, Mapping) else None
+            if not isinstance(v, Mapping):
+                return None
+            if (_norm_type(v.get("type")) == "episode") != is_episode:
+                continue
+            return v
         if feature == "history" and str(it.get("type") or "").strip().lower() == "show":
             target = _show_level_tokens(it)
             if target:
@@ -1775,6 +1796,29 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     add_to_A.append(_minimal(v))
             if coord_pruned_to_A or coord_pruned_to_B:
                 dbg("anime_mapping.coord_pruned", feature=feature, a=a, b=b, to_a=coord_pruned_to_A, to_b=coord_pruned_to_B)
+    if feature == "history":
+        for provider, view, source, server, cloud, target in (
+            (a, a_cfg, B_eff, A_server_history, A_cloud_history, add_to_A),
+            (b, b_cfg, A_eff, B_server_history, B_cloud_history, add_to_B),
+        ):
+            if provider != "PLEX" or ((view.get("plex") or {}).get("history") or {}).get("read_cloud_history") is not True:
+                continue
+            if history_event_mode:
+                missing, _, _ = compare_history_events(source, server, typed_tokens=_typed_tokens, tolerance_seconds=history_tolerance)
+            else:
+                server_alias = _alias_index(server)
+                missing = [item for item in source.values() if has_history_watch(item) and not _present(server, server_alias, item)]
+            candidates = {str(index): item for index, item in enumerate(missing)}
+            cloud_matches = history_event_matches(candidates, cloud, _typed_tokens, tolerance_seconds=history_tolerance)
+            planned = {_sync_key(item) for item in target}
+            for candidate, item in candidates.items():
+                if candidate in cloud_matches:
+                    continue
+                key = _sync_key(item)
+                if key not in planned:
+                    target.append(_sync_minimal(item))
+                    planned.add(key)
+
     add_to_A = groups.ordinary(0, add_to_A) + groups.adds[0]
     add_to_B = groups.ordinary(1, add_to_B) + groups.adds[1]
     upd_to_A, upd_to_B = groups.ordinary(0, upd_to_A), groups.ordinary(1, upd_to_B)
@@ -1891,6 +1935,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     use_phantoms = bool(bb.get("enabled") and bb.get("block_adds", True))
     bb_ttl_days = int(bb.get("cooldown_days") or 0) or None
 
+    add_to_A = filter_provider_adds(aops, a_cfg, feature, add_to_A)
+    add_to_B = filter_provider_adds(bops, b_cfg, feature, add_to_B)
     guardA = PhantomGuard(src=b, dst=a, feature=feature, ttl_days=bb_ttl_days, enabled=use_phantoms)
     guardB = PhantomGuard(src=a, dst=b, feature=feature, ttl_days=bb_ttl_days, enabled=use_phantoms)
 
@@ -2021,6 +2067,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
     review = getattr(ctx, "interactive", None)
     if review is not None:
+        review.discover_notice(feature, a, src_inst, a_cfg)
+        review.discover_notice(feature, b, dst_inst, b_cfg)
         planned_A, planned_B = list(add_to_A), list(add_to_B)
         args_A = dict(source=b, source_instance=dst_inst, before=A_eff, down=a_down)
         args_B = dict(source=a, source_instance=src_inst, before=B_eff, down=b_down)
@@ -2364,6 +2412,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 have_exact_keys=have_exact_keys_A,
                 verify_after_write=verify_after_write,
                 provider_skipped=bool((resA_add or {}).get("skipped")),
+                deferred_keys=(resA_add or {}).get("deferred_keys", []),
             )
             prov_count_A = _decision_A["prov_confirmed"]
             eff_add_A = _decision_A["effective"]
@@ -2404,7 +2453,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                         pair=pair_key,
                     )
                 if use_phantoms and 'guardA' in locals() and guardA and success_A and not dry_run_flag:
-                    guardA.record_success(set(success_A))
+                    guardA.record_success(set(success_A) - set((resA_add or {}).get("cloud_confirmed_keys") or []))
             except Exception:
                 pass
             
@@ -2502,6 +2551,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 have_exact_keys=have_exact_keys_B,
                 verify_after_write=verify_after_write,
                 provider_skipped=bool((resB_add or {}).get("skipped")),
+                deferred_keys=(resB_add or {}).get("deferred_keys", []),
             )
             prov_count_B = _decision_B["prov_confirmed"]
             eff_add_B = _decision_B["effective"]
@@ -2542,7 +2592,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                         pair=pair_key,
                     )
                 if use_phantoms and 'guardB' in locals() and guardB and success_B and not dry_run_flag:
-                    guardB.record_success(set(success_B))
+                    guardB.record_success(set(success_B) - set((resB_add or {}).get("cloud_confirmed_keys") or []))
             except Exception:
                 pass
             

@@ -1003,7 +1003,7 @@ def _xml_to_container(xml_text: str) -> Mapping[str, Any]:
     root = ET.fromstring(xml_text)
     mc = root if root.tag.endswith("MediaContainer") else root.find(".//MediaContainer")
     if mc is None:
-        return {"MediaContainer": {"Metadata": [], "SearchResults": []}}
+        raise ValueError("plex_xml_missing_media_container")
 
     out_mc: dict[str, Any] = {}
     for k in ("totalSize", "size", "offset"):
@@ -1891,10 +1891,13 @@ def _discover_search_title(
 
         def _search_metadata_provider(q: str) -> list[Mapping[str, Any]]:
             try:
+                params = {"title": q, "type": 1 if kind == "movie" else 2, "includeGuids": 1}
+                if kind == "movie" and year is not None:
+                    params["year"] = year
                 r = requests.get(
-                    f"{METADATA}/library/search",
+                    f"{METADATA}/library/metadata/matches",
                     headers=_hdrs(),
-                    params={"query": q, "limit": max(50, int(limit))},
+                    params=params,
                     timeout=7,
                 )
                 if r.ok and "json" in (r.headers.get("content-type", "").lower()):
@@ -2357,6 +2360,7 @@ def _fetch_section_guid_rows(srv: Any, section_id: str, plex_type: int, *, check
     seen_pages: set[tuple[str, ...]] = set()
     start = 0
     made = 0
+    expected_total: int | None = None
 
     while True:
         if check_cancel:
@@ -2390,6 +2394,11 @@ def _fetch_section_guid_rows(srv: Any, section_id: str, plex_type: int, *, check
             total_i = int(total) if total is not None else None
         except Exception as exc:
             raise RuntimeError("plex_guid_index_parse_failed") from exc
+        if total_i is not None:
+            if expected_total is not None and total_i != expected_total:
+                raise RuntimeError(f"plex_guid_index_total_changed:{expected_total}->{total_i}")
+            expected_total = total_i
+        total_i = expected_total
         if not rows:
             if total_i is not None and start < total_i:
                 raise RuntimeError("plex_guid_index_incomplete_page")

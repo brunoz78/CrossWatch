@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from ..path_matching import pair_enabled
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 from contextlib import contextmanager
 import copy
@@ -21,7 +21,15 @@ from ._pairs_utils import (
     supports_feature,
 )
 from ._pairs_metrics import ApiMetrics, persist_api_totals
-from ..provider_instances import _config_key_for, build_pair_config_view, build_provider_config_view, normalize_instance_id
+from ..provider_instances import (
+    _config_key_for,
+    build_pair_config_view,
+    build_provider_config_view,
+    is_sync_user_instance,
+    normalize_instance_id,
+    split_sync_user_id,
+)
+from ..identity_links import mapped_identities
 from ._pairs_oneway import run_one_way_feature
 from ._pairs_twoway import run_two_way_feature
 from ._pairs_playlists import run_playlist_mappings
@@ -92,7 +100,7 @@ def _config_with_pair_feature_options(
     provider_keys: list[str] = []
     for provider in providers:
         name = str(provider or "").upper().strip()
-        if name not in {"PLEX", "EMBY", "JELLYFIN", "KODI"}:
+        if name not in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO"}:
             continue
         provider_key = name.lower()
         if provider_key not in provider_keys:
@@ -158,6 +166,11 @@ except Exception:
             return
 
 
+def _health_instance(instance_id: Any) -> str:
+    ref = split_sync_user_id(instance_id)
+    return ref[0] if ref is not None else normalize_instance_id(instance_id)
+
+
 def _collect_health_for_run(ctx, pairs: list[Mapping[str, Any]]) -> dict[str, Any]:
     emit = ctx.emit
     provs = ctx.providers or {}
@@ -168,8 +181,8 @@ def _collect_health_for_run(ctx, pairs: list[Mapping[str, Any]]) -> dict[str, An
     for p in pairs:
         s = str(p.get("source") or "").upper().strip()
         t = str(p.get("target") or "").upper().strip()
-        si = normalize_instance_id(p.get("source_instance"))
-        ti = normalize_instance_id(p.get("target_instance"))
+        si = _health_instance(p.get("source_instance"))
+        ti = _health_instance(p.get("target_instance"))
         if s:
             needed.add((s, si))
         if t:
@@ -337,6 +350,38 @@ def _pair_scope_ids(ctx) -> set[str]:
     return {str(x).strip() for x in raw if str(x).strip()}
 
 
+_SYNC_USER_PROVIDERS = frozenset({"PLEX", "EMBY", "JELLYFIN", "SILO"})
+
+
+def _expand_sync_user_pair(cfg: Mapping[str, Any], pair: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    if not coerce_bool(pair.get("match_users", False), False):
+        return [pair]
+    src = str(pair.get("source") or "").upper().strip()
+    dst = str(pair.get("target") or "").upper().strip()
+    src_parent = normalize_instance_id(pair.get("source_instance") or pair.get("src_instance"))
+    dst_parent = normalize_instance_id(pair.get("target_instance") or pair.get("dst_instance"))
+    if src not in _SYNC_USER_PROVIDERS or dst not in _SYNC_USER_PROVIDERS:
+        return [pair]
+    if is_sync_user_instance(src_parent) or is_sync_user_instance(dst_parent):
+        return [pair]
+    out: list[Mapping[str, Any]] = []
+    for row in mapped_identities(cfg, src, src_parent, dst, dst_parent, pair.get("user_matches")):
+        derived = {k: v for k, v in pair.items() if k not in ("src_instance", "dst_instance")}
+        derived["source_instance"] = row["source_instance"]
+        derived["target_instance"] = row["target_instance"]
+        derived["_cw_sync_user"] = row["username"]
+        out.append(derived)
+    return out
+
+
+def expand_sync_user_pairs(cfg: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    out: list[Mapping[str, Any]] = []
+    for pair in cfg.get("pairs") or []:
+        if isinstance(pair, Mapping):
+            out.extend(_expand_sync_user_pair(cfg, pair))
+    return out
+
+
 def _pairs_for_run(ctx, cfg: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     scope = _pair_scope_ids(ctx)
     out: list[Mapping[str, Any]] = []
@@ -347,7 +392,13 @@ def _pairs_for_run(ctx, cfg: Mapping[str, Any]) -> list[Mapping[str, Any]]:
             continue
         if scope and str(pair.get("id") or "").strip() not in scope:
             continue
-        out.append(pair)
+        expanded = _expand_sync_user_pair(cfg, pair)
+        if not expanded:
+            emit = getattr(ctx, "emit", None)
+            if callable(emit):
+                emit("run:pair:skip", pair_id=str(pair.get("id") or ""), src=str(pair.get("source") or "").upper(),
+                     dst=str(pair.get("target") or "").upper(), reason="no_matched_users")
+        out.extend(expanded)
     return out
 
 
@@ -376,7 +427,7 @@ def _pair_scope_key(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode
 
 
 @contextmanager
-def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str, feature: str, scope: str | None = None):
+def _pair_env(pair: Mapping[str, Any], *, i: int, src: str, dst: str, mode: str, feature: str, scope: str | None = None) -> Iterator[None]:
     key = scope or _pair_scope_key(pair, i=i, src=src, dst=dst, mode=mode)
     src_inst = normalize_instance_id(pair.get("source_instance"))
     dst_inst = normalize_instance_id(pair.get("target_instance"))
@@ -496,7 +547,7 @@ def run_pairs(ctx) -> dict[str, Any]:
                     pair_cfg_view[k] = blk
                 if isinstance(pv, Mapping):
                     _deep_merge_provider_overrides(blk, pv)
-                elif pv is not None and k in {"plex", "jellyfin", "emby"}:
+                elif pv is not None and k in {"plex", "jellyfin", "emby", "silo"}:
                     blk["strict_id_matching"] = coerce_bool(pv)
 
         feat_map = dict(pair.get("features") or {})
@@ -531,6 +582,7 @@ def run_pairs(ctx) -> dict[str, Any]:
             dst_instance=dst_inst,
             mode=mode,
             features=features,
+            **({"sync_user": pair["_cw_sync_user"]} if pair.get("_cw_sync_user") else {}),
         )
 
         sops = provs.get(src)
@@ -540,10 +592,12 @@ def run_pairs(ctx) -> dict[str, Any]:
             emit_info(f"[!] Missing provider ops for {src}→{dst}")
             continue
 
-        ss = health_status(health_map.get(f"{src}#{src_inst}") or health_map.get(src) or {})
-        sd = health_status(health_map.get(f"{dst}#{dst_inst}") or health_map.get(dst) or {})
-        if ss == "auth_failed" or sd == "auth_failed":
-            emit("pair:skip", pair_id=str(pair.get('id') or ''), src=src, dst=dst, reason="auth_failed", src_status=ss, dst_status=sd)
+        ss = health_status(health_map.get(f"{src}#{_health_instance(src_inst)}") or health_map.get(src) or {})
+        sd = health_status(health_map.get(f"{dst}#{_health_instance(dst_inst)}") or health_map.get(dst) or {})
+        if {"auth_failed", "down"} & {ss, sd}:
+            reason = "auth_failed" if "auth_failed" in (ss, sd) else "provider_down"
+            emit("pair:skip", pair_id=str(pair.get('id') or ''), src=src, dst=dst, reason=reason, src_status=ss, dst_status=sd)
+            errors_total += 1
             continue
 
         injected = False
@@ -573,7 +627,7 @@ def run_pairs(ctx) -> dict[str, Any]:
                         override = next((value for key, value in pair_prov.items() if str(key).strip().upper() == src), {}) if isinstance(pair_prov, Mapping) else {}
                         if isinstance(override, Mapping):
                             _deep_merge_provider_overrides(block, override)
-                        elif override is not None and src in {"PLEX", "JELLYFIN", "EMBY"}:
+                        elif override is not None and src in {"PLEX", "JELLYFIN", "EMBY", "SILO"}:
                             block["strict_id_matching"] = coerce_bool(override)
                         endpoint_cfg = _config_with_pair_feature_options(endpoint_cfg, fcfg, (src, dst), feature)
                         endpoint_blocks[instance] = endpoint_cfg[config_key]

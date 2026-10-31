@@ -6,7 +6,7 @@
   const providerMeta = () => w.CW?.ProviderMeta || {};
   const label = (v) => providerMeta().label?.(v) || String(v || "").toUpperCase();
   const logo = (v) => providerMeta().logoPath?.(v) || "";
-  const plexRatingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob"];
+  const plexRatingSinks = ["kitsu", "myanimelist", "crosswatch", "trakt", "simkl", "mdblist", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob", "silo"];
   const state = { root: null, overview: null, busy: false, panels: { watcherDefaults: false, ratings: false, webhookDefaults: false }, delBtn: null, delTimer: 0, regenBtn: null, regenTimer: 0, legacyConfirm: false, legacyTimer: 0, hybridDismissed: false };
 
   async function authSetupBlocked() {
@@ -90,21 +90,27 @@
     const name = String(row?.user_profile_label || "").trim();
     if (!name) return `<div class="sc2-rt-conn"><span class="sc2-rt-conn-line"></span></div>`;
     return `<div class="sc2-rt-conn has-profile"><span class="sc2-rt-conn-line"></span>
-      <span class="sc2-rt-profile" title="${esc(`User profile: ${name}`)}">
+      <span class="sc2-rt-profile" title="${esc(`Profile: ${name}`)}">
         <span class="material-symbols-rounded" aria-hidden="true">person</span>
         <span class="sc2-rt-profile-name">${esc(name)}</span>
       </span></div>`;
   }
 
-  function routeFilterSummary(filters = {}) {
-    const parts = [];
+  function linkedSummary(on, mapping) {
+    if (!on) return "";
+    const n = Object.keys(mapping && typeof mapping === "object" ? mapping : {}).length;
+    return n ? `${n} ${n === 1 ? "person" : "people"} linked` : "No people linked";
+  }
+
+  function routeFilterSummary(filters = {}, linked = "", replaceUsers = false) {
+    const parts = linked ? [linked] : [];
     const users = Array.isArray(filters.username_whitelist) ? filters.username_whitelist : [];
     const allow = Array.isArray(filters.server_uuid_whitelist) ? filters.server_uuid_whitelist : [];
     const block = Array.isArray(filters.server_uuid_blacklist) ? filters.server_uuid_blacklist : [];
     const paths = Array.isArray(filters.ignored_path_prefixes) ? filters.ignored_path_prefixes : [];
     const patterns = Array.isArray(filters.ignored_filename_patterns) ? filters.ignored_filename_patterns : [];
     const editions = Array.isArray(filters.ignored_editions) ? filters.ignored_editions : [];
-    if (users.length) parts.push(`${users.length} user${users.length === 1 ? "" : "s"}`);
+    if (users.length && !replaceUsers) parts.push(`${users.length} user${users.length === 1 ? "" : "s"}`);
     if (allow.length || filters.server_uuid) parts.push(`${allow.length || 1} UUID allow`);
     if (block.length) parts.push(`${block.length} UUID block`);
     if (filters.ignore_agregarr_trailers) parts.push("Agregarr ignored");
@@ -120,7 +126,8 @@
     const provider = String(row.provider || "").toLowerCase();
     const key = provider === "plex" ? "filters_plex" : provider === "jellyfin" ? "filters_jellyfin" : "filters_emby";
     const settings = row.effective_settings || {};
-    return routeFilterSummary(settings[key] || {});
+    const sink = String(row.sink || "").toLowerCase();
+    return routeFilterSummary(settings[key] || {}, linkedSummary(settings.match_users?.[sink] === true, settings.user_matches?.[sink]));
   }
 
   function renderHeader(o) {
@@ -161,7 +168,7 @@
     const sectionState = rows.some((x) => x.enabled) ? "" : " is-empty";
     return `
       <section class="sc2-section${sectionState}" id="sc-sec-webhook">
-        <div class="sc2-section-head"><div><h4>Webhooks</h4><p>Manage media-server profile endpoints.</p></div></div>
+        <div class="sc2-section-head"><div><h4>Webhooks</h4><p>Manage media-server instance endpoints.</p></div></div>
         <div class="sc2-route-card-grid">
           ${rows.map((x) => {
             const [text] = webhookState(x);
@@ -214,8 +221,8 @@
               <div class="sc2-route-meta">
                 <span class="sc2-route-type"><span class="material-symbols-rounded">sensors</span>Watcher</span>
                 <span class="sc2-route-id">${esc(r.id || "Route")}</span>
-                <span class="sc2-route-filters sc2-muted">${esc(routeFilterSummary(r.filters))}</span>
-                ${r.needs_account_filter ? `<span class="sc2-route-warn" title="This route is assigned to a user profile but has no account whitelist, so play events are blocked."><span class="material-symbols-rounded">warning</span>No account filter</span>` : ""}
+                <span class="sc2-route-filters sc2-muted">${esc(routeFilterSummary(r.filters, linkedSummary(r.match_users === true, r.user_matches), r.match_users === true))}</span>
+                ${r.needs_account_filter ? `<span class="sc2-route-warn" title="This route is assigned to a profile but has no account whitelist, so play events are blocked."><span class="material-symbols-rounded">warning</span>No account filter</span>` : ""}
               </div>
               <div class="sc2-route-actions">
                 <button type="button" class="btn small sc2-round-action sc2-route-toggle ${r.enabled ? "is-on" : "is-off"}" data-action="toggle-route" data-route="${esc(r.id)}" title="${esc(r.enabled ? "Disable route" : "Enable route")}" aria-label="${esc(r.enabled ? "Disable route" : "Enable route")}"><span class="material-symbols-rounded">power_settings_new</span><span>${esc(r.enabled ? "On" : "Off")}</span></button>
@@ -335,7 +342,7 @@
           <span class="sc2-collapse-chev material-symbols-rounded">expand_more</span>
         </button>
         <div class="sc2-collapse-body">
-          <div class="sc2-inline-note"><span class="material-symbols-rounded">info</span><span>These apply to every webhook profile unless a profile sets its own value.</span></div>
+          <div class="sc2-inline-note"><span class="material-symbols-rounded">info</span><span>These apply to every webhook unless an instance sets its own value.</span></div>
           <div class="sc2-defaults-grid">
             <label class="sc2-field"><span>Pause debounce (s)</span><input class="input" type="number" min="0" max="3600" data-setting-num="webhook_pause_debounce_seconds" value="${esc(wd.pause_debounce_seconds ?? "")}" placeholder="Default"></label>
             <label class="sc2-field"><span>Suppress start (%)</span><input class="input" type="number" min="0" max="3600" data-setting-num="webhook_suppress_start_at" value="${esc(wd.suppress_start_at ?? "")}" placeholder="Default"></label>

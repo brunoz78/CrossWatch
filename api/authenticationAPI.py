@@ -22,6 +22,7 @@ from fastapi import Body, Request, HTTPException, Response, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from api.provider_guard import usage_conflict_response
+from cw_platform.access_policy import managed_request, reconnect_payload
 from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import DEFAULT_CFG, load_config, save_config
 from cw_platform.provider_instances import apply_instance_defaults, ensure_instance_block, ensure_provider_block, normalize_instance_id
@@ -399,14 +400,15 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return HTMLResponse(auth_providers_html())
 
     @app.post("/api/crosswatch/connect", tags=["auth"])
-    def api_crosswatch_connect(instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_crosswatch_connect(request: Request, instance: str | None = Query(None)) -> dict[str, Any]:
         try:
             cfg = load_config() or {}
             if not isinstance(cfg, dict):
                 cfg = dict(cfg)
             inst = normalize_instance_id(instance)
             base = ensure_provider_block(cfg, "crosswatch")
-            base["connected"] = True
+            if inst == "default" or not managed_request(request):
+                base["connected"] = True
             base.setdefault("root_dir", "/config/.cw_provider")
             base.setdefault("retention_days", 30)
             base.setdefault("auto_snapshot", True)
@@ -709,7 +711,7 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
                 "instance": inst,
                 "ok": False,
                 "reason": "token_required",
-                "message": "Connect this Plex profile first.",
+                "message": "Connect this Plex instance first.",
             }
 
         norm = lambda s: (s or "").strip().lower()
@@ -896,9 +898,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
     # JELLYFIN
     @app.post("/api/jellyfin/login", tags=["auth"])
-    def api_jellyfin_login(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> JSONResponse:
+    def api_jellyfin_login(request: Request, payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> JSONResponse:
         if not isinstance(payload, dict):
             return JSONResponse({"ok": False, "error": "Malformed request"}, 400)
+        payload = reconnect_payload(request, "/api/jellyfin/login", payload)
 
         inst = normalize_instance_id(instance)
         cfg = load_config()
@@ -991,7 +994,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return JSONResponse({**result, "instance": inst}, 200)
 
     @app.post("/api/jellyfin/quickconnect/start", tags=["auth"])
-    def api_jellyfin_qc_start(payload: dict[str, Any] = Body(default={}), instance: str | None = Query(None)) -> JSONResponse:
+    def api_jellyfin_qc_start(request: Request, payload: dict[str, Any] = Body(default={}), instance: str | None = Query(None)) -> JSONResponse:
+        payload = reconnect_payload(request, "/api/jellyfin/quickconnect/start", payload)
         inst = normalize_instance_id(instance)
         cfg = load_config()
         ensure_provider_block(cfg, "jellyfin")
@@ -1146,9 +1150,10 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
 
     # EMBY
     @app.post("/api/emby/login", tags=["auth"])
-    def api_emby_login(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> JSONResponse:
+    def api_emby_login(request: Request, payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> JSONResponse:
         if not isinstance(payload, dict):
             return JSONResponse({"ok": False, "error": "Malformed request"}, 400)
+        payload = reconnect_payload(request, "/api/emby/login", payload)
 
         inst = normalize_instance_id(instance)
         cfg = load_config()
@@ -2036,19 +2041,20 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return _tmdb_v3_api_key_error(api_key)
 
     @app.post("/api/tmdb_sync/connect/start", tags=["auth"])
-    def api_tmdb_sync_connect_start(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_tmdb_sync_connect_start(request: Request, payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
+        managed = managed_request(request)
         try:
             cfg = load_config()
             tm = ensure_instance_block(cfg, "tmdb_sync", inst)
             key = str((payload or {}).get("api_key") or "").strip()
-            if _looks_masked_secret(key):
+            if managed or _looks_masked_secret(key):
                 key = str((tm or {}).get("api_key") or "").strip()
             key_error = _tmdb_sync_key_error(key)
             if key_error:
                 return {"ok": False, "error": key_error}
             read_token = str((payload or {}).get("read_token") or "").strip()
-            if _looks_masked_secret(read_token):
+            if managed or _looks_masked_secret(read_token):
                 read_token = str((tm or {}).get("read_token") or "").strip()
             read_error = _tmdb_read_token_error(read_token, key)
             if read_error:
@@ -2090,7 +2096,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return {"ok": False, "error": err}
 
     @app.post("/api/tmdb_sync/connect/finish", tags=["auth"])
-    def api_tmdb_sync_connect_finish(payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_tmdb_sync_connect_finish(request: Request, payload: dict[str, Any] = Body(...), instance: str | None = Query(None)) -> dict[str, Any]:
+        payload = reconnect_payload(request, "/api/tmdb_sync/connect/finish", payload)
         inst = normalize_instance_id(instance)
         try:
             cfg = load_config()
@@ -2632,7 +2639,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return {"ok": False, "error": "internal", "instance": inst}
 
     @app.post("/api/flicklist/device/start", tags=["auth"])
-    def api_flicklist_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+    def api_flicklist_device_start(request: Request, payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        payload = reconnect_payload(request, "/api/flicklist/device/start", payload)
         inst = normalize_instance_id(instance)
         try:
             raw = payload or {}
@@ -2970,6 +2978,187 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         except Exception as e:
             _safe_log(log_fn, "NUVIO", f"[NUVIO] disconnect failed reason={_nuvio_error(e)} instance={inst}")
             return {"ok": False, "error": _nuvio_public_error(), "instance": inst}
+
+    # SILO
+    def _silo_client(cfg: dict[str, Any], inst: str):
+        from providers.auth._auth_SILO import SiloClient
+
+        return SiloClient(cfg, instance_id=inst)
+
+    _SILO_PUBLIC_ERRORS: tuple[str, ...] = (
+        "authentication_failed",
+        "connection_failed",
+        "device_login_unavailable",
+        "disconnect_first",
+        "http_error",
+        "invalid_pin",
+        "invalid_profile",
+        "invalid_response",
+        "invalid_url",
+        "missing_authentication",
+        "not_silo",
+        "pin_failed",
+        "pin_locked",
+        "pin_required",
+        "profile_unavailable",
+        "profile_verification_required",
+        "rate_limited",
+        "reconnect_required",
+        "service_unavailable",
+        "ssl_error",
+    )
+
+    def _silo_error(e: Exception) -> str:
+        code = str(e or "").strip()
+        if e.__class__.__name__ == "SiloServiceUnavailable":
+            return "service_unavailable"
+        return next((public for public in _SILO_PUBLIC_ERRORS if public == code), "silo_request_failed")
+
+    @app.post("/api/silo/server", tags=["auth"])
+    def api_silo_server(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _silo_client(cfg, inst).configure_server(cfg, (payload or {}).get("server_url"), (payload or {}).get("verify_ssl"))
+            _probe_bust("silo")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] server check failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst}
+
+    @app.post("/api/silo/device/start", tags=["auth"])
+    def api_silo_device_start(request: Request, payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        payload = reconnect_payload(request, "/api/silo/device/start", payload)
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().start_device_code(
+                "silo",
+                cfg,
+                instance_id=inst,
+                server_url=(payload or {}).get("server_url"),
+                verify_ssl=(payload or {}).get("verify_ssl"),
+            )
+            _safe_log(log_fn, "SILO", f"[SILO] device login started instance={inst}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] device start failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst}
+
+    @app.post("/api/silo/device/poll", tags=["auth"])
+    def api_silo_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code("silo", cfg, instance_id=inst)
+            if res.get("ok"):
+                _probe_bust("silo")
+                _safe_log(log_fn, "SILO", f"[SILO] device login completed instance={inst}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] device poll failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "status": _silo_error(e), "instance": inst}
+
+    @app.post("/api/silo/device/cancel", tags=["auth"])
+    def api_silo_device_cancel(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            return _silo_client(cfg, inst).cancel_device_login(cfg)
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] device cancel failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst}
+
+    @app.get("/api/silo/status", tags=["auth"])
+    def api_silo_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth._auth_SILO import provider_block
+
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        out = _provider_auth().status_for_block("silo", provider_block(cfg, inst))
+        out["instance"] = inst
+        return out
+
+    @app.get("/api/silo/profiles", tags=["auth"])
+    def api_silo_profiles(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            profiles = _silo_client(cfg, inst).list_profiles()
+            return {"ok": True, "instance": inst, "profiles": profiles}
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] profiles failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst, "profiles": []}
+
+    @app.get("/api/silo/users", tags=["auth"])
+    def api_silo_users(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.auth._auth_SILO import provider_block
+
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            own = str(provider_block(cfg, inst).get("profile_id") or "")
+            rows = _silo_client(cfg, inst).list_profiles()
+            users = [{"id": p["id"], "username": p["name"], "has_pin": p["has_pin"], "is_child": p["is_child"], "is_primary": p["is_primary"],
+                      "connected": p["id"] == own} for p in rows]
+            return {"ok": True, "instance": inst, "users": users}
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] users failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst, "users": []}
+
+    @app.get("/api/silo/libraries", tags=["media providers"])
+    def api_silo_libraries(instance: str | None = Query(None)) -> dict[str, Any]:
+        from providers.sync._mod_SILO import SILOModule
+        from providers.sync.silo._common import list_libraries
+
+        inst = normalize_instance_id(instance)
+        try:
+            rows = list_libraries(SILOModule({**load_config(), "_cw_provider_instance": inst}))
+            return {"ok": True, "instance": inst, "libraries": rows}
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] libraries failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst, "libraries": []}
+
+    @app.post("/api/silo/profile/select", tags=["auth"])
+    def api_silo_profile_select(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            selected = _silo_client(cfg, inst).select_profile(cfg, (payload or {}).get("profile_id"), (payload or {}).get("pin"))
+            _probe_bust("silo")
+            _safe_log(log_fn, "SILO", f"[SILO] profile selected instance={inst}")
+            return {"ok": True, "instance": inst, "profile": selected, "profile_id": selected.get("id"), "profile_name": selected.get("name") or ""}
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] profile select failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst}
+
+    @app.post("/api/silo/refresh", tags=["auth"])
+    def api_silo_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("silo", cfg, instance_id=inst, force=True)
+            _probe_bust("silo")
+            return {k: v for k, v in res.items() if k not in {"access_token", "refresh_token"}}
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] refresh failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "status": _silo_error(e), "instance": inst}
+
+    @app.post("/api/silo/disconnect", tags=["auth"])
+    def api_silo_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "silo", inst)
+            if conflict is not None:
+                return conflict
+            _silo_client(cfg, inst).disconnect(cfg)
+            _probe_bust("silo")
+            _safe_log(log_fn, "SILO", f"[SILO] disconnected instance={inst}")
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "SILO", f"[SILO] disconnect failed reason={_silo_error(e)} instance={inst}")
+            return {"ok": False, "error": _silo_error(e), "instance": inst}
 
 
     # TAUTULLI
@@ -3521,7 +3710,8 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         return None
 
     @app.post("/api/trakt/pin/new", tags=["auth"])
-    def api_trakt_pin_new(payload: Optional[dict[str, Any]] = Body(None), instance: str = Query("default")) -> dict[str, Any]:
+    def api_trakt_pin_new(request: Request, payload: Optional[dict[str, Any]] = Body(None), instance: str = Query("default")) -> dict[str, Any]:
+        payload = reconnect_payload(request, "/api/trakt/pin/new", payload)
         try:
             inst = normalize_instance_id(instance)
             method = str((payload or {}).get("auth_method") or "").strip().lower()
@@ -3615,13 +3805,21 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             return {"ok": False, "error": "internal"}
 
     @app.post("/api/kitsu/connect", tags=["auth"])
-    def api_kitsu_connect(payload: dict[str, Any] = Body(...), instance: str = Query("default")) -> Any:
+    def api_kitsu_connect(request: Request, payload: dict[str, Any] = Body(...), instance: str = Query("default")) -> Any:
         from providers.auth import _auth_KITSU as kitsu
 
         try:
             username = str(payload.pop("username", ""))
             password = str(payload.pop("password", ""))
             connection = kitsu.login(username, password)
+            if managed_request(request):
+                cfg = load_config()
+                block = ensure_instance_block(cfg, "kitsu", normalize_instance_id(instance))
+                block.update(connection)
+                block.pop("password", None)
+                save_config(cfg)
+                _probe_bust("kitsu")
+                return JSONResponse({"ok": True, "saved": True}, headers={"Cache-Control": "no-store"})
             return JSONResponse({"ok": True, "connection": connection}, headers={"Cache-Control": "no-store"})
         except kitsu.KitsuAuthError as exc:
             message = "Kitsu rejected the login" if str(exc) == "invalid_grant" else "Kitsu connection failed"

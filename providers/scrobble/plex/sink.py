@@ -8,9 +8,11 @@ from typing import Any
 from urllib.parse import urlencode
 
 from providers.scrobble._media_server import DeliveryError, MediaServerSink, PUBLIC_IDS as _PUBLIC_IDS, combine_results, identical_copies, ids_match as _id_match
-from providers.scrobble.scrobble import ScrobbleEvent
+from providers.scrobble.scrobble import ScrobbleEvent, _log
 from providers.sync.plex._common import configure_plex_context, home_scope_enter, home_scope_exit, ids_from_obj, isolated_plex_context, plex_feature_library_ids
 from providers.sync.plex._progress import _currently_playing, _timeline_progress
+
+PLEX_RESUME_MIN_MS = 60_000
 
 
 def _object_ids(obj: Any) -> dict[str, str]:
@@ -152,8 +154,9 @@ class PlexSink(MediaServerSink):
             if not watched:
                 server.query("/:/scrobble", method=server._session.put,
                              params={"key": rk, "identifier": "com.plexapp.plugins.library", "viewedAt": played_at})
-            if int(getattr(obj, "viewOffset", 0) or 0) > 0:
-                _timeline_progress(adapter, server, rk, 0, int(getattr(obj, "duration", 0) or 0))
+                _log(f"plex marked watched rk={rk} viewedAt={played_at}", "DEBUG")
+            else:
+                _log(f"plex already watched rk={rk} resume_ms={int(getattr(obj, 'viewOffset', 0) or 0)}", "DEBUG")
             return {"ok": True}
         if watched:
             return {"ok": True, "skipped": True, "reason": "destination_already_watched"}
@@ -163,6 +166,13 @@ class PlexSink(MediaServerSink):
         position = round(duration * progress / 100.0)
         if position <= 0:
             return {"ok": True, "skipped": True, "reason": "no_progress"}
-        if abs(position - int(getattr(obj, "viewOffset", 0) or 0)) >= 1000:
+        if position <= PLEX_RESUME_MIN_MS:
+            _log(f"plex resume skipped rk={rk} position_ms={position}: Plex keeps no resume point at {PLEX_RESUME_MIN_MS // 1000}s or less", "DEBUG")
+            return {"ok": True, "skipped": True, "reason": "below_plex_resume_minimum"}
+        previous = int(getattr(obj, "viewOffset", 0) or 0)
+        if abs(position - previous) >= 1000:
             _timeline_progress(adapter, server, rk, position, duration)
+            _log(f"plex resume written rk={rk} position_ms={position} previous_ms={previous} duration_ms={duration}", "DEBUG")
+        else:
+            _log(f"plex resume unchanged rk={rk} position_ms={position} previous_ms={previous}", "DEBUG")
         return {"ok": True}

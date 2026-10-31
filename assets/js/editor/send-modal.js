@@ -82,6 +82,7 @@
         <span class="cw-editor-send-result-icon">${providerLogoHtml(r, esc)}</span>
         <strong>${esc(name)}</strong>
         <small>${esc(parts || (r?.ok ? "Done" : "Failed"))}</small>
+        ${(result.cloud_results || []).map(row => `<small>${esc(row.title || row.key)}: ${esc(({dated:"Plex cloud: original date restored",present:"Plex cloud: already watched, unchanged",cached:"Plex cloud: previously confirmed",plex_discover_date_pending:"Plex cloud: date repair pending"})[row.outcome] || row.reason || row.outcome)}</small>`).join("")}
       </div>`;
     }).join("");
     return `<div class="cw-editor-send-progress ${ok ? "done" : "error"}">
@@ -106,14 +107,14 @@
   }
 
   function formatSendRunning(targetCount, operation = "add") {
-    if (operation === "remove") return '<div class="cw-editor-send-progress active"><strong>Removing selected records</strong><p>Checking the selected provider profiles and verifying removals…</p><div class="cw-editor-send-progress-bar"><span style="width:24%"></span></div></div>';
+    if (operation === "remove") return '<div class="cw-editor-send-progress active"><strong>Removing selected records</strong><p>Checking the selected provider instances and verifying removals…</p><div class="cw-editor-send-progress-bar"><span style="width:24%"></span></div></div>';
     return `<div class="cw-editor-send-progress active">
       <div class="cw-editor-send-progress-head">
         <div><strong>Sending selected rows</strong><span>${Number(targetCount || 0)} provider target${Number(targetCount || 0) === 1 ? "" : "s"} queued</span></div>
         <span class="material-symbols-rounded" aria-hidden="true">sync</span>
       </div>
       <div class="cw-editor-send-progress-bar" aria-hidden="true"><span style="width:24%"></span></div>
-      <div class="cw-editor-send-progress-message">Sending selected rows to the chosen provider profile${Number(targetCount || 0) === 1 ? "" : "s"}...</div>
+      <div class="cw-editor-send-progress-message">Sending selected rows to the chosen provider instance${Number(targetCount || 0) === 1 ? "" : "s"}...</div>
     </div>`;
   }
 
@@ -219,6 +220,7 @@
               <div><span>mode</span><b>Selective send</b></div>
             </div>
           </section>
+          ${kind === "history" ? `<section data-discover-option hidden><label><input type="checkbox" data-discover-fallback> Plex Discover watched-state fallback</label><p>For this send only. Items missing from Plex may be marked watched in the connected account with their original watch date. Existing cloud plays remain unchanged. Managed or switched Home users are not supported. Uncertain writes may require manual review.</p></section>` : ""}
           <section class="cw-editor-send-run-card">
             <div class="cw-editor-send-warning">
               <span class="material-symbols-rounded" aria-hidden="true">warning</span>
@@ -254,7 +256,7 @@
       shell.querySelector(".cw-editor-send-sub").textContent = `${rows.length} selected ${kindLabel} rows`;
       shell.querySelector(".cw-editor-send-data-card h3").textContent = removing ? "Data to remove" : "Data to send";
       shell.querySelector(".cw-editor-send-data-card p").textContent = removing
-        ? "Only matching records from your CrossWatch sync pairs are available. Each profile shows its matching selection."
+        ? "Only matching records from your CrossWatch sync pairs are available. Each instance shows its matching selection."
         : `${rows.length} selected ${kindLabel} row${rows.length === 1 ? "" : "s"} will be sent to selected provider profiles.`;
       const summary = shell.querySelectorAll(".cw-editor-send-data-grid b");
       summary[1].textContent = String(rows.length);
@@ -283,6 +285,14 @@
         btn.classList.toggle("active", on);
         btn.setAttribute("aria-pressed", on ? "true" : "false");
       });
+      const discoverOption = shell.querySelector("[data-discover-option]");
+      const discoverInput = shell.querySelector("[data-discover-fallback]");
+      const discoverAvailable = kind === "history" && operation === "add" && [...selected].some(key => key.startsWith("PLEX:"));
+      if (discoverOption) discoverOption.hidden = !discoverAvailable;
+      if (discoverInput) {
+        discoverInput.disabled = busy || !discoverAvailable;
+        if (!discoverAvailable) discoverInput.checked = false;
+      }
       if (submit) submit.disabled = busy || loading || !selected.size || !rows.length;
       shell.querySelectorAll("[data-operation], [data-provider-key], [data-send-close]").forEach(button => {
         button.disabled = busy || (button.dataset.operation === "add" && !ctx.selectedRowsForSend().length);
@@ -302,7 +312,7 @@
       }).join("") : `<div class="cw-editor-send-empty">${operation === "remove"
         ? (removalEmptyReason === "pair_baseline_unavailable"
           ? "CrossWatch has no saved baseline for one or more current sync pairs. Existing records may still be present on your providers. Run those pairs to establish their sync baselines, then reopen this dialog."
-          : "No provider profiles have matching synced records with removal support.")
+          : "No provider instances have matching synced records with removal support.")
         : `No other configured provider supports ${esc(kind)} sends.`}</div>`;
       syncButtons();
     };
@@ -365,6 +375,7 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ kind, operation, providers: targets, items: rows.map(ctx.rowToSendItem),
+            plex_discover_fallback: kind === "history" && operation === "add" && shell.querySelector("[data-discover-fallback]")?.checked === true,
             ...(operation === "remove" ? { confirmed: true, preview_id: previewId, ...removalScope() } : {}) }),
         });
         if (operation === "add" && !ctx.preselect) {
@@ -405,6 +416,8 @@
           resetConfirm();
         }
       } finally {
+        const discoverInput = shell.querySelector("[data-discover-fallback]");
+        if (discoverInput) discoverInput.checked = false;
         busy = false;
         // Require a fresh preview and confirmation before another removal attempt.
         if (operation === "remove") {

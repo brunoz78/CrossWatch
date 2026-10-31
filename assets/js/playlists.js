@@ -27,7 +27,7 @@
   const EMPTY_PROVIDER_RETRIES = 2;
   const EMPTY_PROVIDER_RETRY_MS = 300;
   const SAFE_NAME_CHARS = " _.'-&()";
-  const PLAYLIST_COMPATIBLE_PROVIDERS = new Set(["PLEX", "TRAKT", "MDBLIST", "JELLYFIN", "EMBY", "PUBLICMETADB", "SIMKL", "TMDB", "FLICKLIST", "CROSSWATCH"]);
+  const PLAYLIST_COMPATIBLE_PROVIDERS = new Set(["PLEX", "TRAKT", "MDBLIST", "JELLYFIN", "EMBY", "PUBLICMETADB", "SIMKL", "TMDB", "FLICKLIST", "SILO", "CROSSWATCH"]);
   const SIMKL_PLAYLIST_WARNING = "SIMKL status buckets are not true playlists. Changes may move or remove items from your SIMKL library. Use with caution. SIMKL custom lists are read only and need SIMKL PRO or VIP.";
   const RULESET_PRESETS = {
     direct: {
@@ -240,7 +240,7 @@
     const providerGate = state.loaded && !hasCompatiblePlaylistProvider() ? `
       <div class="pl-banner warn">
         <span class="material-symbols-rounded" aria-hidden="true">warning</span>
-        <span>Playlists need at least one compatible provider (Plex, Trakt, MDBList, Jellyfin, Emby, PublicMetaDB, SIMKL, TMDb, FlickList or CrossWatch). Configure one in Connections to enable playlist endpoints and mappings.</span>
+        <span>Playlists need at least one compatible provider (Plex, Trakt, MDBList, Jellyfin, Emby, Silo, PublicMetaDB, SIMKL, TMDb, FlickList or CrossWatch). Configure one in Connections to enable playlist endpoints and mappings.</span>
         <button type="button" class="pl-btn small" data-action="open-connections">Open Connections</button>
       </div>
     ` : "";
@@ -428,6 +428,7 @@
     if (raw === "custom_list") return "Custom list";
     if (raw === "status_bucket") return "Status";
     if (raw === "collection") return "Collection";
+    if (raw === "favorites") return "Favorites";
     if (raw === "smart") return "Smart playlist";
     return "Playlist";
   }
@@ -600,7 +601,7 @@
           </section>
           <section class="pl-section cw-page-panel" id="pl-published-lists">
             <div class="pl-section-head">
-              <div><div class="pl-section-title">Published lists</div><div class="pl-section-sub">Let Kometa, Radarr and Sonarr read a CrossWatch list.</div></div>
+              <div><div class="pl-section-title">Published lists</div><div class="pl-section-sub">Let Kometa, Radarr, Sonarr and MDBList JSON readers such as Kodi TMDBHelper read a CrossWatch list.</div></div>
               <button class="pl-btn small" data-action="sync-wizard-publish" ${state.loaded ? "" : "disabled"}><span class="material-symbols-rounded" aria-hidden="true">add</span>Publish a list</button>
             </div>
             <div class="pl-section-body">${renderPublished()}</div>
@@ -663,7 +664,7 @@
     return `
       <div class="pl-table-wrap cw-page-table">
         <table class="pl-endpoints-table">
-          <thead><tr><th>Endpoint</th><th>Provider</th><th>Profile</th><th>Selected playlist</th><th>Type</th><th>Status</th><th>Last refresh</th><th aria-label="Actions">Actions</th></tr></thead>
+          <thead><tr><th>Endpoint</th><th>Provider</th><th>Instance</th><th>Selected playlist</th><th>Type</th><th>Status</th><th>Last refresh</th><th aria-label="Actions">Actions</th></tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>
@@ -678,12 +679,12 @@
     if (state.loading && !state.loaded) return renderSkeleton("Loading published lists");
     const lists = (state.published && state.published.lists) || [];
     if (!lists.length) {
-      return `<div class="pl-empty"><strong>Nothing published yet</strong><span>Select Publish a list to make a list readable by Kometa, Radarr or Sonarr.</span></div>`;
+      return `<div class="pl-empty"><strong>Nothing published yet</strong><span>Select Publish a list to make a list readable by Kometa, Radarr, Sonarr or Kodi TMDBHelper.</span></div>`;
     }
     const rows = lists.map((row) => {
       const key = `${row.instance}|${row.list_id}`;
       const feed = row.feed;
-      const tool = { "kometa-movies.json": "Kometa (movies)", "kometa-shows.json": "Kometa (shows)", "radarr.json": "Radarr", "sonarr.json": "Sonarr" }[feed && feed.last_fetch_format] || "";
+      const tool = { "kometa-movies.json": "Kometa (movies)", "kometa-shows.json": "Kometa (shows)", "radarr.json": "Radarr", "sonarr.json": "Sonarr", "mdblist.json": "MDBList JSON" }[feed && feed.last_fetch_format] || "";
       const read = feed && feed.last_fetch_at ? `${timeText(feed.last_fetch_at)}<br>${esc(tool ? `by ${tool}` : "")}` : feed ? "Not read yet" : "-";
       const used = Number(row.endpoint_count || 0);
       const deleteLabel = !row.can_delete ? "This list cannot be deleted" : used ? `Delete list. Remove the ${used} endpoint(s) that use this list first` : "Delete list";
@@ -745,6 +746,8 @@
         ${block("Kometa, show library", "Paste into a collection file of your show library.", kometa(urls["kometa-shows.json"] || ""), true)}
         ${block("Radarr (movies)", "Settings, Import Lists, add a Custom List (StevenLu Custom) and paste this address. Movies without an IMDb ID are left out.", urls["radarr.json"] || "", false)}
         ${block("Sonarr (shows)", "Settings, Import Lists, add a Custom List and paste this address. Shows without a TVDB ID are left out.", urls["sonarr.json"] || "", false)}
+        ${block("MDBList JSON (movies and shows)", "One mixed list in the MDBList JSON layout, with TMDB IDs. Items without a TMDB ID are left out. Add &sort=random for a new order on every read.", urls["mdblist.json"] || "", false)}
+        ${block("Kodi TMDBHelper", "Use this path in a widget, menu item or button. It loads the MDBList JSON address above.", urls["mdblist.json"] ? `plugin://plugin.video.themoviedb.helper/?info=mdblist_locallist&&${urls["mdblist.json"]}` : "", false)}
       `,
       onOpen: (ctx) => {
         ctx.modal.addEventListener("click", async (e) => {
@@ -769,7 +772,7 @@
     const row = publishedRow(key);
     if (!row) return;
     if (action === "publish-show") return openPublishedModal(row, btn);
-    if (action === "publish-key" && !confirm("Create a new access key? Kometa, Radarr and Sonarr stop reading this list until you paste the new addresses.")) return;
+    if (action === "publish-key" && !confirm("Create a new access key? Kometa, Radarr, Sonarr and Kodi stop reading this list until you paste the new addresses.")) return;
     if (action === "publish-off" && !confirm("Stop publishing this list? The addresses stop working.")) return;
     if (action === "publish-delete" && !confirm(`Delete ${row.name || "this list"}? The list and its items are removed from CrossWatch${row.feed ? " and the addresses stop working" : ""}.`)) return;
     btn.disabled = true;
@@ -1573,10 +1576,10 @@
           </div>
         </section>
         <section class="pl-endpoint-step" id="pl-ep-instance-step">
-          <div class="pl-step-head"><span class="pl-step-index">2</span><div>${simple ? "<b>Profile</b><span>The account that owns the list.</span>" : "<b>Provider profile</b><span>Use the profile that owns the provider playlists.</span>"}</div></div>
+          <div class="pl-step-head"><span class="pl-step-index">2</span><div>${simple ? "<b>Instance</b><span>The account that owns the list.</span>" : "<b>Provider instance</b><span>Use the instance that owns the provider playlists.</span>"}</div></div>
           <div class="pl-form">
             <div class="pl-field full">
-              <label for="pl-ep-instance">Provider profile <span aria-hidden="true">*</span></label>
+              <label for="pl-ep-instance">Provider instance <span aria-hidden="true">*</span></label>
               <select id="pl-ep-instance">${selectOptions(instances.map((x) => ({ value: x, label: x })), instance)}</select>
             </div>
           </div>
@@ -1790,7 +1793,7 @@
       root.__plEndpointResources = resources;
       if (!resources.length) {
         select.innerHTML = `<option value="">No playlists found</option>`;
-        help.textContent = "No readable provider playlists were returned for this profile.";
+        help.textContent = "No readable provider playlists were returned for this instance.";
         refreshEndpointResourceSelection(root, root.__plEndpointCtx);
         return;
       }
@@ -2150,7 +2153,7 @@
           <div class="pl-step-head"><span class="pl-step-index">2</span><div><b>To</b><span>Where the items should go.</span></div></div>
           <div class="pl-wizard-choice" role="radiogroup" aria-label="Destination">
             <label><input type="radio" name="pl-wz-dest" value="list" ${wizard.publish ? "" : "checked"}><span><b>A list on a provider</b><small>Plex, Trakt, MDBList and others.</small></span></label>
-            <label class="${cwAccounts.length ? "" : "is-disabled"}"><input type="radio" name="pl-wz-dest" value="publish" ${wizard.publish ? "checked" : ""} ${cwAccounts.length ? "" : "disabled"}><span><b>Kometa, Radarr or Sonarr</b><small>${cwAccounts.length ? "Publish the list so these tools can read it." : "Needs the CrossWatch provider to be connected."}</small></span></label>
+            <label class="${cwAccounts.length ? "" : "is-disabled"}"><input type="radio" name="pl-wz-dest" value="publish" ${wizard.publish ? "checked" : ""} ${cwAccounts.length ? "" : "disabled"}><span><b>Kometa, Radarr, Sonarr or Kodi</b><small>${cwAccounts.length ? "Publish the list so these tools can read it." : "Needs the CrossWatch provider to be connected."}</small></span></label>
           </div>
           <div class="pl-wizard-row" id="pl-wz-dst-list-row">
             <div class="pl-field"><label for="pl-wz-dst-account">Provider</label><select id="pl-wz-dst-account"><option value="">Choose a provider</option>${accountOptions(accounts)}</select></div>
@@ -2159,7 +2162,7 @@
           <div id="pl-wz-new-toggle-row"><button type="button" class="pl-link" id="pl-wz-new-toggle">+ Create a new list</button><span class="pl-muted" id="pl-wz-new-none"></span></div>
           <div class="pl-warning" id="pl-wz-simkl-warning" hidden>${esc(SIMKL_PLAYLIST_WARNING)}</div>
           <div class="pl-wizard-row" id="pl-wz-new-row">
-            ${cwAccounts.length > 1 ? `<div class="pl-field" id="pl-wz-cw-wrap"><label for="pl-wz-cw-account">CrossWatch profile</label><select id="pl-wz-cw-account">${accountOptions(cwAccounts)}</select></div>` : ""}
+            ${cwAccounts.length > 1 ? `<div class="pl-field" id="pl-wz-cw-wrap"><label for="pl-wz-cw-account">CrossWatch instance</label><select id="pl-wz-cw-account">${accountOptions(cwAccounts)}</select></div>` : ""}
             <div class="pl-field"><label for="pl-wz-new-name">Name of the new list</label><input id="pl-wz-new-name" maxlength="${PLAYLIST_NAME_MAX}" autocomplete="off"><div class="pl-field-error"></div></div>
           </div>
         </section>
