@@ -126,11 +126,13 @@ from ._history_rewatches import (
     config_with_history_rewatches,
     filter_history_events,
     compare_history_events,
+    HistoryEventIndex,
     history_event_matches,
     history_timestamp_tolerance_seconds,
     history_rewatch_pair_enabled,
     history_rewatches_requested,
 )
+from ._history_copies import config_with_history_copies, copy_gap_adds, history_copies_requested, take_copy_gaps
 from ._pairs_utils import (
     declared_types_for,
     ratings_step_for,
@@ -479,7 +481,13 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
 
     a_cfg = pair_endpoint_config(provider_cfg, a, src_inst)
     b_cfg = pair_endpoint_config(provider_cfg, b, dst_inst)
-    reads_cloud_history = feature == "history" and any(provider == "PLEX" and ((view.get("plex") or {}).get("history") or {}).get("read_cloud_history") is True for provider, view in ((a, a_cfg), (b, b_cfg)))
+    a_copies = history_copies_requested(feature, fcfg, a) and not history_event_mode
+    b_copies = history_copies_requested(feature, fcfg, b) and not history_event_mode
+    if a_copies:
+        a_cfg = config_with_history_copies(a_cfg)
+    if b_copies:
+        b_cfg = config_with_history_copies(b_cfg)
+    reads_cloud_history =feature == "history" and any(provider == "PLEX" and ((view.get("plex") or {}).get("history") or {}).get("read_cloud_history") is True for provider, view in ((a, a_cfg), (b, b_cfg)))
     if reads_cloud_history:
         allow_removals = False
     emit("two:start", a=a, b=b, feature=feature, removals=allow_removals)
@@ -512,6 +520,15 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             dbg=dbg, emit_info=info,
         )
         B_cur = require_snapshot(B_cur, b, feature)
+    elif a_copies or b_copies:
+        built: dict[str, Any] = {}
+        for name in build_order:
+            built[name] = require_snapshot(build_snapshots_for_feature(
+                feature=feature, config=a_cfg if name == a else b_cfg, providers={name: pair_providers[name]},
+                snap_cache=ctx.snap_cache, snap_ttl_sec=ctx.snap_ttl_sec,
+                dbg=dbg, emit_info=info, on_snapshot=_on_snapshot,
+            ), name, feature)
+        A_cur, B_cur = built[a], built[b]
     else:
         snaps = build_snapshots_for_feature(
             feature=feature, config=provider_cfg, providers=pair_providers,
@@ -521,6 +538,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         )
         A_cur = require_snapshot(snaps, a, feature)
         B_cur = require_snapshot(snaps, b, feature)
+    A_cur, gaps_A = take_copy_gaps(A_cur) if a_copies else (A_cur, {})
+    B_cur, gaps_B = take_copy_gaps(B_cur) if b_copies else (B_cur, {})
 
     emit_cloud_history_read(emit, a, feature, a_cfg, A_cur)
     emit_cloud_history_read(emit, b, feature, b_cfg, B_cur)
@@ -878,6 +897,15 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                 out["collected_at"] = str(collected_at)
         return out
 
+    history_event_indexes: dict[int, tuple[Mapping[str, Any], int, HistoryEventIndex]] = {}
+
+    def _history_event_index(idx: Mapping[str, Any]) -> HistoryEventIndex:
+        cached = history_event_indexes.get(id(idx))
+        if cached is None or cached[0] is not idx or cached[1] != len(idx):
+            cached = (idx, len(idx), HistoryEventIndex(idx, _typed_tokens, tolerance_seconds=history_tolerance))
+            history_event_indexes[id(idx)] = cached
+        return cached[2]
+
     def _find_history_event_in_idx(idx: Mapping[str, Any], it: Mapping[str, Any], fallback_key: str | None = None) -> Mapping[str, Any] | None:
         if feature != "history" or not history_event_mode:
             return None
@@ -885,7 +913,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         direct = idx.get(sk) if sk else None
         if isinstance(direct, Mapping):
             return direct
-        matches = history_event_matches({sk: it}, idx, _typed_tokens, tolerance_seconds=history_tolerance)
+        matches = _history_event_index(idx).match({sk: it})
         return idx.get(matches[sk]) if sk in matches else None
 
     def _show_level_tokens(it: Mapping[str, Any]) -> set[str]:
@@ -1036,7 +1064,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         if ts_tomb is None:
             return False
         try:
-            if prev_self is not None and prev_self_alias is not None and not _prev_had(dict(prev_self), dict(prev_self_alias), it):
+            if prev_self is not None and prev_self_alias is not None and not _prev_had(prev_self, prev_self_alias, it):
                 return False
         except Exception:
             pass
@@ -1068,7 +1096,7 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
     except Exception:
         tombX = set(tomb)
 
-    def _prev_had(prev_idx: dict[str, Any], prev_alias: dict[str, str], it: Mapping[str, Any]) -> bool:
+    def _prev_had(prev_idx: Mapping[str, Any], prev_alias: Mapping[str, str], it: Mapping[str, Any]) -> bool:
         if feature == "history" and history_event_mode:
             return bool(_find_history_event_in_idx(prev_idx, it))
         ck = _ck(it)
@@ -1819,6 +1847,13 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
                     target.append(_sync_minimal(item))
                     planned.add(key)
 
+    for provider, gaps, source, target in ((a, gaps_A, B_eff, add_to_A), (b, gaps_B, A_eff, add_to_B)):
+        if gaps:
+            extra = copy_gap_adds(source, gaps, target, alias=_alias_index, find=_find_in_idx,
+                                  minimal=_sync_minimal, key_of=_sync_key)
+            dbg("history.copies.planned", feature=feature, dst=provider, gaps=len(gaps), adds=len(extra))
+            target.extend(extra)
+
     add_to_A = groups.ordinary(0, add_to_A) + groups.adds[0]
     add_to_B = groups.ordinary(1, add_to_B) + groups.adds[1]
     upd_to_A, upd_to_B = groups.ordinary(0, upd_to_A), groups.ordinary(1, upd_to_B)
@@ -2080,6 +2115,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
         upd_to_B = review.filter(feature, b, dst_inst, "update", upd_to_B, **args_B)
         rem_from_A = review.filter(feature, a, src_inst, "remove", rem_from_A, **args_A)
         rem_from_B = review.filter(feature, b, dst_inst, "remove", rem_from_B, **args_B)
+        if not review.preview:
+            emit("plan:selected", feature=feature, count=len(add_to_A) + len(add_to_B) + len(upd_to_A) + len(upd_to_B) + len(rem_from_A) + len(rem_from_B))
         if review.preview:
             if (a_tags_dropped or b_tags_dropped) and not (a_down or b_down):
                 view_A = groups.restore(0, A_eff)
@@ -2628,6 +2665,8 @@ def _two_way_sync(  # pyright: ignore[reportGeneralTypeIssues]
             )
         except Exception:
             refreshed = None
+        if refreshed:
+            refreshed = take_copy_gaps(refreshed)[0]
         base_update = 0
         if refreshed:
             for rk, rv in refreshed.items():

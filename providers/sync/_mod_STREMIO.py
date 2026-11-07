@@ -10,14 +10,14 @@ from typing import Any
 
 from cw_platform.provider_instances import normalize_instance_id
 from providers.auth._auth_STREMIO import StremioClient, StremioAuthError
-from providers.sync._mod_common import SimpleRateLimiter, build_op_result, build_session
+from providers.sync._mod_common import SimpleRateLimiter, build_op_result, build_session, make_snapshot_progress
 from providers.sync.stremio import _history as feat_history
 from providers.sync.stremio import _progress as feat_progress
 from providers.sync.stremio import _ratings as feat_ratings
 from providers.sync.stremio import _watchlist as feat_watchlist
 from providers.sync.stremio._common import DEFAULT_STREMIO_PROFILE_ID, datastore_meta, is_capture_mode, is_configured, read_drop_unresolved_items
 
-__VERSION__ = "1.0"
+__VERSION__ = "1.1"
 __all__ = ["get_manifest", "STREMIOModule", "OPS", "feat_history", "feat_progress", "feat_ratings", "feat_watchlist"]
 
 if "ctx" not in globals():
@@ -136,6 +136,7 @@ class STREMIOModule:
         except Exception:
             pass
         self.client = StremioClient(self.config, instance_id=self.instance_id, session=session)
+        self.progress_factory = lambda feature: make_snapshot_progress(ctx, dst="STREMIO", feature=feature)
 
     @staticmethod
     def supported_features() -> dict[str, bool]:

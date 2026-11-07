@@ -15,12 +15,13 @@ from fastapi.responses import Response, StreamingResponse
 
 from cw_platform.access_policy import managed_profile_instances, request_user, user_can_access_instance
 from cw_platform.config_base import CONFIG as CONFIG_DIR, load_config
-from cw_platform.history_events import history_sync_key, is_history_event_key, minimal_history_item
+from cw_platform.history_events import base_key_from_history_event, history_epoch_from_item, history_event_key, history_sync_key, is_history_event_key, minimal_history_item
 from cw_platform.id_map import canonical_key, merge_ids, minimal
 from cw_platform.local_db import crosswatch_db_path, manual_policy as sqlite_manual_policy
 from cw_platform.modules_registry import load_sync_ops, state_read_features, sync_provider_names
 from cw_platform.orchestrator._applier import apply_add
 from cw_platform.orchestrator._blackbox import clear_keys as clear_blackbox_keys
+from cw_platform.orchestrator._history_rewatches import config_with_history_rewatches, history_rewatch_supported
 from cw_platform.orchestrator._unresolved import clear_unresolved_all_scopes
 from cw_platform.orchestrator._snapshots import module_checkpoint
 from cw_platform.orchestrator._state_store import StateStore
@@ -1385,24 +1386,204 @@ def _editor_send_targets(cfg: dict[str, Any], feature: str) -> list[dict[str, An
                 pass
             instance_label = _provider_instance_label(cfg, provider, instance)
 
-            targets.append(
-                {
-                    "provider": provider,
-                    "instance": instance,
-                    "label": label,
-                    "instance_label": instance_label,
-                    "display": label if instance == "default" else f"{label} ({instance_label})",
-                    "feature": feat,
-                    "history_enabled": bool(supported.get("history")),
-                    "ratings_enabled": bool(supported.get("ratings")),
-                    "watchlist_enabled": bool(supported.get("watchlist")),
-                    "progress_enabled": bool(supported.get("progress")),
-                    "collection_enabled": bool(supported.get("collection")),
-                }
-            )
+            target = {
+                "provider": provider,
+                "instance": instance,
+                "label": label,
+                "instance_label": instance_label,
+                "display": label if instance == "default" else f"{label} ({instance_label})",
+                "feature": feat,
+                "history_enabled": bool(supported.get("history")),
+                "ratings_enabled": bool(supported.get("ratings")),
+                "watchlist_enabled": bool(supported.get("watchlist")),
+                "progress_enabled": bool(supported.get("progress")),
+                "collection_enabled": bool(supported.get("collection")),
+            }
+            if feat == "history":
+                target["rewatch_read"] = history_rewatch_supported(provider, ops, "read")
+                target["rewatch_write"] = history_rewatch_supported(provider, ops, "write")
+                target["rewatch_gate"] = _rewatch_account_gate(ops)
+                target["undated_write"] = provider in UNDATED_HISTORY_PROVIDERS
+            targets.append(target)
 
     targets.sort(key=lambda item: (str(item.get("label") or "").lower(), str(item.get("instance") or "")))
     return targets
+
+
+UNDATED_HISTORY_PROVIDERS = frozenset({"TRAKT", "WETRAKR", "CROSSWATCH"})
+
+
+def _rewatch_send_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    if not out.get("watched_at") or is_history_event_key(out.get("_cw_event_key")):
+        return out
+    key = history_event_key(out)
+    if is_history_event_key(key):
+        out["_cw_event_key"] = key
+        out["_cw_rewatch_sync"] = True
+    return out
+
+
+def _collapsed_rewatch_receipts(items: list[dict[str, Any]], result: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    keys = {str(k) for field in ("confirmed_keys", "accepted_keys", "presence_confirmed_keys", "live_confirmed_keys") for k in (result.get(field) or []) if k}
+    newest: dict[str, dict[str, Any]] = {}
+    for item in items:
+        event_key = str(item.get("_cw_event_key") or "")
+        base = base_key_from_history_event(event_key)
+        if not is_history_event_key(event_key) or base not in keys:
+            continue
+        current = newest.get(base)
+        if current is None or (history_epoch_from_item(item) or 0) >= (history_epoch_from_item(current) or 0):
+            newest[base] = {k: v for k, v in item.items() if k not in {"_cw_event_key", "_cw_rewatch_sync"}}
+    return newest
+
+
+def _undated_history_item(item: Mapping[str, Any]) -> bool:
+    return item.get("_cw_watched_state") is True and item.get("watched") is True and not item.get("watched_at")
+
+
+def _rewatch_account_gate(ops: Any) -> str:
+    try:
+        caps = ops.capabilities() or {}
+    except Exception:
+        return ""
+    hist = caps.get("history") if isinstance(caps, Mapping) else None
+    rewatches = hist.get("rewatches") if isinstance(hist, Mapping) else None
+    gate = rewatches.get("account_gate") if isinstance(rewatches, Mapping) else None
+    return gate if isinstance(gate, str) else ""
+
+
+ANIME_ONLY_PROVIDERS = frozenset({"ANILIST", "MYANIMELIST", "KITSU"})
+_ITEM_TYPE_KEYS = {"movie": "movies", "show": "shows", "tv": "shows", "anime": "shows", "season": "seasons", "episode": "episodes"}
+
+
+def _feature_write_blocked(ops: Any, feature: str, media_type: str) -> str:
+    try:
+        caps = ops.capabilities() or {}
+    except Exception:
+        caps = {}
+    fcaps = caps.get(feature) if isinstance(caps, Mapping) else None
+    if not isinstance(fcaps, Mapping):
+        return ""
+    if fcaps.get("write") is False:
+        return "read_only"
+    types = fcaps.get("types")
+    type_key = _ITEM_TYPE_KEYS.get(str(media_type or "").strip().lower())
+    if type_key and isinstance(types, Mapping) and type_key in types and not types[type_key]:
+        return "type_not_supported"
+    return ""
+
+
+def _pair_instances(cfg: Mapping[str, Any], feature: str) -> set[tuple[str, str]]:
+    from cw_platform.orchestrator._pairs import _feature_list_for_pair
+
+    out: set[tuple[str, str]] = set()
+    for pair in cfg.get("pairs") or []:
+        if not isinstance(pair, Mapping) or pair.get("enabled", True) is False:
+            continue
+        if feature not in _feature_list_for_pair(pair):
+            continue
+        for side in ("source", "target"):
+            provider = str(pair.get(side) or "").strip().upper()
+            if provider:
+                out.add((provider, normalize_instance_id(pair.get(f"{side}_instance"))))
+    return out
+
+
+def _viewer_profile(cfg: Mapping[str, Any], request: Request | None, user_profile: str) -> str:
+    from api.appAuthAPI import effective_request_profile_id
+
+    return effective_request_profile_id(dict(cfg), request, user_profile) if request is not None else str(user_profile or "").strip()
+
+
+def _profile_instances(cfg: Mapping[str, Any], profile: str) -> set[tuple[str, str]]:
+    from cw_platform.provider_instances import instances_for_user_profile
+
+    return {
+        (str(provider or "").strip().upper(), normalize_instance_id(instance))
+        for provider, instances in (instances_for_user_profile(cfg, profile) or {}).items()
+        for instance in (instances if isinstance(instances, list) else [instances])
+    }
+
+
+def _owned_instances(cfg: Mapping[str, Any], request: Request | None, user_profile: str, feature: str) -> set[tuple[str, str]]:
+    profile = _viewer_profile(cfg, request, user_profile)
+    return _profile_instances(cfg, profile) if profile else _pair_instances(cfg, feature)
+
+
+def _item_target_rows(
+    cfg: Mapping[str, Any],
+    request: Request | None,
+    feature: str,
+    media_type: str,
+    anime: bool,
+) -> list[tuple[dict[str, Any], str]]:
+    paired = _pair_instances(cfg, feature)
+    out: list[tuple[dict[str, Any], str]] = []
+    for row in _filter_targets_for_request(cfg, request, _editor_send_targets(dict(cfg), feature)):
+        ops = load_sync_ops(row["provider"])
+        reason = _feature_write_blocked(ops, feature, media_type) if ops else "provider_unavailable"
+        if not reason and row["provider"] in ANIME_ONLY_PROVIDERS and not anime:
+            reason = "anime_only"
+        out.append(({**row, "in_pair": (row["provider"], row["instance"]) in paired}, reason))
+    return out
+
+
+def item_action_targets(
+    cfg: Mapping[str, Any],
+    request: Request | None,
+    feature: str,
+    *,
+    media_type: str = "",
+    anime: bool = False,
+    user_profile: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    owned = _owned_instances(cfg, request, user_profile, feature)
+    targets: list[dict[str, Any]] = []
+    hidden: list[dict[str, Any]] = []
+    for row, reason in _item_target_rows(cfg, request, feature, media_type, anime):
+        if (row["provider"], row["instance"]) not in owned:
+            continue
+        if reason:
+            hidden.append({key: row.get(key) for key in ("provider", "instance", "label", "instance_label", "display")} | {"reason": reason})
+        else:
+            targets.append(row)
+    return targets, hidden
+
+
+def item_action_others(
+    cfg: Mapping[str, Any],
+    request: Request | None,
+    feature: str,
+    *,
+    media_type: str = "",
+    anime: bool = False,
+    user_profile: str = "",
+) -> list[dict[str, Any]]:
+    from cw_platform.provider_instances import user_profiles_for_instance
+
+    if _viewer_profile(cfg, request, user_profile):
+        return []
+    return [
+        row for row, reason in _item_target_rows(cfg, request, feature, media_type, anime)
+        if not reason and not row["in_pair"] and not user_profiles_for_instance(cfg, row["provider"], row["instance"])
+    ]
+
+
+@router.get("/send/item-targets")
+def api_editor_item_targets(
+    kind: str = Query("watchlist"),
+    media_type: str = Query("", max_length=20),
+    anime: bool = Query(False),
+    user_profile: str = Query("", max_length=120),
+    request: Request = cast(Request, None),
+) -> dict[str, Any]:
+    cfg = load_config() or {}
+    feature = _normalize_kind(kind)
+    targets, hidden = item_action_targets(cfg, request, feature, media_type=media_type, anime=anime, user_profile=user_profile)
+    others = item_action_others(cfg, request, feature, media_type=media_type, anime=anime, user_profile=user_profile)
+    has_pair = bool(_pair_instances(cfg, feature) & _owned_instances(cfg, request, user_profile, feature))
+    return {"ok": True, "kind": feature, "providers": targets, "hidden": hidden, "others": others, "has_pair": has_pair}
 
 
 @router.get("/send/providers")
@@ -1410,6 +1591,34 @@ def api_editor_send_providers(kind: str = Query("watchlist"), request: Request =
     cfg = load_config() or {}
     feature = _normalize_kind(kind)
     return {"ok": True, "kind": feature, "providers": _filter_targets_for_request(cfg, request, _editor_send_targets(cfg, feature))}
+
+
+def _trakt_keeps_one_play(cfg_view: Mapping[str, Any]) -> bool | None:
+    from providers.sync._mod_TRAKT import TRAKTModule
+    from providers.sync.trakt._common import watch_only_once
+
+    return watch_only_once(TRAKTModule(cfg_view, connect=False))
+
+
+@router.get("/send/history-notes")
+def api_editor_history_notes(
+    provider: str = Query(..., max_length=40),
+    instance: str = Query("default", max_length=120),
+    request: Request = cast(Request, None),
+) -> dict[str, Any]:
+    cfg = load_config() or {}
+    prov = str(provider or "").strip().upper()
+    inst = normalize_instance_id(instance or "default")
+    allowed = {(row["provider"], row["instance"]) for row in _filter_targets_for_request(cfg, request, _editor_send_targets(cfg, "history"))}
+    if (prov, inst) not in allowed:
+        raise HTTPException(status_code=404, detail="Provider profile not found")
+    keeps_one_play: bool | None = None
+    if prov == "TRAKT":
+        try:
+            keeps_one_play = _trakt_keeps_one_play(build_provider_config_view(cfg, prov, inst))
+        except Exception:
+            keeps_one_play = None
+    return {"ok": True, "provider": prov, "instance": inst, "keeps_one_play": keeps_one_play}
 
 
 def _normalize_send_item(raw: Any, feature: str, *, operation: str = "add") -> dict[str, Any] | None:
@@ -1460,8 +1669,12 @@ def _normalize_send_item(raw: Any, feature: str, *, operation: str = "add") -> d
     elif feature == "history":
         watched_at = item.get("watched_at") or item.get("last_watched_at")
         if not watched_at:
-            return None
-        item["watched_at"] = watched_at
+            if not _undated_history_item(item) or typ not in {"movie", "episode"}:
+                return None
+            item.pop("watched_at", None)
+            item.pop("last_watched_at", None)
+        else:
+            item["watched_at"] = watched_at
     elif feature == "progress":
         has_progress = any(item.get(k) not in (None, "") for k in ("progress_ms", "progressMs", "progress", "progress_percent", "progressPercent"))
         if not has_progress:
@@ -1503,13 +1716,22 @@ def _items_confirmed_by_send(feature: Kind, items: list[dict[str, Any]], result:
     return items[: min(confirmed, len(items))]
 
 
-def _merge_sent_items_into_state(provider: str, instance: str, feature: Kind, items: list[dict[str, Any]]) -> None:
+def _merge_sent_items_into_state(
+    provider: str,
+    instance: str,
+    feature: Kind,
+    items: list[dict[str, Any]],
+    *,
+    replace_bases: set[str] | None = None,
+) -> None:
     if not items:
         return
     store = _state_store()
     inst = normalize_instance_id(instance)
     state = store.load_state_features({feature}) or {}
     current = dict(_load_state_items(feature, provider, inst, raw_state=state))
+    if replace_bases:
+        current = {k: v for k, v in current.items() if base_key_from_history_event(k) not in replace_bases}
 
     for item in items:
         key = _editor_item_key(feature, str(item.get("_cw_event_key") or ""), item)
@@ -1551,11 +1773,41 @@ def _emit_editor_operation(event: str, **data: Any) -> None:
         pass
 
 
+def remember_sent_items(
+    provider: str,
+    instance: str,
+    feature: Kind,
+    send_items: list[dict[str, Any]],
+    res: Mapping[str, Any],
+    *,
+    rewatch: bool = False,
+) -> None:
+    if not bool(res.get("ok", True)) or int(res.get("confirmed", res.get("count", 0)) or 0) <= 0:
+        return
+    try:
+        confirmed_items = _items_confirmed_by_send(feature, send_items, res)
+        if rewatch:
+            collapsed = _collapsed_rewatch_receipts([item for item in send_items if item not in confirmed_items], res)
+            if collapsed:
+                _merge_sent_items_into_state(provider, instance, feature, list(collapsed.values()), replace_bases=set(collapsed))
+        _merge_sent_items_into_state(provider, instance, feature, confirmed_items)
+    except Exception:
+        pass
+    confirmed_keys = [str(k) for k in (res.get("confirmed_keys") or []) if k]
+    try:
+        clear_blackbox_keys(provider, feature, confirmed_keys)
+        clear_unresolved_all_scopes(provider, feature, confirmed_keys)
+    except Exception:
+        pass
+
+
 @router.post("/send")
 def api_editor_send(payload: dict[str, Any] = Body(...), request: Request = cast(Request, None)) -> dict[str, Any]:
     operation = payload.get("operation", "add")
     if operation == "remove":
-        from services.editor_removal import remove_selected
+        from services.editor_removal import remove_direct, remove_selected
+        if payload.get("direct") is True:
+            return remove_direct(payload, request)
         return remove_selected(payload, request)
     if operation != "add":
         raise HTTPException(400, "Unknown provider operation")
@@ -1581,6 +1833,7 @@ def api_editor_send(payload: dict[str, Any] = Body(...), request: Request = cast
         raise HTTPException(status_code=400, detail="No target providers selected")
 
     dry_run = bool(payload.get("dry_run", False))
+    rewatch = feature == "history" and payload.get("rewatch") is True
     cfg = load_config() or {}
     available = _filter_targets_for_request(cfg, request, _editor_send_targets(cfg, feature))
     target_map = {
@@ -1610,19 +1863,38 @@ def api_editor_send(payload: dict[str, Any] = Body(...), request: Request = cast
             totals["errors"] += 1
             continue
 
+        if feature == "history" and provider not in UNDATED_HISTORY_PROVIDERS and any(_undated_history_item(item) for item in items):
+            results.append({"provider": provider, "instance": instance, "ok": False, "error": "undated_not_supported"})
+            totals["skipped"] += len(items)
+            continue
+
         cfg_view = build_provider_config_view(cfg, provider, instance)
+        if rewatch and any(_undated_history_item(item) for item in items):
+            results.append({"provider": provider, "instance": instance, "ok": False, "error": "undated_rewatch_not_supported"})
+            totals["skipped"] += len(items)
+            continue
+        if rewatch:
+            if not history_rewatch_supported(provider, ops, "write"):
+                results.append({"provider": provider, "instance": instance, "ok": False, "error": "rewatch_not_supported"})
+                totals["skipped"] += len(items)
+                continue
+            cfg_view = config_with_history_rewatches(cfg_view, True)
+        send_items = [_rewatch_send_item(item) for item in items] if rewatch else items
         if provider == "PLEX" and feature == "history":
             from copy import deepcopy
 
             cfg_view = deepcopy(cfg_view)
             cfg_view.setdefault("plex", {}).setdefault("history", {})["discover_fallback"] = payload.get("plex_discover_fallback") is True
+        if not dry_run:
+            from services.editor_removal import forget_live_reads
+            forget_live_reads(provider, instance, feature)
         try:
             res = apply_add(
                 dst_ops=ops,
                 cfg=cfg_view,
                 dst_name=provider,
                 feature=feature,
-                items=items,
+                items=send_items,
                 dry_run=dry_run,
                 emit=_emit,
                 dbg=lambda *a, **k: None,
@@ -1639,17 +1911,8 @@ def api_editor_send(payload: dict[str, Any] = Body(...), request: Request = cast
         for key in totals:
             totals[key] += int(res.get(key, 0) or 0)
 
-        if not dry_run and bool(res.get("ok", True)) and int(res.get("confirmed", res.get("count", 0)) or 0) > 0:
-            try:
-                _merge_sent_items_into_state(provider, instance, feature, _items_confirmed_by_send(feature, items, res))
-            except Exception:
-                pass
-            confirmed_keys = [str(k) for k in (res.get("confirmed_keys") or []) if k]
-            try:
-                clear_blackbox_keys(provider, feature, confirmed_keys)
-                clear_unresolved_all_scopes(provider, feature, confirmed_keys)
-            except Exception:
-                pass
+        if not dry_run:
+            remember_sent_items(provider, instance, feature, send_items, res, rewatch=rewatch)
 
     return {
         "ok": bool(results) and all(bool(r.get("ok")) for r in results),

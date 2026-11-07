@@ -8,6 +8,8 @@ from contextlib import contextmanager
 import hashlib
 import json
 import logging
+import threading
+import time
 from typing import Any
 
 from fastapi import HTTPException
@@ -20,6 +22,7 @@ from cw_platform.id_map import canonical_key, unified_keys_from_ids
 from cw_platform.local_db import state as sqlite_state
 from cw_platform.modules_registry import load_sync_ops
 from cw_platform.orchestrator._applier import apply_remove
+from cw_platform.orchestrator._history_copies import COPIES_PROVIDERS, config_with_history_copies
 from cw_platform.orchestrator._history_rewatches import (
     collapse_history_latest, config_with_history_rewatches, history_event_matches, history_rewatch_supported,
     history_timestamp_tolerance_seconds,
@@ -200,7 +203,7 @@ def _can_remove(ops, feature, key, item, *, viewing=False):
     return True
 
 
-def _add_tracker_records(cfg, feature, selected, targets, entry):
+def _add_live_records(cfg, feature, selected, targets, entry, *, same_account=True):
     provider, instance = entry["provider"], entry["instance"]
     ops = load_sync_ops(provider)
     view = build_provider_config_view(cfg, provider, instance)
@@ -214,7 +217,7 @@ def _add_tracker_records(cfg, feature, selected, targets, entry):
         if titles:
             current = _RecordIndex(_read_current(ops, config_with_history_rewatches(view, False), provider, instance, feature))
             for index, key, item in titles:
-                matches = current.matches(key, item, same_account=True)
+                matches = current.matches(key, item, same_account=same_account)
                 if len(matches) != 1 or index in targets.get((provider, instance), {}).get("rows", ()):
                     continue
                 dest_key, dest = matches[0]
@@ -223,7 +226,7 @@ def _add_tracker_records(cfg, feature, selected, targets, entry):
                     target()["records"].setdefault(dest_key, dest)
         if events and _supports_viewings(provider, ops):
             recorded = _read_viewings(ops, config_with_history_rewatches(view, True), provider, instance, feature)
-            matched = _match_viewings({k: item for k, (_, item) in events.items()}, recorded, cfg, same_account=True)
+            matched = _match_viewings({k: item for k, (_, item) in events.items()}, recorded, cfg, same_account=same_account)
             for key, dest_key in matched.items():
                 index = events[key][0]
                 if index in targets.get((provider, instance), {}).get("rows", ()):
@@ -232,7 +235,19 @@ def _add_tracker_records(cfg, feature, selected, targets, entry):
                     target()["rows"].add(index)
                     target()["viewings"].setdefault(dest_key, recorded[dest_key])
     except Exception:
-        LOG.warning("Editor removal could not read the %s tracker %s", feature, instance, exc_info=True)
+        LOG.warning("Editor removal could not read %s %s from %s", feature, instance, provider, exc_info=True)
+
+
+def _live_checks(payload):
+    rows = payload.get("live_check")
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, Mapping):
+            continue
+        identity = (str(row.get("provider") or "").upper(), normalize_instance_id(row.get("instance")))
+        if identity[0] and identity not in out:
+            out.append(identity)
+    return out
 
 
 def _plan(payload, request):
@@ -247,7 +262,8 @@ def _plan(payload, request):
     missing_baselines = set()
     found_pair = not pair_id
     # Reuse labels and configured-instance filtering from Send. The baseline,
-    # rather than provider discovery or the global inventory, grants eligibility.
+    # rather than provider discovery or the global inventory, grants eligibility,
+    # unless the caller asks for a live check of specific accounts.
     available = {(row["provider"], row["instance"]): row
                  for row in api._filter_targets_for_request(cfg, request, api._editor_send_targets(cfg, feature))}
     for index, pair in enumerate(cfg.get("pairs") or [], 1):
@@ -310,7 +326,15 @@ def _plan(payload, request):
         raise HTTPException(404, "Sync pair not found for this feature")
     tracker = (source, source_instance)
     if source == "CROSSWATCH" and tracker in available and user_can_access_instance(cfg, user, *tracker):
-        _add_tracker_records(cfg, feature, selected, targets, available[tracker])
+        _add_live_records(cfg, feature, selected, targets, available[tracker])
+    for identity in _live_checks(payload):
+        if identity == tracker and source == "CROSSWATCH":
+            continue
+        if identity not in available or not user_can_access_instance(cfg, user, *identity):
+            continue
+        if len(targets.get(identity, {}).get("rows", ())) >= len(selected):
+            continue
+        _add_live_records(cfg, feature, selected, targets, available[identity], same_account=identity == tracker)
     rows = sorted(targets.values(), key=lambda t: (t["display"].casefold(), t["instance"]))
     signature = [(t["provider"], t["instance"], t["records"], t["viewings"]) for t in rows]
     digest = hashlib.sha256(json.dumps([feature, pair_id, signature], sort_keys=True, default=str).encode()).hexdigest()
@@ -328,7 +352,7 @@ def preview_removal(payload, request=None):
         public.append(row)
     return dict(ok=True, operation="remove", kind=feature, selected=len(selected), providers=public, preview_id=digest,
                 missing_baselines=missing,
-                empty_reason="pair_baseline_unavailable" if not public and missing else "no_matching_records")
+                empty_reason="pair_baseline_unavailable" if not public and missing and not _live_checks(payload) else "no_matching_records")
 
 
 @contextmanager
@@ -345,12 +369,41 @@ def _sync_guard():
         lock.release()
 
 
-def _read_current(ops, config, provider, instance, feature):
+def _write_view(view, provider, feature):
+    return config_with_history_copies(view) if feature == "history" and provider in COPIES_PROVIDERS else view
+
+
+_LIVE_READS: dict[tuple[str, str, str, bool], tuple[float, dict[str, dict[str, Any]]]] = {}
+_LIVE_READS_LOCK = threading.Lock()
+LIVE_READ_TTL = 30.0
+
+
+def forget_live_reads(provider, instance, feature):
+    key = (str(provider or "").upper(), normalize_instance_id(instance), str(feature or ""))
+    with _LIVE_READS_LOCK:
+        for cached in [k for k in _LIVE_READS if k[:3] == key]:
+            _LIVE_READS.pop(cached, None)
+
+
+def _live_index(ops, config, provider, instance, feature, *, fresh=False):
+    key = (str(provider or "").upper(), normalize_instance_id(instance), str(feature or ""), bool(config.get("_cw_history_rewatches")))
+    now = time.monotonic()
+    with _LIVE_READS_LOCK:
+        hit = _LIVE_READS.get(key)
+    if hit and not fresh and now - hit[0] < LIVE_READ_TTL:
+        return {k: dict(v) for k, v in hit[1].items()}
     with _capture_mode_env(pid=provider, instance=instance, feat=feature):
         result = ops.build_index(config, feature=feature)
     if not isinstance(result, Mapping):
         raise RuntimeError("Provider returned no usable inventory")
-    result = {str(k): dict(v) for k, v in result.items() if isinstance(v, Mapping)}
+    rows = {str(k): dict(v) for k, v in result.items() if isinstance(v, Mapping)}
+    with _LIVE_READS_LOCK:
+        _LIVE_READS[key] = (now, rows)
+    return {k: dict(v) for k, v in rows.items()}
+
+
+def _read_current(ops, config, provider, instance, feature, *, fresh=False):
+    result = _live_index(ops, config, provider, instance, feature, fresh=fresh)
     if feature == "history":
         return collapse_history_latest(result)
     return result
@@ -377,12 +430,8 @@ def _remove_target(cfg, feature, target, *, dry_run):
     return out
 
 
-def _read_viewings(ops, config, provider, instance, feature):
-    with _capture_mode_env(pid=provider, instance=instance, feat=feature):
-        result = ops.build_index(config, feature=feature)
-    if not isinstance(result, Mapping):
-        raise RuntimeError("Provider returned no usable inventory")
-    return _viewings({str(k): dict(v) for k, v in result.items() if isinstance(v, Mapping)})
+def _read_viewings(ops, config, provider, instance, feature, *, fresh=False):
+    return _viewings(_live_index(ops, config, provider, instance, feature, fresh=fresh))
 
 
 def _remove_viewings(cfg, feature, target, *, dry_run):
@@ -402,12 +451,13 @@ def _remove_viewings(cfg, feature, target, *, dry_run):
     removed_keys, unresolved_keys = [], []
     if matched:
         with _crosswatch_write_env() if provider == "CROSSWATCH" else _capture_mode_env(pid=provider, instance=instance, feat=feature):
-            result = apply_remove(dst_ops=ops, cfg=view, dst_name=provider, feature=feature,
+            forget_live_reads(provider, instance, feature)
+            result = apply_remove(dst_ops=ops, cfg=_write_view(view, provider, feature), dst_name=provider, feature=feature,
                                   items=[live[key] for key in matched.values()], dry_run=dry_run,
                                   emit=lambda event, **data: _emit(event, instance=instance, **data),
                                   dbg=lambda *a, **k: None, chunk_size=100, chunk_pause_ms=0)
         if not dry_run:
-            remaining = _read_viewings(ops, view, provider, instance, feature)
+            remaining = _read_viewings(ops, view, provider, instance, feature, fresh=True)
             gone = {key: live[key] for key in matched.values()}
             survivors = _match_viewings(gone, remaining, cfg, same_account=True, tolerance=0)
             for key, live_key in matched.items():
@@ -479,7 +529,8 @@ def _remove_titles(cfg, feature, target, *, dry_run):
             # Capture mode prefers provider-native IDs. Keep the same identities
             # for confirmation after leaving that context (which prefers TMDB).
             write_keys = {key: canonical_key(dest) for key, (_, dest) in matched.items()}
-            result = apply_remove(dst_ops=ops, cfg=view, dst_name=provider, feature=feature,
+            forget_live_reads(provider, instance, feature)
+            result = apply_remove(dst_ops=ops, cfg=_write_view(view, provider, feature), dst_name=provider, feature=feature,
                                   items=[v for _, v in matched.values()], dry_run=dry_run,
                                   emit=lambda event, **data: _emit(event, instance=instance, **data),
                                   dbg=lambda *a, **k: None, chunk_size=100, chunk_pause_ms=0)
@@ -491,7 +542,7 @@ def _remove_titles(cfg, feature, target, *, dry_run):
                 provider_unresolved_count=result.get("unresolved", 0), provider_errors=result.get("errors", 0),
             )
             confirmed = set(decision["success_keys"])
-            remaining = _RecordIndex(_read_current(ops, view, provider, instance, feature))
+            remaining = _RecordIndex(_read_current(ops, view, provider, instance, feature, fresh=True))
             for key, (dest_key, dest) in matched.items():
                 survivors = remaining.matches(dest_key, dest, same_account=True)
                 deleted_watch = _floppy_watch(dest) if single_watch else ("", None)
@@ -543,6 +594,99 @@ def _remove_titles(cfg, feature, target, *, dry_run):
                 still_watched=len(still_watched),
                 confirmed_keys=removed_keys, skipped_keys=absent_keys, unresolved_keys=unresolved_keys,
                 dry_run=dry_run)
+
+
+DIRECT_REMOVE_LIVE_MATCH = frozenset({"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO", "CROSSWATCH"})
+
+
+def _direct_supported(provider, feature, selected):
+    if provider in DIRECT_REMOVE_LIVE_MATCH or (provider == "FLOPPY" and feature == "history"):
+        return False
+    return not any(_event(key, item) for key, item in selected)
+
+
+def _prune_local(provider, instance, feature, removed):
+    from api import editorAPI as api
+
+    state = sqlite_state.load_state_features(api._STATE_BASE, {feature})
+    current = _items(state, provider, instance, feature)
+    keys = [k for k, v in current.items() if isinstance(v, Mapping) and any(
+        _matches(key, item, k, v, same_account=True, include_viewings=feature == "history") for key, item in removed)]
+    if keys:
+        sqlite_state.remove_baseline_items(api._STATE_BASE, provider, instance, feature, keys)
+
+
+def _remove_direct_target(cfg, feature, identity, selected):
+    provider, instance = identity
+    ops = load_sync_ops(provider)
+    items = [(key, _status_item(item) if feature == "history" else dict(item)) for key, item in selected]
+    allowed = [(key, item) for key, item in items if _can_remove(ops, feature, key, item)]
+    if not allowed:
+        return dict(ok=False, attempted=len(items), confirmed=0, removed=0, skipped=len(items), unresolved=0, errors=0,
+                    confirmed_keys=[], unresolved_keys=[], reason="not_supported")
+    view = config_with_history_rewatches(build_provider_config_view(cfg, provider, instance), False)
+    write = [{k: v for k, v in item.items() if k != "key"} for _, item in allowed]
+    forget_live_reads(provider, instance, feature)
+    with _capture_mode_env(pid=provider, instance=instance, feat=feature):
+        write_keys = [canonical_key(item) for item in write]
+        result = apply_remove(dst_ops=ops, cfg=_write_view(view, provider, feature), dst_name=provider, feature=feature,
+                              items=write, dry_run=False,
+                              emit=lambda event, **data: _emit(event, instance=instance, **data),
+                              dbg=lambda *a, **k: None, chunk_size=100, chunk_pause_ms=0)
+    decision = compute_effective_remove(
+        attempted_keys=write_keys,
+        provider_confirmed_count=result.get("confirmed", 0),
+        provider_confirmed_keys=result.get("confirmed_keys"),
+        provider_unresolved_count=result.get("unresolved", 0), provider_errors=result.get("errors", 0),
+    )
+    confirmed = set(decision["success_keys"])
+    removed = [(key, item) for (key, item), write_key in zip(allowed, write_keys) if write_key in confirmed]
+    unresolved = [key for (key, _), write_key in zip(allowed, write_keys) if write_key not in confirmed]
+    if removed:
+        _prune_local(provider, instance, feature, removed)
+    return dict(ok=bool(removed) and not unresolved, attempted=len(items), confirmed=len(removed), removed=len(removed),
+                skipped=len(items) - len(allowed), unresolved=len(unresolved), errors=int(result.get("errors", 0) or 0),
+                confirmed_keys=[key for key, _ in removed], unresolved_keys=unresolved)
+
+
+def remove_direct(payload, request=None):
+    from api import editorAPI as api
+
+    feature, selected = _selection(payload, request)
+    requested = payload.get("providers")
+    if not isinstance(requested, list) or not requested:
+        raise HTTPException(400, "Select at least one provider instance")
+    cfg, user = api.load_config(), request_user(request)
+    available = {(row["provider"], row["instance"]): row
+                 for row in api._filter_targets_for_request(cfg, request, api._editor_send_targets(cfg, feature))}
+    identities = []
+    for row in requested:
+        if not isinstance(row, Mapping):
+            raise HTTPException(400, "Invalid provider selection")
+        identity = (str(row.get("provider") or "").upper(), normalize_instance_id(row.get("instance")))
+        if identity not in identities:
+            identities.append(identity)
+    results = []
+    with _sync_guard():
+        for identity in identities:
+            entry = available.get(identity)
+            if entry is None or not user_can_access_instance(cfg, user, *identity):
+                results.append(dict(provider=identity[0], instance=identity[1], ok=False, error="provider_not_allowed", result=dict(errors=1)))
+                continue
+            base = {k: entry[k] for k in ("provider", "instance", "label", "instance_label", "display")}
+            if not _direct_supported(identity[0], feature, selected):
+                results.append(dict(base, ok=False, error="needs_live_match", result={}))
+                continue
+            try:
+                result = _remove_direct_target(cfg, feature, identity, selected)
+                results.append(dict(base, ok=result["ok"], result=result))
+            except Exception:
+                LOG.exception("Direct editor removal failed for %s/%s", *identity)
+                results.append(dict(base, ok=False, error="remove_failed", result=dict(errors=1)))
+    totals = {key: sum(int(r["result"].get(key, 0)) for r in results)
+              for key in ("attempted", "confirmed", "removed", "skipped", "unresolved", "errors")}
+    return dict(ok=all(r["ok"] for r in results), operation="remove", kind=feature, direct=True,
+                selected=len(selected), results=results, **totals)
 
 
 def remove_selected(payload, request=None):

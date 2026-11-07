@@ -26,8 +26,13 @@
       closeAll(null);
     });
     d.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape") closeAll(null);
-    });
+      if (ev.key !== "Escape" || !OPEN) return;
+      const button = OPEN.btn;
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      closeAll(null);
+      if (button.isConnected) button.focus({preventScroll:true});
+    }, true);
   }
 
   function normalizeIcon(icon) {
@@ -70,6 +75,14 @@
   function rowMain(data) {
     const main = d.createElement("span");
     main.className = "cw-icon-select-main";
+
+    if (data.html) {
+      const html = d.createElement("span");
+      html.className = "cw-icon-select-html";
+      html.innerHTML = String(data.html);
+      main.appendChild(html);
+      return main;
+    }
 
     if (Array.isArray(data.leadingBadges) && data.leadingBadges.length) {
       const leadingBadges = d.createElement("span");
@@ -191,6 +204,9 @@
       : data;
     if (Object.prototype.hasOwnProperty.call(data, "selectedShowNote")) {
       selectedData.showNote = data.selectedShowNote;
+    }
+    if (Object.prototype.hasOwnProperty.call(data, "selectedHtml")) {
+      selectedData.html = data.selectedHtml;
     }
     labelHost.replaceWith(rowMain(selectedData));
     btn.insertBefore(btn.querySelector(".cw-icon-select-main"), btn.querySelector(".cw-icon-select-caret"));

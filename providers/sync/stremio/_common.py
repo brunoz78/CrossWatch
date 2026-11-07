@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
+import re
+import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from cw_platform.id_map import ID_KEYS, canonical_key, ids_from, merge_ids, minimal as id_minimal
@@ -17,10 +21,50 @@ from providers.sync._log import log as cw_log
 
 COLLECTION = "libraryItem"
 DEFAULT_STREMIO_PROFILE_ID = "default"
+EPISODE_DATE_TOLERANCE_MS = 2 * 24 * 60 * 60 * 1000
+READ_PROGRESS_SECONDS = 5.0
+_GENERIC_EPISODE_TITLE = re.compile(r"(episode|ep|chapter)?\d+")
+_CINEMETA_WRITE_LOCK = threading.Lock()
 
 
 def is_capture_mode() -> bool:
     return str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def cinemeta_cache_dir() -> Path | None:
+    if is_capture_mode():
+        return None
+    try:
+        from cw_platform.config_base import CONFIG_BASE
+
+        return Path(CONFIG_BASE()) / "cache" / "meta" / "cinemeta"
+    except Exception:
+        return None
+
+
+def read_cinemeta_entry(imdb: str) -> dict[str, Any]:
+    root = cinemeta_cache_dir()
+    if root is None:
+        return {}
+    try:
+        entry = json.loads((root / f"{imdb}.json").read_text("utf-8"))
+    except Exception:
+        return {}
+    return entry if isinstance(entry, dict) else {}
+
+
+def update_cinemeta_entry(imdb: str, **fields: Any) -> None:
+    root = cinemeta_cache_dir()
+    if root is None:
+        return
+    tmp = root / f"{imdb}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with _CINEMETA_WRITE_LOCK:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps({**read_cinemeta_entry(imdb), **fields}, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(root / f"{imdb}.json")
+        except Exception:
+            tmp.unlink(missing_ok=True)
 
 
 def configured_block(cfg: Mapping[str, Any] | None, instance_id: Any = "default") -> dict[str, Any]:
@@ -265,6 +309,26 @@ def _titles_agree(left: Any, right: Any) -> bool:
     return a == b or a.startswith(b) or b.startswith(a)
 
 
+def _distinct_title(value: Any) -> str:
+    title = _normalized_title(value)
+    return "" if _GENERIC_EPISODE_TITLE.fullmatch(title) else title
+
+
+def episode_agrees(video: Mapping[str, Any], row: Mapping[str, Any], season_rows: Iterable[Mapping[str, Any]]) -> bool:
+    name = str(video.get("name") or video.get("title") or "").strip()
+    other_name = str(row.get("title") or "").strip()
+    title = _distinct_title(name)
+    if title and title == _distinct_title(other_name):
+        return True
+    released = epoch_ms(video.get("released"))
+    if released is None:
+        return False
+    dates = ((other, epoch_ms(other.get("released"))) for other in season_rows)
+    near = [other for other, aired in dates if aired is not None and abs(released - aired) <= EPISODE_DATE_TOLERANCE_MS]
+    same_day = str(video.get("released") or "")[:10] == str(row.get("released") or "")[:10]
+    return row in near and (len(near) == 1 or (same_day and bool(name) and name.casefold() == other_name.casefold()))
+
+
 def verify_bare_numeric_id(adapter: Any, record: Mapping[str, Any]) -> tuple[bool, str | None]:
     rid = record_id(record)
     if not is_bare_numeric_id(rid):
@@ -445,6 +509,24 @@ def datastore_meta(adapter: Any) -> list[Mapping[str, Any]]:
 
 def datastore_put(adapter: Any, changes: list[Mapping[str, Any]]) -> Any:
     return adapter.client.request_json("datastorePut", {"collection": COLLECTION, "changes": [dict(x) for x in changes]})
+
+
+def read_progress(adapter: Any, feature: str, total: int, *, enabled: bool = True) -> Callable[[int], None]:
+    factory = getattr(adapter, "progress_factory", None)
+    progress: Any = factory(feature) if enabled and callable(factory) else None
+    last = time.monotonic()
+
+    def tick(done: int) -> None:
+        nonlocal last
+        if progress is None:
+            return
+        now = time.monotonic()
+        due = now - last >= READ_PROGRESS_SECONDS
+        if due:
+            last = now
+        progress.tick(done, total=total, force=due)
+
+    return tick
 
 
 def library_records(adapter: Any, *, incremental: bool = False) -> list[Mapping[str, Any]]:

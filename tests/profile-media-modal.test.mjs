@@ -8,14 +8,15 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("../assets/js/profile-media-modal.js", import.meta.url), "utf8");
 
-function modal(presence = null, type = "movie") {
+function modal(presence = null, type = "movie", ItemActions = undefined) {
   const context = {
-    window: { CW: { ProfileDateTime: { format: (date) => date.toISOString().slice(0, 10) } } },
+    window: { CW: { ItemActions, ProfileDateTime: { format: (date) => date.toISOString().slice(0, 10) } } },
     navigator: { language: "en-US" },
     document: { documentElement: { dataset: {} } },
   };
-  vm.runInNewContext(source.replace("  (window.CW ||= {}).ProfileMediaModal =", "  window.testModal = { state, movieProgressBox, overviewTab, episodesTab, seasonProgress, upNext, episodeSlot, livesCard, episodeDetail };\n  (window.CW ||= {}).ProfileMediaModal ="), context);
+  vm.runInNewContext(source.replace("  (window.CW ||= {}).ProfileMediaModal =", "  window.testModal = { state, openItemActions, movieProgressBox, overviewTab, episodesTab, seasonProgress, upNext, episodeSlot, livesCard, episodeDetail, showResumePoints };\n  (window.CW ||= {}).ProfileMediaModal ="), context);
   const api = context.window.testModal;
+  api.window = context.window;
   Object.assign(api.state, { item: { type, tmdb: "123" }, presence, progress: [] });
   return api;
 }
@@ -50,6 +51,38 @@ test("history-only, unwatched and absent presence retain their watch status", ()
     assert.match(html, /Not started/);
     assert.match(html, /width:0%/);
   }
+});
+
+test("a tile without a sync pair says so and offers the other accounts", () => {
+  const api = modal({ ratings: null, collection: null, scrobble: null }, "movie", { canWrite: () => true });
+  Object.assign(api.state, { actionTargets: { ratings: [], collection: [] }, actionOthers: { ratings: [{ provider: "MDBLIST", instance: "default" }], collection: [] }, actionPairless: new Set(["ratings", "collection"]) });
+  const html = api.livesCard();
+  assert.match(html, /Ratings<\/strong><span>No sync pair/);
+  assert.match(html, /Collection<\/strong><span>No sync pair/);
+  assert.match(html, /Scrobbled<\/strong><span>Not synced/);
+  assert.equal((html.match(/data-ia-more/g) || []).length, 1);
+});
+
+test("the add button opens Quick add for the other accounts of that tile", async () => {
+  const api = modal({ ratings: null }, "movie", { canWrite: () => true });
+  Object.assign(api.state, { meta: { title: "Michael", year: 2026 }, actionOthers: { ratings: [{ provider: "MDBLIST", instance: "default" }] } });
+  const opened = [];
+  api.window.openManualWatchedModal = (props) => opened.push(props);
+  await api.openItemActions({ hasAttribute: (name) => name === "data-ia-more", closest: () => ({ dataset: { mmLive: "ratings" } }), dataset: {} });
+  assert.equal(opened.length, 1);
+  assert.equal(opened[0].action, "rating");
+  assert.equal(opened[0].item.type, "movie");
+  assert.equal(opened[0].item.tmdb, "123");
+  assert.equal(opened[0].item.title, "Michael");
+  assert.deepEqual([...opened[0].only], ["MDBLIST:default"]);
+});
+
+test("the add button goes away once the title is on the only other account", () => {
+  const api = modal({ ratings: { present: [{ provider: "MDBLIST", instance: "default", rating: 8 }], missing: [], rating: 8 } }, "movie", { canWrite: () => true });
+  Object.assign(api.state, { actionTargets: { ratings: [] }, actionOthers: { ratings: [{ provider: "MDBLIST", instance: "default" }] }, actionPairless: new Set(["ratings"]) });
+  const html = api.livesCard();
+  assert.doesNotMatch(html, /data-ia-more/);
+  assert.doesNotMatch(html, /No sync pair/);
 });
 
 test("a current rewatch keeps playback progress alongside the completed scrobble", () => {
@@ -121,7 +154,7 @@ function loadingModal() {
   const metas = [], requests = [], body = {innerHTML:"",scrollTop:0}, panel = {innerHTML:""};
   const root = {hidden:true,addEventListener(){},querySelector:selector => selector === ".cw-mm-body" ? body : selector === ".cw-mm-panel" ? panel : {style:{},focus(){}},querySelectorAll:()=>[]};
   const context = {
-    window:{CW:{Meta:{get:() => {const d=deferred();metas.push(d);return d.promise;}},ProfileDateTime:{format:date=>date.toISOString()}}},
+    window:{addEventListener(){},CW:{Meta:{get:() => {const d=deferred();metas.push(d);return d.promise;}},ProfileDateTime:{format:date=>date.toISOString()}}},
     navigator:{language:"en-US"},
     document:{createElement:()=>root,body:{appendChild(){}},addEventListener(){},documentElement:{dataset:{cwPermPlayback:"off"},classList:{add(){},remove(){}}}},
     fetch:url=>{const d=deferred();requests.push({url,...d});return d.promise;},
@@ -279,4 +312,19 @@ test("leaving an actor ignores its late response and reuses metadata on reopenin
   await f.extra.openPerson("12");
   assert.equal(f.requests.length, 2);
   assert.match(f.body.innerHTML, /Actor/);
+});
+
+test("a show lists each paused episode with its provider", () => {
+  const api = modal({ synced: null, scrobble: null }, "show");
+  api.state.progress = [
+    { rid: "0", provider: "PLEX", instance: "default", label: "Plex", pct: 48, remaining: 1500, updated: "", season: 2, episode: 4, episodeTitle: "The Long Night", record: { can_remove_progress: true } },
+    { rid: "1", provider: "TRAKT", instance: "default", label: "Trakt", pct: 12, remaining: 0, updated: "", season: 1, episode: 1, episodeTitle: "", record: {} },
+  ];
+  const html = api.showResumePoints();
+  assert.match(html, /Resume points/);
+  assert.match(html, /S2E4 · The Long Night/);
+  assert.match(html, /S1E1/);
+  assert.match(html, /48%/);
+  api.state.progress = [];
+  assert.equal(api.showResumePoints(), "");
 });

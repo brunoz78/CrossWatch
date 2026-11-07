@@ -56,14 +56,212 @@
     return hours ? `${hours}h ${total % 60}m` : `${total}m`;
   }
 
-  function providerChip(ref, missing = false) {
+  function providerChip(ref, missing = false, action = false, episode = null) {
     const provider = String(ref?.provider || "");
     const instance = String(ref?.instance || "default");
     const name = window.CW?.ProviderMeta?.label?.(provider) || provider;
     const logo = window.CW?.ProviderMeta?.logoPath?.(provider) || "";
     const title = `${name}${instance !== "default" ? ` · ${instance}` : ""}${missing ? " · missing" : ""}`;
     const mark = missing ? "" : ref?.rating != null ? `<em>${esc(ref.rating)}</em>` : `<span class="cw-mm-provider-mark material-symbols-rounded" aria-hidden="true">check</span>`;
-    return `<span class="cw-mm-provider${missing ? " is-missing" : ""}" title="${esc(title)}">${logo ? `<img src="${esc(logo)}" alt="" loading="lazy">` : `<b>${esc(name.slice(0, 2))}</b>`}${mark}</span>`;
+    const inner = `${logo ? `<img src="${esc(logo)}" alt="" loading="lazy">` : `<b>${esc(name.slice(0, 2))}</b>`}${mark}`;
+    if (episode) {
+      const label = `${title} · open ${episodeCode(episode)}`;
+      return `<button type="button" class="cw-mm-provider${missing ? " is-missing" : ""}" data-mm-episode="${esc(episode.season)}:${esc(episode.episode)}" title="${esc(label)}" aria-label="${esc(label)}">${inner}</button>`;
+    }
+    if (action) return `<button type="button" class="cw-mm-provider${missing ? " is-missing" : ""}" data-ia-chip data-ia-ref="${esc(`${provider.toUpperCase()}:${instance}`)}" title="${esc(title)}" aria-label="${esc(title)}" aria-haspopup="dialog">${inner}</button>`;
+    return `<span class="cw-mm-provider${missing ? " is-missing" : ""}" title="${esc(title)}">${inner}</span>`;
+  }
+
+  const LIVE_FEATURES = { watchlist: "watchlist", synced: "history", ratings: "ratings", collection: "collection" };
+  const QUICK_ACTIONS = { watchlist: "watchlist", synced: "history", ratings: "rating", collection: "collection" };
+  const itemActions = () => (window.CW?.ItemActions?.canWrite?.() ? window.CW.ItemActions : null);
+  const liveFeature = (key) => {
+    if (!itemActions()) return "";
+    if (key === "scrobble") return isMovie() ? "history" : "";
+    return isMovie() || key === "watchlist" ? LIVE_FEATURES[key] || "" : "";
+  };
+  const refId = (ref) => `${String(ref?.provider || "").toUpperCase()}:${String(ref?.instance || "default")}`;
+
+  function missingRefs(key) {
+    const present = new Set((state.presence?.[key]?.present || []).map(refId));
+    return (state.actionTargets?.[LIVE_FEATURES[key]] || []).filter((row) => !present.has(refId(row))).map((row) => ({ provider: row.provider, instance: row.instance || "default" }));
+  }
+
+  function otherRefs(key) {
+    const present = new Set((state.presence?.[key]?.present || []).map(refId));
+    return (state.actionOthers?.[LIVE_FEATURES[key]] || []).filter((row) => !present.has(refId(row)));
+  }
+
+  async function loadActionTargets(seq) {
+    const actions = itemActions();
+    if (!actions?.targets) return;
+    const query = actions.targetQuery ? actions.targetQuery(actionItem(null)) : {};
+    const keys = Object.keys(LIVE_FEATURES).filter((key) => liveFeature(key));
+    const results = await Promise.all(keys.map((key) => actions.targets(LIVE_FEATURES[key], query)));
+    if (seq !== state.seq || root.hidden) return;
+    state.actionTargets = Object.fromEntries(keys.map((key, index) => [LIVE_FEATURES[key], results[index]?.rows || []]));
+    state.actionOthers = Object.fromEntries(keys.map((key, index) => [LIVE_FEATURES[key], results[index]?.others || []]));
+    state.actionPairless = new Set(keys.filter((key, index) => results[index]?.hasPair === false).map((key) => LIVE_FEATURES[key]));
+    if (!personView) render();
+  }
+
+  function actionItem(entry) {
+    const imdb = state.meta?.ids?.imdb || state.item?.ids?.imdb || "";
+    const base = {
+      type: kindOf(state.item),
+      title: state.meta?.title || state.item?.title || "",
+      year: state.meta?.year || state.item?.year || "",
+      ids: { tmdb: tmdbOf(state.item), ...(imdb ? { imdb } : {}) },
+    };
+    const found = entry?.entry;
+    return found ? { ...base, ...found, ids: { ...base.ids, ...(found.ids || {}) } } : base;
+  }
+
+  async function refreshPresence() {
+    const seq = state.seq;
+    const presence = await loadPresence(state.item);
+    if (seq !== state.seq || root.hidden || personView) return;
+    state.presence = presence;
+    render();
+  }
+
+  const releaseDate = () => String(state.meta?.release?.date || state.meta?.detail?.release_date || "").slice(0, 10) || null;
+
+  function openPlays() {
+    const actions = itemActions();
+    if (!actions || !isMovie()) return;
+    actions.openHistory({
+      item: actionItem(state.presence?.synced),
+      releaseDate: releaseDate(),
+      poster: posterUrl(state.item),
+      onChanged: refreshPresence,
+    });
+  }
+
+  function openProgressActions(node) {
+    const actions = itemActions();
+    const rows = Array.isArray(state.progress) ? state.progress : [];
+    if (!actions || !rows.length) return;
+    const movie = isMovie();
+    const progressRows = rows.filter((row) => row.record).map((row) => {
+      const who = providerDisplay(row);
+      return {
+        rid: row.rid,
+        provider: row.provider.toUpperCase(),
+        instance: row.instance,
+        provider_label: who.full,
+        label: movie ? who.full : `${episodeCode(row)} on ${who.full}`,
+        record: row.record,
+      };
+    });
+    const seq = state.seq;
+    void actions.openMenu({
+      anchor: node,
+      feature: "progress",
+      item: actionItem(null),
+      progressRows,
+      focusRow: node.dataset.iaPlay ?? null,
+      scope: () => [root?.querySelector("[data-mm-progress]")],
+      onChanged: async () => {
+        if (seq !== state.seq) return;
+        await Promise.all([loadProgress(state.item, seq), refreshPresence()]);
+      },
+    });
+  }
+
+  function openEverything(node) {
+    const actions = itemActions();
+    if (!actions) return;
+    const keys = isMovie() ? ["watchlist", "synced", "ratings", "collection"] : ["watchlist"];
+    const groups = keys.map((key) => {
+      const entry = state.presence?.[key];
+      const { key: _recordKey, ...titleItem } = actionItem(entry);
+      return {
+        feature: LIVE_FEATURES[key],
+        present: Array.isArray(entry?.present) ? entry.present : [],
+        item: key === "synced" ? titleItem : actionItem(entry),
+        scope: () => [root?.querySelector(`[data-mm-live="${key}"]`)],
+      };
+    }).filter((group) => group.present.length);
+    if (!groups.length) return;
+    void actions.openMenu({ anchor: node, mode: "everything", item: actionItem(null), groups, onChanged: refreshPresence });
+  }
+
+  function openQuickAdd(node) {
+    const key = node.closest("[data-mm-live]")?.dataset.mmLive || "";
+    window.openManualWatchedModal?.({
+      action: QUICK_ACTIONS[key],
+      item: { tmdb: tmdbOf(state.item), type: isMovie() ? "movie" : "show", title: state.meta?.title || state.item?.title || "", year: state.meta?.year || state.item?.year || "" },
+      only: otherRefs(key).map(refId),
+    });
+  }
+
+  async function openItemActions(node) {
+    if (node.hasAttribute("data-ia-more")) {
+      openQuickAdd(node);
+      return;
+    }
+    const actions = itemActions();
+    if (node.closest("[data-mm-progress]")) {
+      openProgressActions(node);
+      return;
+    }
+    if (node.closest("[data-mm-ep-live]")) {
+      openEpisodeActions(node);
+      return;
+    }
+    const key = node.closest("[data-mm-live]")?.dataset.mmLive || "";
+    const feature = liveFeature(key);
+    if (!actions || !feature) return;
+    const stateKey = key === "scrobble" ? "synced" : key;
+    const entry = state.presence?.[stateKey] || null;
+    const present = Array.isArray(entry?.present) ? entry.present : [];
+    const [provider, ...instance] = String(node.dataset.iaRef || "").split(":");
+    void actions.openMenu({
+      anchor: node,
+      feature,
+      item: actionItem(entry),
+      refs: { present, missing: missingRefs(stateKey) },
+      focus: node.dataset.iaRef ? { provider, instance: instance.join(":") || "default" } : null,
+      rating: entry?.rating ?? null,
+      epoch: feature === "history" ? Number(state.presence?.[key]?.last_epoch) || Number(entry?.last_epoch) || 0 : 0,
+      releaseDate: feature === "history" ? releaseDate() : null,
+      scope: () => [...new Set([key, stateKey])].map((name) => root?.querySelector(`[data-mm-live="${name}"]`)),
+      onChanged: refreshPresence,
+      openHistory: feature === "history" ? openPlays : null,
+    });
+  }
+
+  function episodeItem(season, episode) {
+    const imdb = state.meta?.ids?.imdb || state.item?.ids?.imdb || "";
+    return {
+      type: "episode",
+      title: state.meta?.title || state.item?.title || "",
+      season,
+      episode,
+      show_ids: { tmdb: tmdbOf(state.item), ...(imdb ? { imdb } : {}) },
+    };
+  }
+
+  function openEpisodeActions(node) {
+    const actions = itemActions();
+    if (!actions || !state.episode) return;
+    const { season, episode } = state.episode;
+    const find = (key) => state.presence?.[key]?.episodes?.find((row) => Number(row.season) === season && Number(row.episode) === episode);
+    const history = find("synced");
+    const clicked = node.closest("[data-mm-ep-live]")?.dataset.mmEpLive === "scrobble" ? find("scrobble") : history;
+    const [provider, ...instance] = String(node.dataset.iaRef || "").split(":");
+    void actions.openMenu({
+      anchor: node,
+      feature: "history",
+      item: episodeItem(season, episode),
+      refs: { present: history?.present || [], missing: [] },
+      focus: node.dataset.iaRef ? { provider, instance: instance.join(":") || "default" } : null,
+      epoch: Number(clicked?.epoch || history?.epoch) || 0,
+      releaseDate: String(state.seasons.get(String(season))?.episodes?.find((row) => Number(row.episode) === episode)?.air_date || "").slice(0, 10) || null,
+      scope: () => [root?.querySelector(".cw-ep-providers")],
+      onChanged: refreshPresence,
+    });
   }
 
   function ensure() {
@@ -88,9 +286,13 @@
     document.addEventListener("keydown", (event) => {
       if (root.hidden || event.key !== "Escape") return;
       if (document.getElementById("cw-trailer")?.classList.contains("show")) return;
+      if (document.querySelector(".cw-ia-pop:not([hidden]),.cw-ia-sheet-wrap:not([hidden]),.cx-backdrop")) return;
       event.preventDefault();
       close();
     }, true);
+    window.addEventListener("cw:manual-watched-saved", () => {
+      if (!root.hidden && !personView) void refreshPresence();
+    });
     return root;
   }
 
@@ -117,15 +319,21 @@
     if (document.documentElement?.dataset?.cwPermPlayback !== "off") {
       try {
         const tmdb = tmdbOf(item);
-        const res = await fetch((window.CW?.ProfileViewAs?.scope || String)(`/api/playback_progress/items?tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=50`), { credentials: "same-origin", cache: "no-store" });
+        const movie = kindOf(item) === "movie";
+        const query = movie ? `tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=50` : `show_tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=250`;
+        const res = await fetch((window.CW?.ProfileViewAs?.scope || String)(`/api/playback_progress/items?${query}`), { credentials: "same-origin", cache: "no-store" });
         const data = await res.json().catch(() => null);
-        const match = (Array.isArray(data?.items) ? data.items : []).find((entry) => {
-          if (String(entry?.media_type || "").toLowerCase() !== "movie") return false;
-          const records = Array.isArray(entry.records) && entry.records.length ? entry.records : [entry];
-          return records.some((record) => String(record?.ids?.tmdb || "") === tmdb);
-        });
-        const records = match ? (Array.isArray(match.records) && match.records.length ? match.records : [match]) : [];
-        rows = records.map((record) => ({
+        const items = Array.isArray(data?.items) ? data.items : [];
+        const matches = movie
+          ? items.filter((entry) => {
+            if (String(entry?.media_type || "").toLowerCase() !== "movie") return false;
+            const records = Array.isArray(entry.records) && entry.records.length ? entry.records : [entry];
+            return records.some((record) => String(record?.ids?.tmdb || "") === tmdb);
+          }).slice(0, 1)
+          : items;
+        const records = matches.flatMap((match) => (Array.isArray(match.records) && match.records.length ? match.records : [match]));
+        rows = records.map((record, index) => ({
+          rid: String(index),
           provider: String(record.provider || ""),
           instance: String(record.instance_id || "default"),
           label: record.provider_label || record.provider || "",
@@ -133,7 +341,12 @@
           pct: Number(record.progress_percent) || 0,
           remaining: Number(record.remaining_seconds) || 0,
           updated: record.updated_at || record.progress_at || "",
+          season: record.season ?? null,
+          episode: record.episode ?? null,
+          episodeTitle: String(record.episode_title || ""),
+          record,
         }));
+        if (!movie) rows.sort((a, b) => (Date.parse(String(b.updated || "")) || 0) - (Date.parse(String(a.updated || "")) || 0));
       } catch {
         rows = [];
       }
@@ -170,11 +383,14 @@
       presence: null,
       loading: true,
       presenceLoading: true,
+      actionTargets: null,
+      actionOthers: null,
+      actionPairless: null,
       tab: "overview",
       seasons: sameTitle ? new Map([...state.seasons].filter(([, data]) => !data.loading && !data.error)) : new Map(),
       season: null,
       episode: null,
-      progress: kindOf(item) === "movie" ? null : undefined,
+      progress: null,
     });
     if (root.hidden) state.lastFocus = document.activeElement;
     root.hidden = false;
@@ -183,7 +399,8 @@
     root.querySelector(".cw-mm-body").scrollTop = 0;
     render();
     root.querySelector(".cw-mm-card")?.focus({ preventScroll: true });
-    if (kindOf(item) === "movie") void loadProgress(item, seq);
+    void loadProgress(item, seq);
+    if (itemActions()) void loadActionTargets(seq);
     await Promise.all([
       loadMeta(item).then((meta) => {
         if (seq !== state.seq || root.hidden) return;
@@ -278,6 +495,7 @@
     if (window.CW?.Trailer?.has?.(meta)) out.push(`<button class="cw-mm-btn is-primary" type="button" data-mm-trailer>${icon("play_arrow")}Watch trailer</button>`);
     out.push(`<a class="cw-mm-btn" href="https://www.themoviedb.org/${artType(item)}/${encodeURIComponent(tmdb)}" target="_blank" rel="noopener">TMDB</a>`);
     if (imdb) out.push(`<a class="cw-mm-btn" href="https://www.imdb.com/title/${encodeURIComponent(imdb)}/" target="_blank" rel="noopener">IMDb</a>`);
+    if (removable()) out.push(`<button type="button" class="cw-mm-btn is-danger" data-mm-clear-all aria-haspopup="dialog" title="Remove from everything" aria-label="Remove from everything">${icon("delete")}Remove</button>`);
     const score = Number(meta?.detail?.vote_average) || (Number(meta?.score) || 0) / 10;
     if (score > 0) {
       const votes = Number(meta?.vote_count) || 0;
@@ -314,15 +532,26 @@
       const entry = presence[key];
       const present = entry?.present || [];
       const synced = present.length > 0;
-      const chips = synced
-        ? `<div class="cw-mm-live-chips">${present.map((ref) => providerChip(ref)).join("")}${(entry.missing || []).map((ref) => providerChip(ref, true)).join("")}</div>`
-        : "";
-      return `<div class="cw-mm-live${synced ? " is-on" : ""}">
-        <div class="cw-mm-live-head">${icon(symbol)}<strong>${esc(label)}</strong><span>${esc(synced ? liveSummary(key, entry) : "Not synced")}</span></div>
+      const feature = liveFeature(key);
+      const missing = feature && key !== "scrobble" ? missingRefs(key) : (synced ? entry.missing || [] : []);
+      const latest = key === "scrobble" && !isMovie() && itemActions()
+        ? (entry?.episodes || []).reduce((best, row) => (!best || Number(row.epoch) > Number(best.epoch) ? row : best), null)
+        : null;
+      const chipList = [...present.map((ref) => providerChip(ref, false, !!feature, latest)), ...missing.map((ref) => providerChip(ref, true, !!feature, latest))];
+      if (feature && key !== "scrobble" && otherRefs(key).length) chipList.push(`<button type="button" class="cw-mm-provider is-more" data-ia-chip data-ia-more title="Add to another account" aria-label="Add to another account" aria-haspopup="dialog">${icon("add")}</button>`);
+      const chips = chipList.length ? `<div class="cw-mm-live-chips">${chipList.join("")}</div>` : "";
+      const empty = feature && key !== "scrobble" && state.actionPairless?.has(feature) ? "No sync pair" : "Not synced";
+      return `<div class="cw-mm-live${synced ? " is-on" : ""}${feature ? " has-actions" : ""}" data-mm-live="${esc(key)}">
+        <div class="cw-mm-live-head">${icon(symbol)}<strong>${esc(label)}</strong><span>${esc(synced ? liveSummary(key, entry) : empty)}</span></div>
         ${chips}
       </div>`;
     }).join("");
     return `<section class="cw-mm-lives"><h3>Providers</h3><div class="cw-mm-live-grid">${tiles}</div></section>`;
+  }
+
+  function removable() {
+    const presence = state.presence;
+    return !!presence && !!itemActions() && (isMovie() ? ["watchlist", "synced", "ratings", "collection"] : ["watchlist"]).some((key) => (presence[key]?.present || []).length);
   }
 
   function tabs() {
@@ -442,6 +671,44 @@
     return `<div class="cw-mm-tiles">${shown.map(([symbol, label, value]) => `<div class="cw-mm-tile" title="${esc(value)}">${icon(symbol)}<span><small>${esc(label)}</small><strong>${esc(value)}</strong></span></div>`).join("")}</div>`;
   }
 
+  const providerDisplay = (row) => {
+    const name = window.CW?.ProviderMeta?.label?.(row.provider) || row.label || row.provider;
+    const profile = row.instance !== "default" ? row.instanceLabel || row.instance : "";
+    return { name, profile, full: profile ? `${name} · ${profile}` : name };
+  };
+  const episodeCode = (row) => (row.season != null && row.episode != null ? `S${row.season}E${row.episode}` : "Episode");
+
+  function progressRowsHtml(records, episodes = false) {
+    const editable = !!itemActions() && records.some((row) => row.record?.can_mark_watched || row.record?.can_remove_progress);
+    const list = records.map((row) => {
+      const logo = window.CW?.ProviderMeta?.logoPath?.(row.provider) || "";
+      const who = providerDisplay(row);
+      const updated = Date.parse(String(row.updated || ""));
+      const meta = [episodes ? who.full : "", row.remaining ? `${runtimeLabel(Math.round(row.remaining / 60))} left` : "", Number.isFinite(updated) ? `paused ${relTime(Math.floor(updated / 1000))}` : ""].filter(Boolean).join(" · ");
+      const heading = episodes ? `${episodeCode(row)}${row.episodeTitle ? ` · ${row.episodeTitle}` : ""}` : who.full;
+      const value = Math.round(row.pct);
+      const mark = logo ? `<img src="${esc(logo)}" alt="" loading="lazy">` : `<b>${esc(who.name.slice(0, 2))}</b>`;
+      const label = `${episodes ? `${episodeCode(row)} on ` : ""}${who.full}: resume point`;
+      const logoHtml = editable
+        ? `<button type="button" class="cw-mm-progress-logo" data-ia-chip data-ia-ref="${esc(refId(row))}" data-ia-play="${esc(row.rid)}" title="${esc(label)}" aria-label="${esc(label)}" aria-haspopup="dialog">${mark}</button>`
+        : `<span class="cw-mm-progress-logo">${mark}</span>`;
+      return `<div class="cw-mm-progress-row">
+        ${logoHtml}
+        <span class="cw-mm-progress-copy"><strong>${esc(heading)}</strong><small>${esc(meta)}</small></span>
+        <span class="cw-mm-progress-mini"><i style="width:${value}%"></i></span>
+        <b>${value}%</b>
+      </div>`;
+    }).join("");
+    if (!list) return "";
+    return `<div class="cw-mm-progress-rows" data-mm-progress>${list}</div>`;
+  }
+
+  function showResumePoints() {
+    const rows = Array.isArray(state.progress) ? state.progress : [];
+    if (!rows.length) return "";
+    return `<div class="cw-mm-seasons-progress"><h5>Resume points</h5>${progressRowsHtml(rows, true)}</div>`;
+  }
+
   function movieProgressBox() {
     const history = state.presence?.synced;
     const scrobble = state.presence?.scrobble;
@@ -452,20 +719,6 @@
     const pct = best ? Math.round(best.pct) : watched ? 100 : 0;
     const watchStatus = state.presenceLoading ? "Checking watch status..." : !state.presence ? "Watch status unavailable" : "";
     const summary = best ? `<b>${pct}%</b>` : watched ? "<b>Watched</b>" : watchStatus || (rows === null ? "Checking..." : "Not started");
-    const list = records.map((row) => {
-      const logo = window.CW?.ProviderMeta?.logoPath?.(row.provider) || "";
-      const name = window.CW?.ProviderMeta?.label?.(row.provider) || row.label || row.provider;
-      const profile = row.instance !== "default" ? row.instanceLabel || row.instance : "";
-      const updated = Date.parse(String(row.updated || ""));
-      const meta = [row.remaining ? `${runtimeLabel(Math.round(row.remaining / 60))} left` : "", Number.isFinite(updated) ? `paused ${relTime(Math.floor(updated / 1000))}` : ""].filter(Boolean).join(" · ");
-      const value = Math.round(row.pct);
-      return `<div class="cw-mm-progress-row">
-        <span class="cw-mm-progress-logo">${logo ? `<img src="${esc(logo)}" alt="" loading="lazy">` : `<b>${esc(name.slice(0, 2))}</b>`}</span>
-        <span class="cw-mm-progress-copy"><strong>${esc(name)}${profile ? ` · ${esc(profile)}` : ""}</strong><small>${esc(meta)}</small></span>
-        <span class="cw-mm-progress-mini"><i style="width:${value}%"></i></span>
-        <b>${value}%</b>
-      </div>`;
-    }).join("");
     const lastEpoch = Math.max(Number(history?.last_epoch) || 0, Number(scrobble?.last_epoch) || 0);
     const lastSeen = lastEpoch ? [`Last watched ${relTime(lastEpoch)}`, dateFmt.format(new Date(lastEpoch * 1000))] : [];
     const watchline = watchStatus
@@ -478,7 +731,7 @@
       : `<div class="cw-mm-watchline">${icon("visibility")}<span class="cw-mm-watchline-copy"><strong>Not watched yet</strong><small>No synced history or scrobbles</small></span></div>`;
     return `<div class="cw-mm-box"><h4>Watch progress <small>${summary}</small></h4>
       <div class="cw-mm-progress${!best && watched ? " is-done" : ""}"><i style="width:${pct}%"></i></div>
-      ${list ? `<div class="cw-mm-progress-rows">${list}</div>` : ""}
+      ${progressRowsHtml(records)}
       ${watchline}${castStrip()}</div>`;
   }
 
@@ -506,7 +759,7 @@
       const pair = `${first}${second}`;
       main = `<div class="cw-mm-box"><h4>Watch progress <small>${numberFmt.format(watched)}/${numberFmt.format(total)} episodes <b>${pct}%</b></small></h4>
         <div class="cw-mm-progress"><i style="width:${pct}%"></i></div>
-        ${unmatchedEpisodes().length ? `<p class="cw-mm-muted">${plural(unmatchedEpisodes().length, "watched episode")} could not be matched to TMDB season numbering and ${unmatchedEpisodes().length === 1 ? "is" : "are"} excluded from progress.</p>` : pair ? `<div class="cw-mm-episodes-pair">${pair}</div>` : empty("No episode information on TMDB.")}${seasonProgress()}</div>`;
+        ${unmatchedEpisodes().length ? `<p class="cw-mm-muted">${plural(unmatchedEpisodes().length, "watched episode")} could not be matched to TMDB season numbering and ${unmatchedEpisodes().length === 1 ? "is" : "are"} excluded from progress.</p>` : pair ? `<div class="cw-mm-episodes-pair">${pair}</div>` : empty("No episode information on TMDB.")}${seasonProgress()}${showResumePoints()}</div>`;
     }
     return `<div class="cw-mm-grid-2">${main}<div class="cw-mm-stack">
       <div class="cw-mm-box"><h4>Details</h4>${detailTiles()}</div>
@@ -614,7 +867,7 @@
     const providers = [["synced", "History"], ["scrobble", "Scrobbled"]].map(([key, label]) => {
       const row = state.presence?.[key]?.episodes?.find(row => Number(row.season) === season && Number(row.episode) === episode);
       if (!row) return "";
-      return `<div><h4>${label}</h4><div class="cw-mm-live-chips">${(row.present || []).map(ref => providerChip(ref)).join("")}</div></div>`;
+      return `<div data-mm-ep-live="${key}"><h4>${label}</h4><div class="cw-mm-live-chips">${(row.present || []).map(ref => providerChip(ref, false, !!itemActions())).join("")}</div></div>`;
     }).join("");
     const details = [fmtIso(ep.air_date), runtimeLabel(ep.runtime), Number(ep.vote_average) > 0 ? `TMDB ${Number(ep.vote_average).toFixed(1)}/10` : ""].filter(Boolean);
     return `<div class="cw-ep-page">${back}<article><div class="cw-ep-intro">${ep.has_still ? `<img class="cw-ep-art" src="${esc(stillUrl(season, episode).replace("size=w300", "size=w780"))}" alt="" onerror="${placeholder}">` : ""}<div class="cw-ep-copy"><p class="cw-ep-series">${esc(state.meta?.title || state.item?.title)} <span>Season ${esc(season)} · Episode ${esc(episode)}</span></p><h2 id="cw-mm-title" tabindex="-1">${esc(ep.name || "Episode " + episode)}</h2><div class="cw-ep-meta">${details.map(value => `<span>${esc(value)}</span>`).join("")}</div><p class="cw-ep-synopsis">${esc(ep.overview || "No synopsis available for this episode yet.")}</p></div></div><section class="cw-ep-activity"><div class="cw-ep-status"><span class="cw-ep-status-icon">${icon(watched ? "check_circle" : "visibility")}</span><div><h3>Your activity</h3><p>${esc(status)}</p></div></div>${providers ? `<div class="cw-ep-providers">${providers}</div>` : ""}</section>${episodeCredits(ep)}</article></div>`;
@@ -759,6 +1012,16 @@
 
   function onClick(event) {
     const target = event.target;
+    const actionNode = target?.closest?.("[data-ia-chip],[data-ia-cover]");
+    if (actionNode) {
+      void openItemActions(actionNode);
+      return;
+    }
+    const clearAll = target?.closest?.("[data-mm-clear-all]");
+    if (clearAll) {
+      openEverything(clearAll);
+      return;
+    }
     if (target?.closest?.("[data-mm-person-back]")) {
       const view = personView;
       personView = null;

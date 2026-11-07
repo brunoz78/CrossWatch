@@ -9,7 +9,7 @@ import { providerLogoHTML, providerToneRgb, sharedFeatureOrder, sharedFeatureLab
 import { ensurePairConfigStyles } from "./styles.js";
 import { createTabsController } from "./tabs.js";
 import { createIdentityMap } from "../core/identity-map.js";
-import { collectionDisabledForPair, collectionTypesForPair, commonFeaturesForPair, featureAllowedForPair, hasCumulativeAnimeHistory, ratingsDisabledForPair, sanitizeFeaturesForPair, sourceWatchStatusAllowed, undatedAsTodayAllowed } from "./custom-rules.js";
+import { collectionDisabledForPair, collectionTypesForPair, commonFeaturesForPair, featureAllowedForPair, hasCumulativeAnimeHistory, historyRemoveAllowed, ratingsDisabledForPair, sanitizeFeaturesForPair, sourceWatchStatusAllowed, undatedAsTodayAllowed } from "./custom-rules.js";
 
 const TWO_WAY_WARNING =
   "Two-way sync means both sides can write to each other. It keeps both providers aligned, but it also heavily increases the risk of conflicts, duplicates, overwrites, and deletions. Use with extreme caution.";
@@ -106,6 +106,7 @@ function applyPairRemoveMode(features, mode){
   return features;
 }
 function isTwoWayMode(state){return !!ID("cx-mode-two")?.checked||String(state?.mode||"").toLowerCase().startsWith("two")}
+function allCopiesAllowed(state){return same(state?.dst,"jellyfin")||(isTwoWayMode(state)&&same(state?.src,"jellyfin"))}
 const DROPPED_PROVIDERS=["trakt","mdblist","simkl","wetrakr","flicklist"];
 function droppedProviders(state){return [...new Set([state?.src,state?.dst].map(p=>String(p||"").trim().toLowerCase()))].filter(p=>DROPPED_PROVIDERS.includes(p))}
 function droppedTagAllowed(state,key){
@@ -1079,7 +1080,7 @@ function applySubDisable(feature){
       "#cx-rt-add","#cx-rt-remove","#cx-rt-library-only","#cx-rt-anime-map","#cx-rt-anime-only","#cx-rt-type-all","#cx-rt-type-movies","#cx-rt-type-shows","#cx-rt-type-seasons","#cx-rt-type-episodes","#cx-rt-mode","#cx-rt-from-date","#cx-rt-specials",
       "#st-rt-liked-min","#st-rt-loved-min"
     ],
-    history: ["#plx-marked-watched", "#plx-cloud-read", "#plx-discover-fallback", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-undated-today", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped"],
+    history: ["#plx-marked-watched", "#plx-cloud-read", "#plx-discover-fallback", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-undated-today", "#cx-hs-all-copies", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
     progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance","#cx-pr-specials","#cx-pr-library-only","#cx-pr-anime-map"],
     collection:["#cx-co-add","#cx-co-remove","#cx-co-type-all","#cx-co-type-movies","#cx-co-type-shows","#cx-co-type-seasons","#cx-co-type-episodes","#cx-co-media","#cx-co-media-upd"]
@@ -1781,6 +1782,7 @@ function renderFeaturePanel(state){
         </div></div>`
       : "";
     const hsCumulative = hasCumulativeAnimeHistory(state);
+    const hsRemoveAllowed = historyRemoveAllowed(state);
     const hsSourceStatus = sourceWatchStatusAllowed(state);
     const animeOpts = normalizeAnimeHistoryOptions(state);
     const animeBlocked = !tmdbMetadataReady(state) || !globalAnimeMappingEnabled(state);
@@ -1831,11 +1833,12 @@ left.innerHTML = `
         <div class="opt-row">
           <label for="cx-hs-remove">Remove</label>
           <label class="switch">
-            <input id="cx-hs-remove" type="checkbox" ${hs.remove ? "checked" : ""}>
+            <input id="cx-hs-remove" type="checkbox" ${hs.remove && hsRemoveAllowed ? "checked" : ""} ${hsRemoveAllowed ? "" : 'disabled data-locked="1"'}>
             <span class="slider"></span>
           </label>
         </div>
       </div>
+      ${hsRemoveAllowed ? "" : `<div class="muted">Remove is not available when Tautulli or Tracearr is the source. They only import watch history.</div>`}
       ${hsCumulative && !globalAnimeMappingEnabled(state) ? `<div class="muted"><b>Enable global Anime ID Mapping for episode history.</b></div>` : ""}
       ${hsCumulative ? `<div class="muted">${hasAniList(state) ? "AniList" : [state?.src,state?.dst].some(p=>same(p,"myanimelist")) ? "MyAnimeList" : "Kitsu"} history supports both directions and is anime only. It uses watched status and episode progress per title. Remove reduces progress only for the latest watched episodes, or resets a movie to unwatched; ratings and notes are preserved. Gaps are reported unresolved. Specials and rewatches are skipped.</div>` : ""}
       <div class="muted">${rwSupported ? "Synchronize plays between providers. Rewatches require event-capable providers; SIMKL requires Pro/VIP. Remove is not recommended." : "Synchronize plays between providers. Rewatches are available only when both sides support event history; SIMKL requires Pro/VIP."}</div>
@@ -1868,6 +1871,13 @@ left.innerHTML = `
           <label for="cx-hs-undated-today" data-tip-id="cx-hs-undated-today">Undated watches as today (SIMKL)</label>
           <label class="switch">
             <input id="cx-hs-undated-today" type="checkbox" ${hs.undated_as_today ? "checked" : ""}>
+            <span class="slider"></span>
+          </label>
+        </div>` : ""}
+        ${allCopiesAllowed(state) ? `<div class="opt-row" style="grid-column:1/-1">
+          <label for="cx-hs-all-copies" data-tip-id="cx-hs-all-copies">Update all copies</label>
+          <label class="switch">
+            <input id="cx-hs-all-copies" type="checkbox" ${hs.update_all_copies ? "checked" : ""}>
             <span class="slider"></span>
           </label>
         </div>` : ""}
@@ -2363,6 +2373,7 @@ function bindChangeHandlers(state,root){
         anime_only_sync: false,
         use_source_status: !!ID("cx-hs-source-status")?.checked && sourceWatchStatusAllowed(state),
         undated_as_today: !!ID("cx-hs-undated-today")?.checked && undatedAsTodayAllowed(state),
+        update_all_copies: !!ID("cx-hs-all-copies")?.checked && allCopiesAllowed(state),
       });
       state.visited.add("history");
     }

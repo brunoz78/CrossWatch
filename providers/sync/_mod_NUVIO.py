@@ -20,14 +20,14 @@ from providers.auth._auth_NUVIO import (
     provider_block,
 )
 
-from ._mod_common import SimpleRateLimiter, build_op_result, build_session
+from ._mod_common import SimpleRateLimiter, build_op_result, build_session, make_snapshot_progress
 from .nuvio import _history as feat_history
 from .nuvio import _progress as feat_progress
 from .nuvio import _watchlist as feat_watchlist
 from .nuvio._common import pull_library_rows, pull_watch_progress_rows, pull_watched_rows
 from cw_platform.provider_instances import normalize_instance_id
 
-__VERSION__ = "0.6"
+__VERSION__ = "0.7"
 __all__ = ["get_manifest", "NUVIOModule", "OPS"]
 
 if "ctx" not in globals():
@@ -133,6 +133,7 @@ class NUVIOModule:
         except Exception:
             pass
         self.client = NuvioClient(self.config, instance_id=self.instance_id, session=session)
+        self.progress_factory = lambda feature: make_snapshot_progress(ctx, dst="NUVIO", feature=feature)
 
     @staticmethod
     def supported_features() -> dict[str, bool]:
@@ -199,11 +200,11 @@ class NUVIOModule:
     def build_index(self, feature: str, **kwargs: Any) -> dict[str, dict[str, Any]]:
         feature_name = str(feature or "").strip().lower()
         if feature_name == "progress":
-            return feat_progress.build_index(self)
+            return feat_progress.build_index(self, reporting=True)
         if feature_name == "history":
-            return feat_history.build_index(self)
+            return feat_history.sync_index(self)
         if feature_name == "watchlist":
-            return feat_watchlist.build_index(self)
+            return feat_watchlist.build_index(self, reporting=True)
         return {}
 
     def add(self, feature: str, items: Iterable[Mapping[str, Any]], *, dry_run: bool = False) -> dict[str, Any]:

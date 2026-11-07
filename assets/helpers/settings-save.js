@@ -605,6 +605,9 @@ async function saveSettings() {
 
     try { delete cfg.app_auth; } catch {}
 
+    let oidcDraft = null;
+    try { oidcDraft = _cwFn("cwAppAuthOidcDraft", window)?.() || null; } catch {}
+
     try {
       const ok = await _cwSaveAppAuth(serverCfg);
       if (!ok) return;
@@ -619,6 +622,20 @@ async function saveSettings() {
     } catch (e) {
       console.warn("saveSettings: app users save failed", e);
       if (e?.__cwAbortSave) throw e;
+    }
+
+    try {
+      const saveOidc = _cwFn("cwAppAuthOidcSavePending", window);
+      const res = saveOidc && oidcDraft ? await saveOidc(oidcDraft) : null;
+      if (res && res.ok === false) {
+        _cwShowToast(res.error || "OIDC save failed", false);
+        _cwAbortSave(res.error || "OIDC save failed");
+      }
+    } catch (e) {
+      console.warn("saveSettings: OIDC save failed", e);
+      if (e?.__cwAbortSave) throw e;
+      _cwShowToast("OIDC save failed", false);
+      _cwAbortSave("OIDC save failed");
     }
 
     try {
@@ -667,19 +684,12 @@ async function saveSettings() {
     }
 
     const prevMetaLocale = _cwNorm(serverCfg?.metadata?.locale);
-    const prevMetaTTL = Number.isFinite(serverCfg?.metadata?.ttl_hours) ? Number(serverCfg.metadata.ttl_hours) : 720;
     const metaLocaleEl = _cwEl("metadata_locale");
-    const metaTtlEl = _cwEl("metadata_ttl_hours");
     const uiMetaLocale = _cwNorm(metaLocaleEl?.value);
-    const uiMetaTTL = _cwNorm(metaTtlEl?.value);
     if (metaLocaleEl && uiMetaLocale !== prevMetaLocale) {
       const meta = ensureObj(cfg, "metadata");
       uiMetaLocale ? (meta.locale = uiMetaLocale) : delete meta.locale;
       mark();
-    }
-    if (metaTtlEl && uiMetaTTL !== "") {
-      const ttl = parseInt(uiMetaTTL, 10);
-      if (!Number.isNaN(ttl) && ttl !== prevMetaTTL) { ensureObj(cfg, "metadata").ttl_hours = Math.max(1, ttl); mark(); }
     }
 
     const normalizeUiDisplay = (value, fallbackLimit) => {
