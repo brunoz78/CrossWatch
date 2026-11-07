@@ -331,5 +331,18 @@
  "SILO",
  "Silo",
  "SILOSERVER",
- "Text"
+ "Text",
+ "/art/tmdb/movie/{0}?size=w342",
+ "/quickconnect?code={0}",
+ "Authelia",
+ "Authentik",
+ "Discord",
+ "Google",
+ "Keycloak",
+ "Microsoft",
+ "OIDC",
+ "Okta",
+ "show_tmdb={0}&page=1&page_size=250",
+ "Subject",
+ "tmdb={0}&page=1&page_size=50"
 ]
