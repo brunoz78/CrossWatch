@@ -177,7 +177,12 @@ jobs:
           LAST: ${{ steps.decide.outputs.last }}
           UPTAG: ${{ steps.merge.outputs.tag }}
         run: |
-          SINCE=${LAST:+^$LAST}
+          # Only one build per version: a new build replaces older ones of the same version,
+          # and its notes cover every fork change since the previous version.
+          BASE="v${UPTAG#v}"
+          OLD=$(git tag -l "$BASE.post*")
+          PREV=$(git tag -l 'v*.post*' --sort=-creatordate | grep -v "^$BASE\.post" | head -1)
+          SINCE=${PREV:+^$PREV}
           # Notes of the original release, translated to German when an API key is set.
           gh api "repos/cenodude/CrossWatch/releases/tags/$UPTAG" -q .body > upstream.md || : > upstream.md
           git log --no-merges --format='- %s' HEAD $SINCE ^"upstream-$UPTAG" | head -40 > fork.txt
@@ -186,3 +191,6 @@ jobs:
           git tag "$TAG"
           git push origin "$TAG"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" dist/* --title "CrossWatch $TAG" --notes-file notes.md
+          for OLDTAG in $OLD; do
+            gh release delete "$OLDTAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          done
