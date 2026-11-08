@@ -172,24 +172,17 @@ jobs:
         if: steps.decide.outputs.release == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TAG: ${{ steps.build.outputs.tag }}
           LAST: ${{ steps.decide.outputs.last }}
           UPTAG: ${{ steps.merge.outputs.tag }}
         run: |
           SINCE=${LAST:+^$LAST}
-          {
-            echo "Wöchentlicher Stand: Original cenodude/CrossWatch $UPTAG mit deutscher Oberfläche und Sicherheits-Ergänzungen."
-            echo
-            echo "**Aktualisieren:** Glocke in CrossWatch → «Jetzt aktualisieren», oder \`update\` in der Konsole des Containers."
-            if [ -n "$LAST" ]; then
-              echo
-              echo "### Neu im Original (bis $UPTAG)"
-              git log --no-merges --format='- %s ([%h](https://github.com/cenodude/CrossWatch/commit/%H))' "upstream-$UPTAG" $SINCE | head -80
-            fi
-            echo
-            echo "### Neu im Fork"
-            git log --no-merges --format='- %s' HEAD $SINCE ^"upstream-$UPTAG" | head -40
-          } > notes.md
+          # Notes of the original release, translated to German when an API key is set.
+          gh api "repos/cenodude/CrossWatch/releases/tags/$UPTAG" -q .body > upstream.md || : > upstream.md
+          git log --no-merges --format='- %s' HEAD $SINCE ^"upstream-$UPTAG" | head -40 > fork.txt
+          if [ -n "$ANTHROPIC_API_KEY" ]; then pip install --quiet anthropic; fi
+          python tools/release_notes.py "$UPTAG" upstream.md fork.txt > notes.md
           git tag "$TAG"
           git push origin "$TAG"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" dist/* --title "CrossWatch $TAG" --notes-file notes.md
