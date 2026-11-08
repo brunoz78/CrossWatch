@@ -470,14 +470,14 @@ function bundleKey(s) {
             </div>
             <div id="ss-list" class="ss-list"></div>
             <div id="ss-list-footer" class="ss-row" style="justify-content:space-between;margin:10px 0 14px"></div>
-            <div id="ss-bulk" class="ss-bulk" hidden>
-              <span class="ss-bulk-count"><strong data-ss-count>0</strong><span>selected</span></span>
-              <button class="ss-bulk-btn" type="button" data-ss-bulk="visible"><span class="material-symbols-rounded" aria-hidden="true">select_all</span>Visible</button>
-              <button class="ss-bulk-btn" type="button" data-ss-bulk="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>
-              <span class="ss-bulk-actions">
-                <button class="ss-bulk-btn" type="button" data-ss-bulk="compare" title="Compare two captures"><span class="material-symbols-rounded" aria-hidden="true">compare_arrows</span>Compare</button>
-                <button class="ss-bulk-btn" type="button" data-ss-bulk="export"><span class="material-symbols-rounded" aria-hidden="true">download</span>Export</button>
-                <button class="ss-bulk-btn danger" type="button" data-ss-bulk="delete"><span class="material-symbols-rounded" aria-hidden="true">delete</span>Delete</button>
+            <div id="ss-bulk" class="ss-bulk cw-selection-bar" role="group" aria-label="Selected captures" hidden>
+              <span class="cw-selection-count" aria-live="polite"><span class="material-symbols-rounded" aria-hidden="true">check_box_outline_blank</span><strong data-ss-count>0</strong><span>selected</span></span>
+              <button class="cw-selection-button" type="button" data-ss-bulk="visible"><span class="material-symbols-rounded" aria-hidden="true">visibility</span>Visible</button>
+              <button class="cw-selection-button" type="button" data-ss-bulk="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>
+              <span class="cw-selection-actions">
+                <button class="cw-selection-button" type="button" data-ss-bulk="compare" title="Compare two captures"><span class="material-symbols-rounded" aria-hidden="true">compare_arrows</span>Compare</button>
+                <button class="cw-selection-button" type="button" data-ss-bulk="export"><span class="material-symbols-rounded" aria-hidden="true">download</span>Export</button>
+                <button class="cw-selection-button is-danger" type="button" data-ss-bulk="delete"><span class="material-symbols-rounded" aria-hidden="true">delete</span>Delete</button>
               </span>
             </div>
           </div>
@@ -501,6 +501,7 @@ function bundleKey(s) {
               <select id="ss-restore-mode" class="input hidden" aria-hidden="true"><option value="merge">Merge missing only</option><option value="clear_restore">Replace exactly</option></select>
               <div id="ss-restore-warning" class="ss-restore-warning hidden">Replace exactly clears the target feature first, then restores this capture.</div>
             </div>
+            <div id="ss-restore-statuses" class="ss-small ss-muted hidden">Supported title statuses are restored in both modes. Planned follows Watchlist.</div>
             <div class="ss-row" style="margin-top:12px"><button id="ss-restore" class="btn danger cw-danger-confirm" style="width:100%" type="button"><span class="material-symbols-rounded" aria-hidden="true">restore</span><span>Restore capture</span></button></div>
             <div id="ss-restore-progress" class="ss-progress hidden"><div class="ss-pbar"></div><div class="ss-plabel">Working...</div></div>
             <div id="ss-restore-out" class="ss-small ss-muted" style="margin-top:10px"></div>
@@ -961,7 +962,8 @@ function bundleKey(s) {
     const picks = Array.isArray(state.diffPick) ? state.diffPick.filter(Boolean) : [];
     bar.hidden = picks.length === 0;
     const label = $("[data-ss-count]", bar);
-    if (label) label.textContent = String(picks.length);
+    if (label && picks.length) label.textContent = String(picks.length);
+    window.CW?.SelectionBar?.update(bar, picks.length);
     const compare = compareSelectionState();
     $$("[data-ss-bulk]", bar).forEach((btn) => {
       const isCompare = btn.dataset.ssBulk === "compare";
@@ -1061,6 +1063,10 @@ function bundleKey(s) {
     const p = _providerById(pid);
     const instMeta = Array.isArray(p?.instances) ? p.instances.find((x) => String(x?.id || "") === targetInst) : null;
     const instOk = instMeta ? !!instMeta.configured : true;
+    const hasStatuses = Number(state.selectedSnap?.stats?.title_statuses || 0) > 0;
+    $("#ss-restore-statuses", page)?.classList.toggle("hidden", !hasStatuses);
+    const mergeHint = $('[data-restore-mode="merge"] span', page);
+    if (mergeHint) mergeHint.textContent = hasStatuses ? "Add items + restore statuses" : "Only add items";
 
     b.disabled = state.busy || !state.selectedPath || !instOk;
     b.title = !state.selectedPath ? "Select a snapshot first" : (!instOk ? "Target instance not configured" : "");
@@ -1685,6 +1691,7 @@ function renderSelected() {
       </div>
       <div class="ss-selected-meta">
         <div class="ss-selected-kv"><b>Captured</b> ${escapeHtml(created)}</div>
+        ${stats.title_statuses != null ? `<div class="ss-selected-kv"><b>Title statuses</b> ${Number(stats.title_statuses)} captured</div>` : ``}
       </div>
       ${selectedStats ? `<div class="ss-selected-stats">${selectedStats}</div>` : ``}
     `;
@@ -2256,7 +2263,7 @@ function renderSelected() {
       const res = progress.restore_result || progress.result || {};
       const out = $("#ss-restore-out", page);
       if (out) {
-        if (res.ok) out.textContent = `Done. Added ${res.added || 0}, removed ${res.removed || 0}.`;
+        if (res.ok) out.textContent = res.message || `Done. Added ${res.added || 0}, removed ${res.removed || 0}.`;
         else out.textContent = `Restore finished with errors: ${(res.errors || []).join("; ") || "unknown error"}`;
       }
 

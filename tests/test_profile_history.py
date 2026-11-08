@@ -109,8 +109,8 @@ def test_synced_history_counts_rewatches_once_per_viewing() -> None:
     trakt = {f"tmdb:603@{epoch}": _movie(603, "The Matrix", 1999, value) for epoch, value in watches.items()}
     simkl = {"tmdb:603": _movie(603, "The Matrix", 1999, "2026-03-01T19:32:00Z")}
     state = {"providers": {"TRAKT": _history(trakt), "SIMKL": _history(simkl), "PLEX": _history({"tmdb:20": KUSAMA})}}
-    payload = profile_history.build_history_payload(
-        profile_history.build_history_index("synced", state=state, tracker_items={}), resolve_art=False)
+    index = profile_history.build_history_index("synced", state=state, tracker_items={})
+    payload = profile_history.build_history_payload(index, resolve_art=False)
 
     kusama, matrix = payload["items"]
     assert matrix["watch_count"] == 3
@@ -119,6 +119,12 @@ def test_synced_history_counts_rewatches_once_per_viewing() -> None:
     assert "watch_epochs" not in kusama
     assert payload["stats"]["plays"] == 2
     assert payload["stats"]["watches"] == 4
+    presence = profile_history.title_presence(index, "movie", 603)
+    assert presence is not None
+    assert presence["count"] == matrix["watch_count"]
+    assert presence["last_epoch"] == matrix["sort_epoch"]
+    assert presence["present"] == matrix["present"]
+    assert profile_history.title_presence(index, "movie", 20)["count"] == 1
 
 
 def test_synced_history_keeps_same_title_shows_apart() -> None:
@@ -244,6 +250,41 @@ def test_ratings_filter_by_score_and_conflict() -> None:
     assert titles(rating="10") == ["Pulp Fiction"]
     assert titles(coverage="partial") == ["The Matrix", "Pulp Fiction"]
     assert titles(provider="trakt") == ["Heat"]
+
+
+@pytest.mark.parametrize("score,agree", [(8, True), (7, False)])
+def test_rounded_ratings_keep_raw_scores_and_update_conflict_surfaces(score, agree):
+    state = {"providers": {
+        "CROSSWATCH": _ratings({"tmdb:949": {**HEAT, "rating": 7.5}}),
+        "SIMKL": _ratings({"tmdb:949": {**HEAT, "rating": score}}),
+    }}
+    index = profile_history.build_history_index("ratings", state=state, tracker_items={})
+    payload = profile_history.build_history_payload(index, resolve_art=False)
+    item = payload["items"][0]
+    assert item["agree"] is agree
+    assert item["rating_adjusted"] is agree
+    assert {ref["provider"]: ref["rating"] for ref in item["present"]} == {"CROSSWATCH": 7.5, "SIMKL": score}
+    assert payload["stats"]["mismatch"] == (0 if agree else 1)
+    filtered = profile_history.build_history_payload(index, coverage="mismatch", resolve_art=False)
+    assert filtered["total"] == (0 if agree else 1)
+    presence = profile_history.title_presence(index, "movie", 949)
+    assert presence["agree"] is agree
+    assert presence["rating_adjusted"] is agree
+
+
+def test_profile_api_uses_instance_settings_for_rating_comparison(monkeypatch):
+    cfg = {"stremio": {"instances": {"second": {"ratings": {"liked_min": 6, "loved_min": 9}}}}}
+    state = {"providers": {
+        "CROSSWATCH": _ratings({"tmdb:949": {**HEAT, "rating": 8}}),
+        "STREMIO": {"instances": {"second": _ratings({"tmdb:949": {**HEAT, "rating": 6}})}},
+    }}
+    monkeypatch.setattr(profileAPI, "_ratings_state", lambda: state)
+    monkeypatch.setattr(profileAPI, "_tracker_feature_items", lambda _: {})
+    monkeypatch.setattr(profileAPI, "_dashboard_widgets_version", lambda *_, **__: "")
+    payload = profileAPI.build_profile_history_payload(cfg, source="ratings")
+    assert len(payload["items"][0]["present"]) == 2
+    assert payload["items"][0]["agree"] is True
+    assert payload["items"][0]["rating_adjusted"] is True
 
 
 def test_history_index_is_built_once_per_cache_key() -> None:

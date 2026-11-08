@@ -107,6 +107,7 @@ except Exception:
     ctx = None  # type: ignore[assignment]
 
 __VERSION__ = "2.0"
+_MANUAL_RATING_SCALE = {"step": 1}
 __all__ = ["get_manifest", "TRAKTModule", "OPS"]
 
 os.environ.setdefault("CW_TRAKT_UA", http_user_agent("TRAKT", override_env="CW_TRAKT_UA"))
@@ -190,6 +191,7 @@ def get_manifest() -> Mapping[str, Any]:
             "provides_ids": True,
             "index_semantics": "present",
             "ratings": {
+                "manual_scale": _MANUAL_RATING_SCALE,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "unrate": True,
@@ -233,11 +235,9 @@ class TRAKTConfig:
     rate_post_per_sec: float = 1.0
     watchlist_batch_size: int = 100
     ratings_per_page: int = 250
-    ratings_max_pages: int = 50
     ratings_chunk_size: int = 100
     history_per_page: int = 250
     progress_per_page: int = 250
-    history_max_pages: int = 10000
     history_chunk_size: int = 100
     history_collection: bool = False
     history_collection_types: list[str] | None = None
@@ -345,13 +345,14 @@ class TRAKTClient:
             self._try_refresh()
 
     def _do(self, method: str, url: str, **kw: Any):
+        max_retries = kw.pop("max_retries", self.cfg.max_retries)
         self._preflight()
         r = request_with_retries(
             self.session,
             method,
             url,
             timeout=self.cfg.timeout,
-            max_retries=self.cfg.max_retries,
+            max_retries=max_retries,
             **kw,
         )
         if r.status_code in (401, 403):
@@ -361,7 +362,7 @@ class TRAKTClient:
                     method,
                     url,
                     timeout=self.cfg.timeout,
-                    max_retries=self.cfg.max_retries,
+                    max_retries=max_retries,
                     **kw,
                 )
         return r
@@ -425,11 +426,9 @@ class TRAKTModule:
             rate_post_per_sec=rate_post,
             watchlist_batch_size=int(t.get("watchlist_batch_size", 100) or 100),
             ratings_per_page=int(t.get("ratings_per_page", 250) or 250),
-            ratings_max_pages=int(t.get("ratings_max_pages", 50) or 50),
             ratings_chunk_size=int(t.get("ratings_chunk_size", 100) or 100),
             history_per_page=int(t.get("history_per_page", 250) or 250),
             progress_per_page=int(t.get("progress_per_page", 250) or 250),
-            history_max_pages=int(t.get("history_max_pages", 10000) or 10000),
             history_chunk_size=int(t.get("history_chunk_size", 100) or 100),
             history_collection=bool(t.get("history_collection")),
             history_collection_types=types or None,
@@ -780,6 +779,7 @@ class _TraktOPS:
             "provides_ids": True,
             "index_semantics": "present",
             "ratings": {
+                "manual_scale": _MANUAL_RATING_SCALE,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "unrate": True,

@@ -10,9 +10,36 @@
     return dt;
   };
 
+  function createDateTimeEditor(row, ctx = {}) {
+    const dt = DT();
+    const field = ctx.state.kind === "history" ? "watched_at" : "collected_at";
+    const input = document.createElement("input");
+    input.type = "datetime-local";
+    input.step = 1;
+    input.className = "cw-input cw-timestamp-input";
+    input.value = dt.localInput(row.raw && row.raw[field]);
+    input.title = "Local time; saved in UTC";
+    input.onclick = () => {
+      try { input.showPicker?.(); } catch {}
+    };
+    input.onchange = () => {
+      if (!input.checkValidity()) return;
+      const value = dt.dateTimeInputToIso(input.value, row.raw && row.raw[field]);
+      if (value === (row.raw[field] || null)) return;
+      row.raw[field] = value;
+      ctx.finishExtraChange(row, input, () => {});
+    };
+    return input;
+  }
+
   function updateExtraDisplay(row, el, ctx = {}) {
     const state = ctx.state || {};
     const dt = DT();
+    if (el.type === "datetime-local") {
+      const field = state.kind === "history" ? "watched_at" : "collected_at";
+      el.value = dt.localInput(row.raw && row.raw[field]);
+      return;
+    }
     let label = "";
     let placeholder = "";
     let icon = "";
@@ -76,30 +103,12 @@
     const dt = DT();
     ctx.openPopup(anchor, (pop, close) => {
       ctx.appendPopupTitle(pop, "Watched at");
-      const grid = document.createElement("div");
-      grid.className = "cw-datetime-grid";
-
-      const dateInput = document.createElement("input");
-      dateInput.type = "date";
-      dateInput.id = "cw_history_date";
-      dateInput.name = dateInput.id;
-      const timeInput = document.createElement("input");
-      timeInput.type = "time";
-      timeInput.id = "cw_history_time";
-      timeInput.name = timeInput.id;
-      timeInput.step = 60;
-
-      dt.fillDateTimeInputs?.(row.raw && row.raw.watched_at, dateInput, timeInput);
-
-      grid.appendChild(dateInput);
-      grid.appendChild(timeInput);
-      pop.appendChild(grid);
-      dt.appendUtcHint?.(pop);
+      const dateInput = dt.appendDateTimeInput(pop, row.raw && row.raw.watched_at, "Watched at");
 
       ctx.appendPopupActions(pop, [
         { label: "Clear", kind: "ghost", onClick: () => { row.raw.watched_at = null; ctx.finishExtraChange(row, displayEl, close); } },
         { label: "Close", kind: "ghost", onClick: close },
-        { label: "Save", kind: "primary", onClick: () => { row.raw.watched_at = dt.dateTimeInputsToIso?.(dateInput.value, timeInput.value) || null; ctx.finishExtraChange(row, displayEl, close); } },
+        { label: "Save", kind: "primary", onClick: () => { row.raw.watched_at = dt.dateTimeInputToIso(dateInput.value, row.raw.watched_at) || null; ctx.finishExtraChange(row, displayEl, close); } },
       ]);
 
       dateInput.focus();
@@ -110,30 +119,12 @@
     const dt = DT();
     ctx.openPopup(anchor, (pop, close) => {
       ctx.appendPopupTitle(pop, "Collected at");
-      const grid = document.createElement("div");
-      grid.className = "cw-datetime-grid";
-
-      const dateInput = document.createElement("input");
-      dateInput.type = "date";
-      dateInput.id = "cw_collection_date";
-      dateInput.name = dateInput.id;
-      const timeInput = document.createElement("input");
-      timeInput.type = "time";
-      timeInput.id = "cw_collection_time";
-      timeInput.name = timeInput.id;
-      timeInput.step = 60;
-
-      dt.fillDateTimeInputs?.(row.raw && row.raw.collected_at, dateInput, timeInput);
-
-      grid.appendChild(dateInput);
-      grid.appendChild(timeInput);
-      pop.appendChild(grid);
-      dt.appendUtcHint?.(pop);
+      const dateInput = dt.appendDateTimeInput(pop, row.raw && row.raw.collected_at, "Collected at");
 
       ctx.appendPopupActions(pop, [
         { label: "Clear", kind: "ghost", onClick: () => { row.raw.collected_at = null; ctx.finishExtraChange(row, displayEl, close); } },
         { label: "Close", kind: "ghost", onClick: close },
-        { label: "Save", kind: "primary", onClick: () => { row.raw.collected_at = dt.dateTimeInputsToIso?.(dateInput.value, timeInput.value) || null; ctx.finishExtraChange(row, displayEl, close); } },
+        { label: "Save", kind: "primary", onClick: () => { row.raw.collected_at = dt.dateTimeInputToIso(dateInput.value, row.raw.collected_at) || null; ctx.finishExtraChange(row, displayEl, close); } },
       ]);
 
       dateInput.focus();
@@ -182,18 +173,7 @@
 
       ctx.appendPopupTitle(pop, "Updated at", "10px");
 
-      const whenGrid = document.createElement("div");
-      whenGrid.className = "cw-datetime-grid";
-
-      const dateInput = makeInput("date");
-      const timeInput = makeInput("time", { step: 60 });
-
-      dt.fillDateTimeInputs?.(row.raw && row.raw.progress_at, dateInput, timeInput);
-
-      whenGrid.appendChild(dateInput);
-      whenGrid.appendChild(timeInput);
-      pop.appendChild(whenGrid);
-      dt.appendUtcHint?.(pop);
+      const dateInput = dt.appendDateTimeInput(pop, row.raw && row.raw.progress_at, "Updated at");
 
       const saveProgress = () => {
         const posMs = dt.parseTimeToMs ? dt.parseTimeToMs(posInput.value) : null;
@@ -205,7 +185,7 @@
         row.raw.progress_percent = row.raw.progress_ms != null && row.raw.duration_ms != null
           ? Math.round((row.raw.progress_ms / row.raw.duration_ms) * 1000) / 10
           : percent;
-        row.raw.progress_at = dt.dateTimeInputsToIso?.(dateInput.value, timeInput.value) || null;
+        row.raw.progress_at = dt.dateTimeInputToIso(dateInput.value, row.raw.progress_at) || null;
         if (!row.raw.progress_at && (row.raw.progress_ms != null || row.raw.progress_percent != null)) row.raw.progress_at = new Date().toISOString().replace(/\.\d{3}Z$/, ".000Z");
         ctx.finishExtraChange(row, displayEl, close);
       };
@@ -228,26 +208,100 @@
   }
 
   function openRatingEditor(row, anchor, displayEl, ctx = {}) {
+    const dt = DT();
     ctx.openPopup(anchor, (pop, close) => {
       ctx.appendPopupTitle(pop, "Rating");
 
-      const grid = document.createElement("div");
-      grid.className = "cw-rating-grid";
       const current = row.raw && row.raw.rating != null ? Number(row.raw.rating) : null;
+      const scale = ctx.state?.ratingScale;
+      const selected = current == null ? null : scale?.bands
+        ? scale.bands.find(band => current >= band.min && current < band.max)?.value
+        : scale?.round_step ? Math.max(scale.values[0], Math.min(scale.values.at(-1), Math.floor(current / scale.round_step + 0.5) * scale.round_step)) : current;
 
-      for (let i = 1; i <= 10; i += 1) {
+      const values = scale?.values || [];
+      const half = !scale?.labels && values.some(value => !Number.isInteger(value * scale.display_factor));
+      const slots = scale?.labels || !values.length ? values : Array.from({length: scale.max * (half ? 2 : 1)}, (_, i) => (i + 1) / (half ? 2 : 1) / scale.display_factor);
+      const ratingLabel = value => value == null ? "Not rated" : scale?.labels?.[value] || `${value * (scale?.display_factor ?? 1)}/${scale?.max ?? 10}`;
+      const wrapper = document.createElement("div");
+      wrapper.className = "cw-editor-rating";
+      const scoreSummary = document.createElement("div");
+      scoreSummary.className = "cw-editor-rating-summary";
+      const score = document.createElement("strong");
+      score.textContent = ratingLabel(selected);
+      score.setAttribute("data-editor-rating-value", "");
+      scoreSummary.append(score, Object.assign(document.createElement("span"), {textContent: "Your rating"}));
+      const grid = document.createElement("div");
+      grid.className = scale?.labels ? "cw-rating-grid" : `cw-editor-stars${half ? " is-half" : ""}`;
+      grid.setAttribute("style", `--mw-rating-slots:${slots.length || 10}`);
+      grid.setAttribute("role", "group");
+      grid.setAttribute("aria-label", "Rating");
+      const buttons = [];
+      const preview = value => {
+        score.textContent = ratingLabel(value);
+        buttons.forEach((button, index) => {
+          const i = slots[index];
+          button.className = scale?.labels ? `cw-rating-pill${value === i ? " active" : ""}` : `cw-editor-star${half && Number.isInteger(i * scale.display_factor) ? " is-right" : ""}${value != null && i <= value ? " is-lit" : ""}`;
+        });
+      };
+      for (const i of slots) {
         const pill = document.createElement("button");
         pill.type = "button";
-        pill.className = "cw-rating-pill" + (current === i ? " active" : "");
-        pill.textContent = String(i);
+        pill.disabled = !values.includes(i);
+        pill.setAttribute("data-editor-rating", String(i));
+        pill.setAttribute("aria-label", `Rate ${ratingLabel(i)}`);
+        pill.setAttribute("aria-pressed", String(selected === i));
+        if (scale.labels) pill.textContent = scale.labels[i];
+        else {
+          const star = document.createElement("span");
+          star.className = "material-symbols-rounded";
+          star.textContent = "star";
+          star.setAttribute("aria-hidden", "true");
+          pill.appendChild(star);
+        }
+        pill.onpointerenter = event => { if (!pill.disabled && event.pointerType !== "touch") preview(i); };
+        pill.onfocus = () => preview(i);
+        pill.onkeydown = event => {
+          if (!["ArrowLeft", "ArrowDown", "ArrowRight", "ArrowUp", "Home", "End"].includes(event.key)) return;
+          event.preventDefault();
+          const enabled = buttons.filter(button => !button.disabled);
+          const index = enabled.indexOf(pill);
+          const next = event.key === "Home" ? 0 : event.key === "End" ? enabled.length - 1 : Math.max(0, Math.min(enabled.length - 1, index + (["ArrowLeft", "ArrowDown"].includes(event.key) ? -1 : 1)));
+          enabled[next]?.focus();
+        };
         pill.onclick = () => {
+          if (pill.disabled) return;
           row.raw.rating = i;
+          if (dateInput.value !== initialDate) {
+            row.raw.rated_at = dt.dateTimeInputToIso(dateInput.value, row.raw.rated_at);
+          }
           ctx.finishExtraChange(row, displayEl, close);
         };
+        buttons.push(pill);
         grid.appendChild(pill);
       }
-
-      pop.appendChild(grid);
+      grid.onpointerleave = () => preview(selected);
+      grid.onfocusout = event => { if (!grid.contains(event.relatedTarget)) preview(selected); };
+      preview(selected);
+      wrapper.append(scoreSummary, grid);
+      pop.appendChild(wrapper);
+      if (!scale?.values?.length) {
+        const message = document.createElement("p");
+        message.textContent = "Select a provider with rating support to choose a score.";
+        pop.appendChild(message);
+      }
+      const dates = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "Rated at";
+      dates.appendChild(summary);
+      const dateInput = dt.appendDateTimeInput(dates, row.raw && row.raw.rated_at, "Rated at");
+      const initialDate = dateInput.value;
+      ctx.appendPopupActions(dates, [
+        { label: "Save date", kind: "primary", onClick: () => {
+          row.raw.rated_at = dt.dateTimeInputToIso(dateInput.value, row.raw.rated_at);
+          ctx.finishExtraChange(row, displayEl, close);
+        } },
+      ]);
+      pop.appendChild(dates);
       ctx.appendPopupActions(pop, [
         { label: "Clear", kind: "ghost", onClick: () => { row.raw.rating = null; ctx.finishExtraChange(row, displayEl, close); } },
         { label: "Close", kind: "ghost", onClick: close },
@@ -256,6 +310,7 @@
   }
 
   Editor.ExtraEditors = {
+    createDateTimeEditor,
     updateExtraDisplay,
     openHistoryEditor,
     openCollectionEditor,

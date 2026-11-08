@@ -75,7 +75,7 @@
   const statusCacheKey = () => `${STATUS_CACHE_KEY}.${String(window.CW?.OverviewProfile?.id || "").trim() || "all"}`;
   const DETAILS_MAX_LINES = 300;
   const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
-  const ROUTE_TABS = new Set(["main", "snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
+  const ROUTE_TABS = new Set(["main", "snapshots", "capture_compare", "playlists", "tracker", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
   const SETTINGS_PANES = new Set(["overview", "providers", "sync", "scrobbler", "scheduling", "app", "maintenance"]);
   let routeSyncing = false;
 
@@ -101,6 +101,7 @@
     const perms = auth?.permissions || {};
     if (normalized === "main") return perms.dashboard !== false;
     if (normalized === "settings") return perms.write === true && !!document.getElementById("page-settings");
+    if (normalized === "tracker") return perms.write === true && !!document.getElementById("page-tracker");
     if (["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync"].includes(normalized)) return perms.write === true;
     return false;
   }
@@ -144,6 +145,7 @@
     if (tab === "capture_compare") return "#capture_compare" + (window.location.hash.startsWith("#capture_compare?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
     if (tab === "events") return "#events" + (window.location.hash.startsWith("#events?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
     if (tab === "maintenance") return "#maintenance" + (window.location.hash.startsWith("#maintenance?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
+    if (tab === "tracker") return "#tracker" + (window.location.hash.startsWith("#tracker?") ? window.location.hash.slice(window.location.hash.indexOf("?")) : "");
     if (tab === "main") return "";
     if (tab === "settings") {
       const settingsPane = normalizeSettingsPane(pane || window.__cwSettingsPane || "overview");
@@ -209,6 +211,18 @@
   }
 
   function hasSiloConfig(root) {
+    if (!root || typeof root !== "object") return false;
+    const match = (block) => {
+      if (!block || typeof block !== "object") return false;
+      return hasValue(block.server_url) && hasValue(block.profile_id) && (hasValue(block.access_token) || hasValue(block.refresh_token)) && block.auth_error !== "reconnect_required";
+    };
+    if (match(root)) return true;
+    const instances = root.instances;
+    if (!instances || typeof instances !== "object") return false;
+    return Object.values(instances).some(match);
+  }
+
+  function hasTofaConfig(root) {
     if (!root || typeof root !== "object") return false;
     const match = (block) => {
       if (!block || typeof block !== "object") return false;
@@ -311,6 +325,7 @@
 
     if ([cfg?.nuvio, cfg?.auth?.nuvio].some(hasNuvioConfig)) set.add("NUVIO");
     if ([cfg?.silo].some(hasSiloConfig)) set.add("SILO");
+    if ([cfg?.tofa].some(hasTofaConfig)) set.add("TOFA");
     if ([cfg?.kodi, cfg?.auth?.kodi].some(hasKodiConfig)) set.add("KODI");
     if ([cfg?.floppy, cfg?.auth?.floppy].some(hasFloppyConfig)) set.add("FLOPPY");
     if ([cfg?.scrob, cfg?.auth?.scrob].some(hasScrobConfig)) set.add("SCROB");
@@ -921,7 +936,7 @@
   }
 
   function setTabHeaderState(tab) {
-    ["main", "snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "maintenance", "settings"].forEach((name) => {
+    ["main", "snapshots", "capture_compare", "playlists", "tracker", "editor", "analyzer", "events", "logs", "import_export", "maintenance", "settings"].forEach((name) => {
       byId(`tab-${name}`)?.classList.toggle("active", name === tab || (name === "snapshots" && tab === "capture_compare"));
     });
   }
@@ -934,6 +949,7 @@
     byId("page-snapshots")?.classList.toggle("hidden", tab !== "snapshots");
     byId("page-capture_compare")?.classList.toggle("hidden", tab !== "capture_compare");
     byId("page-playlists")?.classList.toggle("hidden", tab !== "playlists");
+    byId("page-tracker")?.classList.toggle("hidden", tab !== "tracker");
     byId("page-editor")?.classList.toggle("hidden", tab !== "editor");
     byId("page-analyzer")?.classList.toggle("hidden", tab !== "analyzer");
     byId("page-maintenance")?.classList.toggle("hidden", tab !== "maintenance");
@@ -983,7 +999,7 @@
       const perms = auth?.permissions || {};
       const dashboardAllowed = perms.dashboard !== false;
       const writeAllowed = perms.write === true;
-      if (!(tab === "main" && dashboardAllowed) && !(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export"].includes(tab) && writeAllowed) && !(tab === "settings" && writeAllowed && byId("page-settings"))) tab = allowedRouteTab(tab);
+      if (!(tab === "main" && dashboardAllowed) && !(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export"].includes(tab) && writeAllowed) && !(["settings", "tracker"].includes(tab) && writeAllowed && byId(`page-${tab}`))) tab = allowedRouteTab(tab);
     }
     writeRouteHash(tab);
 
@@ -1056,6 +1072,21 @@
         }
       }
       if (!isCurrentNavigation()) return;
+      return;
+    }
+
+    if (tab === "tracker") {
+      try {
+        await ensurePageModule("tracker", "/assets/js/tracker.js", "TrackerPage");
+        if (!isCurrentNavigation()) return;
+        await window.TrackerPage?.mount?.(byId("page-tracker"));
+      } catch (e) {
+        console.warn("Tracker load failed:", e);
+        const root = byId("page-tracker");
+        if (root && !root.children.length) {
+          root.innerHTML = '<div class="cw-page-load-error">The tracker failed to load. Refresh the page and try again.</div>';
+        }
+      }
       return;
     }
 

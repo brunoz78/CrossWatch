@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 import io
 import json
+import shutil
 import zipfile
 
 import api.providerInstancesAPI as provider_api
@@ -22,6 +23,7 @@ import api.scrobbleAPI as scrobble_api
 import services.editor as editor_service
 import services.export as export_service
 import cw_platform.tracker_storage as tracker_storage
+from cw_platform.tracker_store import TrackerStore
 from cw_platform.orchestrator._state_store import StateStore
 import cw_platform.provider_instances as provider_instances
 from cw_platform.provider_instances import build_pair_config_view, get_provider_block
@@ -1178,8 +1180,8 @@ def test_tracker_archive_json_import_uses_crosswatch_profile_snapshot_dir(tmp_pa
     )
 
     assert stats["target"] == "snapshot"
-    assert (root / "profiles" / "CW-P04" / "snapshots" / "20260101T000000Z-watchlist.json").exists()
-    assert not (root / "snapshots" / "20260101T000000Z-watchlist.json").exists()
+    assert [p.name for p in TrackerStore(root / "profiles" / "CW-P04").restore_points("watchlist")] == ["20260101T000000Z-watchlist.json"]
+    assert TrackerStore(root).restore_points("watchlist") == []
 
 
 def test_tracker_archive_ignores_unconfigured_profile_path_input(tmp_path: Path, monkeypatch) -> None:
@@ -1196,7 +1198,7 @@ def test_tracker_archive_ignores_unconfigured_profile_path_input(tmp_path: Path,
     )
 
     assert stats["target"] == "state"
-    assert (root / "watchlist.json").exists()
+    assert TrackerStore(root).read_current("watchlist")["items"] == {"movie:x": {"title": "X"}}
     assert not outside.exists()
 
 
@@ -1522,8 +1524,7 @@ def test_maintenance_tracker_archive_exports_and_imports_profile_storage(tmp_pat
             "snapshots/20260101T000000Z-watchlist.json",
         }
 
-    for path in profile_root.rglob("*.json"):
-        path.unlink()
+    shutil.rmtree(profile_root)
 
     imported = client.post(
         "/api/maintenance/crosswatch-tracker/import",
@@ -1534,9 +1535,10 @@ def test_maintenance_tracker_archive_exports_and_imports_profile_storage(tmp_pat
     assert imported["ok"] is True
     assert imported["states"] == 2
     assert imported["snapshots"] == 1
-    assert (profile_root / "watchlist.json").exists()
-    assert (profile_root / "progress.json").exists()
-    assert (snapshot_root / "20260101T000000Z-watchlist.json").exists()
+    store = TrackerStore(profile_root)
+    assert store.read_current("watchlist")["items"] == {"tmdb:1": {"title": "One"}}
+    assert store.read_current("progress")["items"] == {"tmdb:2": {"title": "Two"}}
+    assert [p.name for p in store.restore_points("watchlist")] == ["20260101T000000Z-watchlist.json"]
 
 
 def test_crosswatch_profile_delete_removes_profile_storage(tmp_path: Path, monkeypatch) -> None:
@@ -1695,7 +1697,7 @@ def test_crosswatch_connect_creates_connection_config(monkeypatch) -> None:
     assert store["crosswatch"]["connected"] is True
     assert store["crosswatch"]["retention_days"] == 30
     assert store["crosswatch"]["auto_snapshot"] is True
-    assert store["crosswatch"]["max_snapshots"] == 64
+    assert store["crosswatch"]["max_snapshots"] == 14
 
 
 def test_crosswatch_explicitly_disconnected_config_stays_disconnected() -> None:
@@ -2097,7 +2099,7 @@ def test_profile_last_watched_uses_provider_branding_icons() -> None:
     assert 'const art = watchlistPreviewArt(item) || poster(item, "w780");' in js
     helper = js[js.index("const watchlistPreviewArt ="):js.index("const heroBackdrop =")]
     assert "backdrop_url" not in helper and "background_url" not in helper and "fanart" not in helper
-    assert 'return `/art/tmdb/${kind}/${encodeURIComponent(String(id))}?kind=backdrop&size=${encodeURIComponent(size)}&locale=${locale}${watchlistArtEvidence(item)}`;' in js
+    assert 'return `/art/tmdb/${kind}/${encodeURIComponent(String(id))}?fallback=2&kind=backdrop&size=${encodeURIComponent(size)}&locale=${locale}${watchlistArtEvidence(item)}`;' in js
     assert "updated ${relTime(when)}" in js
     assert "cw-profile-watchlist-status" in js
     assert "cw-profile-watchlist-sync" in js
@@ -2131,12 +2133,12 @@ def test_profile_watchlist_rows_reuse_widget_art_url() -> None:
     css = Path("assets/css/profile-page.css").read_text("utf-8")
 
     assert "artUrl,\n    gridArtUrl," in helper
-    assert 'const cover = preview?.artUrl?.(item, "w342") || "/assets/img/placeholder_poster.svg";' in js
+    assert 'const cover = preview?.artUrl?.(item, "w342") || "/assets/img/placeholder_poster.svg?v=2";' in js
     assert "return preview?.gridArtUrl?.(item, size) || cover;" in js
     row = js[js.index("function watchlistRow(item, fallbackSyncEpoch = 0)"):js.index("function posterCard(item)")]
     assert "const art = watchlistWidgetArt(item);" in row
     assert "backdrop(item)" not in row
-    assert "this.src='/assets/img/placeholder_poster.svg'" in row
+    assert "this.src='/assets/img/placeholder_poster.svg?v=2'" in row
     assert "body.cw-profile-page #dashboard-widgets-card #placeholder-card .poster *{text-decoration:none!important}" in css
 
 

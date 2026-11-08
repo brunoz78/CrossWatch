@@ -12,16 +12,18 @@ import time
 from typing import Any
 import uuid
 
+from _logging import _redact_log_text
 from cw_platform.orchestrator import Orchestrator
 from cw_platform.orchestrator._interactive import InteractivePlan, fingerprint
 from cw_platform.value_coercion import coerce_bool
 from cw_platform.interactive_reads import ReviewReads
 from .interactive_sync_store import ReviewStore
 from .interactive_sync_progress import SyncProgress
-from .interactive_sync_report import SyncReport
+from .interactive_sync_report import SyncReport, notice_subject
 
 SESSION_TTL = 24 * 60 * 60
 MAX_SESSIONS = 24
+PRIORITY_NOTICES = frozenset({"feature:error", "playlist:mapping:error"})
 LOCK = threading.RLock()
 SESSIONS: dict[str, Session] = {}
 LOG = logging.getLogger(__name__)
@@ -54,7 +56,9 @@ class Session:
                     revision=self.revision, message=self.message, progress=self.progress.public(),
                     counts=dict(self.store.counts) if self.store else dict(changes=0, conflicts=0, attention=0, selected=0),
                     features=list(self.store.features) if self.store else [], selection_version=self.selection_version,
-                    notices=self.plan.notices[:100], summary=self.summary, apply_review=self.apply_review, report=self.report)
+                    completed_features=sorted(self.plan.completed_features), failed_features=sorted(self.plan.failed_features),
+                    notices=self.plan.notices[:100], status_mappings=self.plan.status_mappings,
+                    summary=self.summary, apply_review=self.apply_review, report=self.report)
 
     def close(self):
         if self.store is not None:
@@ -87,7 +91,12 @@ def mapping_version(cfg=None):
 def build(session: Session, cfg: dict[str, Any], choices: dict[str, str], *, store=None, selected=None, collecting=False) -> tuple[InteractivePlan, dict[str, Any]]:
     plan = InteractivePlan(choices=dict(choices), planned_at=session.planned_at,
                            record_rows=store is not None or selected is None, selected=selected or set(), copy_rows=store is None,
-                           reads=session.reads, collecting=collecting)
+                           reads=session.reads, collecting=collecting,
+                           allowed_features=set(session.plan.completed_features) if selected is not None else None)
+    if plan.allowed_features is not None:
+        plan.failed_features = session.plan.failed_features - plan.allowed_features
+        plan.notices = deepcopy([notice for notice in session.plan.notices
+                                if notice.get("feature") in plan.failed_features])
     plan.on_progress = session.progress.event
     if store is not None:
         plan.rows = store.rows
@@ -104,12 +113,24 @@ def build(session: Session, cfg: dict[str, Any], choices: dict[str, str], *, sto
         name = str(event.get("event") or "")
         feature = str(event.get("feature") or "")
         if name in {"history:cloud_read", "feature:error", "feature:unsupported", "pair:skip", "run:pair:skip", "playlist:mapping:error", "writes:skipped"} or "mass_delete" in name or "massdelete" in name:
+            if name in PRIORITY_NOTICES and len(plan.notices) >= 100:
+                replace = next((i for i, notice in enumerate(plan.notices) if notice.get("event") not in PRIORITY_NOTICES), None)
+                if replace is not None:
+                    plan.notices.pop(replace)
             if len(plan.notices) < 100:
                 plan.notices.append(dict(event=name, feature=feature, reason=str(event.get("reason") or name),
-                                         provider=str(event.get("dst") or event.get("provider") or ""), detail=str(event.get("detail") or "")[:300]))
+                                         detail=str(event.get("detail") or "")[:300],
+                                         error=_redact_log_text(event.get("error") or "")[:500], **notice_subject(event)))
 
     mgr = Orchestrator(preview_cfg, on_progress=progress, interactive=plan)
     summary = mgr.run(dry_run=True, pair_scope_ids=[session.pair_id], write_state_json=False)
+    if plan.failed_features:
+        for rows in (plan.rows, plan.conflicts):
+            for key in list(rows):
+                if rows[key]["feature"] in plan.failed_features:
+                    del rows[key]
+        plan.completed_features -= plan.failed_features
+        plan.seen.intersection_update(plan.rows)
     return plan, summary
 
 
@@ -156,8 +177,9 @@ def refresh(session: Session, cfg: dict[str, Any], choices: dict[str, str], *, r
 
 def _finish_review(session, cfg, version, plan, summary, store, *, corrections=()):
     session.progress.set_stage("finalizing", "Preparing pages and preserving selections")
+    ready = bool(summary.get("ok")) or bool(plan.completed_features and plan.failed_features and not summary.get("cancelled"))
     store.finish(session.store)
-    if summary.get("ok"):
+    if ready:
         store.select_corrected(corrections)
     with LOCK:
         if session.store is not None:
@@ -171,8 +193,10 @@ def _finish_review(session, cfg, version, plan, summary, store, *, corrections=(
         session.selection_version += 1
         session.apply_review = None
         session.report = None
-        session.status = "review" if summary.get("ok") else "error"
-        session.message = "Review the proposed changes. Nothing has been applied." if summary.get("ok") else "The plan could not be completed. Check provider status and refresh."
+        session.status = "review" if ready else "error"
+        session.message = "Review the proposed changes. Nothing has been applied." if summary.get("ok") else "The plan could not be completed. Any displayed proposals are partial. Review the failure notices and refresh the plan to retry."
+        if ready and plan.failed_features:
+            session.message = "Completed features are ready to apply. Failed features are excluded; review the notices and refresh to retry them."
         if corrections and summary.get("ok"):
             session.message = "Mappings saved and the plan recalculated. Review the corrected changes before applying."
         if summary.get("cancelled"):
@@ -238,7 +262,8 @@ def apply(session: Session, cfg: dict[str, Any], selected: set[str]):
     finally:
         if session.store is not store:
             store.close()
-    execution = InteractivePlan(preview=False, selected=selected, choices=dict(plan.choices), planned_at=session.planned_at, record_rows=False, reads=session.reads)
+    execution = InteractivePlan(preview=False, selected=selected, choices=dict(plan.choices), planned_at=session.planned_at, record_rows=False, reads=session.reads,
+                                allowed_features=set(plan.completed_features))
     def progress(event):
         session.progress.event(event)
         report.event(event)

@@ -76,8 +76,8 @@
     if (summary) {
       summary.classList.add("cw-import-summary");
       summary.innerHTML =
-        '<span class="cw-import-title">Import provider state</span>' +
-        '<span class="cw-import-help material-symbol" title="Imports selected Watchlist, History, Ratings, or Progress data from a configured provider instance into Current State. Replace baseline refreshes those datasets from the provider; Merge keeps existing baseline rows and adds or updates provider rows. Provider accounts are not changed." aria-label="Import provider state help">help</span>';
+        '<span class="cw-import-title">Debug settings</span>' +
+        '<span class="cw-import-help material-symbol" title="Refreshes the internal sync baseline from the selected provider. Replace rebuilds the selected datasets; Merge keeps existing rows and adds or updates provider rows. Use Tracker import to copy records into your CrossWatch tracker. Provider accounts are not changed." aria-label="Debug settings help">help</span>';
     }
 
     const body = summary ? summary.nextElementSibling : null;
@@ -267,6 +267,9 @@
     details.className = 'cw-editor-filters';
     const summary = document.createElement('summary');
     summary.textContent = 'Source and filters';
+    const context = document.createElement('small');
+    context.className = 'cw-editor-source-summary';
+    summary.append(context);
     details.appendChild(summary);
     side.before(details);
     details.appendChild(side);
@@ -274,6 +277,15 @@
     const update = () => { details.open = !narrow.matches; };
     update();
     narrow.addEventListener('change', update);
+    const updateContext = () => {
+      context.textContent = ['#cw-source', '#cw-kind', '#cw-snapshot', '#cw-instance'].map(selector => {
+        const select = side.querySelector(selector);
+        return select && (selector === '#cw-snapshot' || select.style.display !== 'none') ? select.selectedOptions[0]?.textContent : '';
+      }).filter(Boolean).join(' · ');
+    };
+    side.addEventListener('change', updateContext);
+    new MutationObserver(updateContext).observe(side, {childList:true, subtree:true, attributes:true, attributeFilter:['style', 'selected']});
+    updateContext();
   }
 
   Editor.Chrome = {

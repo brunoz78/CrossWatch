@@ -21,7 +21,7 @@ from cw_platform.identity_links import clean_identity_map
 from cw_platform.provider_instances import list_user_profiles, normalize_user_profile_id
 from cw_platform.local_db.legacy_files import LAST_SYNC_JSON
 from cw_platform.memory_release import clear_caches, release_memory
-from cw_platform.reason_labels import friendly_reason
+from cw_platform.reason_labels import friendly_reason, reason_hint, reason_message
 from cw_platform.run_control import (
     SyncCancelled,
     cancel_requested,
@@ -255,7 +255,7 @@ def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
     if not sync_provider_supports_feature(src, "ratings") or not sync_provider_supports_feature(dst, "ratings"):
         feats.pop("ratings", None)
     if "collection" in feats:
-        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "SILO", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
+        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "SILO", "TOFA", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
         collection_targets = {"TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
         if src not in collection_sources or dst not in collection_targets or str(pair.get("mode") or "").strip().lower().startswith("two"):
             feats.pop("collection", None)
@@ -266,7 +266,7 @@ def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
     if isinstance(plex_history, Mapping) and plex_history.get("discover_fallback") is True and isinstance(feats.get("history"), dict):
         feats["history"]["library_only"] = False
 
-_DROPPED_SHOW_PROVIDERS = frozenset({"trakt", "mdblist", "simkl", "wetrakr", "flicklist"})
+_DROPPED_SHOW_PROVIDERS = frozenset({"trakt", "mdblist", "simkl", "wetrakr", "flicklist", "crosswatch"})
 
 
 def _normalize_pair_providers(p: Any) -> dict[str, Any]:
@@ -340,6 +340,7 @@ def _summary_reset() -> None:
         SUMMARY.update(
             {
                 "running": False,
+                "current_pair": None,
                 "started_at": None,
                 "finished_at": None,
                 "duration_sec": None,
@@ -686,13 +687,19 @@ def _format_unresolved_line(it: Mapping[str, Any]) -> str:
     nested = it.get("item")
     if isinstance(nested, Mapping):
         merged = dict(nested)
-        for field in ("reason", "feature", "provider"):
+        for field in ("reason", "hint", "feature", "provider"):
             if it.get(field) not in (None, ""):
                 merged[field] = it.get(field)
         it = merged
     series = str(it.get("series_title") or it.get("show_title") or "").strip()
     title = str(it.get("title") or it.get("name") or "").strip()
-    reason = _friendly_unresolved_reason(it.get("reason"))
+    raw_reason = it.get("reason")
+    message = reason_message(raw_reason, provider=it.get("provider"), feature=it.get("feature"))
+    provider_hint = reason_hint(it.get("hint"), raw_reason)
+    if provider_hint:
+        message = reason_message(provider_hint, provider=it.get("provider"), feature=it.get("feature")) or message
+        raw_reason = f"{raw_reason}; {provider_hint}"
+    reason = f"{message} [{raw_reason}]" if message else _friendly_unresolved_reason(raw_reason)
     code = ""
     season = it.get("season")
     episode = it.get("episode")
@@ -814,6 +821,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None, *, interactive
     rt = _rt()
     LOG_BUFFERS, RUNNING_PROCS, _append_log, strip_ansi = rt[0], rt[1], rt[8], rt[7]
     overrides = overrides or {}
+    import_pair = overrides.get("import_pair") if isinstance(overrides.get("import_pair"), dict) else None
     scheduler_context = dict(overrides)
     scheduler_context["run_id"] = str(run_id)
     scheduler_webhook_cfg: dict[str, Any] | None = None
@@ -832,6 +840,8 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None, *, interactive
                      for p in log_cfg.get("pairs", []) if isinstance(p, dict) and coerce_bool(p.get("enabled", True), True)
                      and (not requested or str(p.get("id")) == requested)
                      and (not scope or str(p.get("id") or '').strip() in scope)]
+        if import_pair:
+            log_pairs = [{key: import_pair.get(key) for key in ("id", "source", "source_instance", "target", "target_instance", "mode", "features")}]
         archived_run = archive().start(str(run_id), log_pairs)
     except Exception:
         pass
@@ -935,6 +945,8 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None, *, interactive
     try:
         load_config, _save = _env()
         cfg = load_config()
+        if import_pair:
+            cfg = {**cfg, "pairs": [dict(import_pair)]}
         if interactive is not None:
             from cw_platform.orchestrator._interactive import fingerprint
 
@@ -1033,7 +1045,7 @@ def _run_pairs_thread(run_id: str, overrides: dict | None = None, *, interactive
             write_state_json = coerce_bool(
                 sync_cfg.get("write_state_json", runtime_cfg.get("write_state_json", True)),
                 True,
-            )
+            ) and not import_pair
             def report_progress(line):
                 _sync_progress_ui(line)
                 if interactive is not None and interactive.on_progress is not None:
@@ -1198,10 +1210,13 @@ def _track_apply_progress(ev: str, o: Mapping[str, Any]) -> None:
     with SUMMARY_LOCK:
         phase = SUMMARY.setdefault("_phase", {}).setdefault("apply", {"total": 0, "done": 0, "final": False})
         if ev == "run:pair":
+            SUMMARY["current_pair"] = {key: o[key] for key in ("pair_id", "src", "dst", "src_instance", "dst_instance", "mode") if key in o}
             features = o.get("features")
             phase.update(pair_index=_count_of(o.get("i")), pair_count=_count_of(o.get("n")), feature_count=len(features) if isinstance(features, list) else 1,
                          feature_index=0, step_planned=0, step_settled=0, step_finished=False, current=0)
         elif ev == "run:feature":
+            if isinstance(SUMMARY.get("current_pair"), dict):
+                SUMMARY["current_pair"]["feature"] = str(o.get("feature") or "")
             phase.update(feature_index=_count_of(o.get("i")), feature_count=_count_of(o.get("n")), step_planned=0, step_settled=0, step_finished=False, current=0)
         elif ev == "feature:done":
             phase["step_finished"] = True
@@ -2290,6 +2305,10 @@ def api_sync_providers(request: Request = cast(Request, None)) -> JSONResponse:
         mf["label"] = mf.get("label") or mf["name"].title()
         mf["features"] = _norm_features(mf.get("features"))
         mf["capabilities"] = _norm_caps(mf.get("capabilities"))
+        from providers.sync._status_mapping import provider_caps
+        status_caps = provider_caps(mf["name"])
+        if status_caps:
+            mf["capabilities"]["status_mapping"] = status_caps
         if mf["name"] in seen:
             continue
         seen.add(mf["name"])
@@ -2311,6 +2330,7 @@ class PairIn(BaseModel):
     enabled: bool | None = None
     path_matching: bool | None = None
     providers: dict[str, Any] | None = None
+    status_mapping: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     profile_id: str | None = None
     match_users: bool | None = None
@@ -2325,6 +2345,7 @@ class PairPatch(BaseModel):
     enabled: bool | None = None
     path_matching: bool | None = None
     providers: dict[str, Any] | None = None
+    status_mapping: dict[str, Any] | None = None
     features: dict[str, Any] | None = None
     profile_id: str | None = None
     match_users: bool | None = None
@@ -2567,6 +2588,13 @@ def api_pairs_add(payload: PairIn = Body(...), request: Request = cast(Request, 
             item.pop("providers", None)
         item["id"] = _gen_id("pair")
 
+        from cw_platform.orchestrator._status_mapping import validate_pair
+        from cw_platform.status_mapping import STATUS_MAPPING_ERRORS, StatusMappingValidationError
+        try:
+            validate_pair(item)
+        except StatusMappingValidationError as exc:
+            return {"ok": False, "error": STATUS_MAPPING_ERRORS.get(exc.code, "Invalid status mapping configuration")}
+
         arr.append(item)
         save_config(cfg)
         return {"ok": True, "id": item["id"]}
@@ -2646,6 +2674,8 @@ def api_pairs_update(pair_id: str, payload: PairPatch = Body(...), request: Requ
         cfg = load_config()
         arr = _cfg_pairs(cfg)
         upd = payload.model_dump(exclude_unset=True, exclude_none=True)
+        if "status_mapping" in payload.model_fields_set:
+            upd["status_mapping"] = payload.status_mapping
 
         for it in arr:
             if str(it.get("id")) == str(pair_id):
@@ -2655,6 +2685,12 @@ def api_pairs_update(pair_id: str, payload: PairPatch = Body(...), request: Requ
                     return {"ok": False, "error": "playlist_managed_pair"}
                 if _same_pair_endpoint({**it, **upd}):
                     return {"ok": False, "error": "same_provider_instance"}
+                from cw_platform.orchestrator._status_mapping import validate_pair
+                from cw_platform.status_mapping import STATUS_MAPPING_ERRORS, StatusMappingValidationError
+                try:
+                    validate_pair({**it, **upd})
+                except StatusMappingValidationError as exc:
+                    return {"ok": False, "error": STATUS_MAPPING_ERRORS.get(exc.code, "Invalid status mapping configuration")}
                 if "features" in upd:
                     it["features"] = _normalize_features(upd.pop("features"))
                 if "providers" in upd:
@@ -2693,6 +2729,8 @@ def _cw_state_dir() -> Path:
         return p if p.exists() else Path('.cw_state')
 
 def _purge_pair_state(pair_id: str, scopes: Sequence[str] = ()) -> dict[str, Any]:
+    from cw_platform.status_mapping_store import StatusStore
+    StatusStore().purge(pair_id)
     state_dir = _cw_state_dir()
     token = str(pair_id or '').strip()
     removed: list[str] = []
@@ -3033,6 +3071,9 @@ def _scope_summary_for_user(cfg: dict[str, Any], user: Mapping[str, Any] | None,
     if not scope_ids and (snap.get("run_id") or snap.get("running")):
         return _empty_summary_for_pairs(pairs)
     out = dict(snap)
+    current_pair = out.get("current_pair")
+    if isinstance(current_pair, Mapping) and str(current_pair.get("pair_id") or "") not in allowed_ids:
+        out["current_pair"] = None
     out["enabled"] = _enabled_from_pairs(pairs)
     out["pair_scope_ids"] = sorted(scope_ids & allowed_ids) if scope_ids else sorted(allowed_ids)
     allowed_providers: set[str] = set()
@@ -3142,11 +3183,49 @@ def api_cancel_sync(request: Request = cast(Request, None)) -> Any:
                 return JSONResponse({"ok": False, "error": "profile_scope_denied"}, status_code=403)
         except Exception:
             return JSONResponse({"ok": False, "error": "profile_scope_denied"}, status_code=403)
+    state = _request_run_cancel()
+    return {"ok": True, "running": True, "run_id": state.get("run_id"), "requested_at": state.get("requested_at")}
+
+
+def _request_run_cancel() -> dict[str, Any]:
     run_id = str(_summary_snapshot().get("run_id") or "")
     state = request_cancel(run_id, reason="user")
     _summary_set("cancel_requested", True)
     _rt()[8]("SYNC", "[!] Cancel requested; stopping after the current batch.")
-    return {"ok": True, "running": True, "run_id": state.get("run_id"), "requested_at": state.get("requested_at")}
+    return state
+
+
+def start_import_run(pair: Mapping[str, Any], run_id: str, on_done: Any) -> dict[str, Any]:
+    rt = _rt()
+    RUNNING_PROCS, SYNC_PROC_LOCK = rt[1], rt[2]
+
+    def run() -> None:
+        try:
+            _run_pairs_thread_entry(run_id, {"import_pair": dict(pair), "source": "tracker-import"})
+        finally:
+            on_done(_summary_snapshot())
+
+    with SYNC_PROC_LOCK:
+        if _is_sync_running():
+            return {"ok": False, "error": "sync_running"}
+        clear_queue_stop()
+        th = threading.Thread(target=run, name="tracker-import", daemon=True)
+        th.start()
+        RUNNING_PROCS["SYNC"] = th
+        rt[8]("SYNC", f"[i] Triggered tracker import {run_id}")
+        return {"ok": True, "run_id": run_id}
+
+
+def import_run_snapshot(run_id: str) -> dict[str, Any] | None:
+    snap = _summary_snapshot()
+    return snap if str(snap.get("run_id") or "") == str(run_id) else None
+
+
+def cancel_import_run(run_id: str) -> bool:
+    if not _is_sync_running() or import_run_snapshot(run_id) is None:
+        return False
+    _request_run_cancel()
+    return True
 
 
 @router.get("/run/cancel")
@@ -3386,6 +3465,7 @@ async def api_run_summary_stream(request: Request) -> StreamingResponse:
             snap = _scope_summary_for_user(cfg_for_scope, user_for_scope, snap)
             key = (
                 snap.get("running"),
+                json.dumps(snap.get("current_pair"), sort_keys=True),
                 snap.get("exit_code"),
                 snap.get("cancel_requested"),
                 snap.get("cancelled"),

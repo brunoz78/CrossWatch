@@ -45,6 +45,21 @@ _SOURCE_ROOTS = ("providers", "cw_platform", "services", "api")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def failure_attribution(exc: BaseException, src: str, dst: str, mode: str = "one-way") -> dict[str, str]:
+    failed = str(getattr(exc, "_cw_failed_provider", "") or "").upper()
+    if not failed:
+        parts = str(type(exc).__module__).split(".")
+        if len(parts) >= 3 and parts[:2] == ["providers", "sync"]:
+            failed = parts[2].removeprefix("_mod_").upper()
+    src_u, dst_u = str(src or "").upper(), str(dst or "").upper()
+    if not failed or failed not in (src_u, dst_u):
+        return {}
+    side = ""
+    if src_u != dst_u:
+        side = ("side A" if failed == src_u else "side B") if mode == "two-way" else ("source" if failed == src_u else "destination")
+    return {"provider": failed, "side": side} if side else {"provider": failed}
+
+
 def error_detail(exc: BaseException) -> str:
     parts = [type(exc).__name__]
     try:
@@ -100,7 +115,7 @@ def _config_with_pair_feature_options(
     provider_keys: list[str] = []
     for provider in providers:
         name = str(provider or "").upper().strip()
-        if name not in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO"}:
+        if name not in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO", "TOFA"}:
             continue
         provider_key = name.lower()
         if provider_key not in provider_keys:
@@ -350,7 +365,7 @@ def _pair_scope_ids(ctx) -> set[str]:
     return {str(x).strip() for x in raw if str(x).strip()}
 
 
-_SYNC_USER_PROVIDERS = frozenset({"PLEX", "EMBY", "JELLYFIN", "SILO"})
+_SYNC_USER_PROVIDERS = frozenset({"PLEX", "EMBY", "JELLYFIN", "SILO", "TOFA"})
 
 
 def _expand_sync_user_pair(cfg: Mapping[str, Any], pair: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -520,6 +535,7 @@ def run_pairs(ctx) -> dict[str, Any]:
     provs = ctx.providers or {}
 
     features_ran: set[str] = set()
+    status_pairs = []
     cancelled = False
 
     for i, pair in enumerate(pairs, 1):
@@ -603,11 +619,24 @@ def run_pairs(ctx) -> dict[str, Any]:
         injected = False
 
         for feature_index, feature in enumerate(features, 1):
+            if review is not None and review.allowed_features is not None and feature not in review.allowed_features:
+                continue
             if cancel_requested():
                 cancelled = True
                 break
             emit("run:feature", pair_id=str(pair.get('id') or ''), i=feature_index, n=len(features), feature=feature)
             fcfg = feat_map.get(feature) or {}
+            if feature == "history" and pair.get("status_mapping") and isinstance(fcfg, dict):
+                from ._status_mapping import validate_pair
+                try:
+                    validate_pair(pair)
+                except ValueError as exc:
+                    emit("feature:error", src=src, dst=dst, feature=feature, error=str(exc))
+                    errors_total += 1
+                    if review is not None:
+                        review.failed_features.add(feature)
+                    continue
+                fcfg = {**fcfg, "use_source_status": False}
             if isinstance(fcfg, dict) and not coerce_bool(fcfg.get("enable", True), True):
                 continue
 
@@ -653,6 +682,7 @@ def run_pairs(ctx) -> dict[str, Any]:
                         continue
 
                     features_ran.add(feature)
+                    feature_errors_before = errors_total
 
                     try:
                         if feature == "playlists":
@@ -717,16 +747,40 @@ def run_pairs(ctx) -> dict[str, Any]:
                             cancelled = True
                             break
 
+                        if review is not None:
+                            if errors_total > feature_errors_before or res.get("ok") is False:
+                                review.failed_features.add(feature)
+                                if errors_total == feature_errors_before:
+                                    errors_total += 1
+                            else:
+                                review.completed_features.add(feature)
+                        if feature == "history" and errors_total == feature_errors_before and res.get("ok") is not False:
+                            status_pairs.append(pair)
+
                     except SyncCancelled:
                         emit("feature:cancelled", src=src, dst=dst, feature=feature)
                         cancelled = True
                     except Exception as e:
-                        emit("feature:error", src=src, dst=dst, feature=feature, error=str(e), detail=error_detail(e), traceback=traceback.format_exc())
+                        if review is not None:
+                            review.failed_features.add(feature)
+                        emit("feature:error", src=src, dst=dst, feature=feature, error=str(e), detail=error_detail(e), **failure_attribution(e, src, dst, mode), traceback=traceback.format_exc())
                         errors_total += 1
                         continue
                 finally:
                     ctx.config = prev_cfg
                     ctx.state_store = prev_store
+    if not cancelled:
+        from ._status_mapping import report_skipped, run_status_mappings, skip_reason
+        try:
+            for pair in pairs:
+                if pair not in status_pairs:
+                    report_skipped(ctx, pair, skip_reason(pair) or "History did not complete successfully. Status mapping was not run.")
+            status_result = run_status_mappings(ctx, status_pairs, cfg, health_map)
+            updated_total += status_result["updated"]
+            unresolved_total += status_result["unresolved"]
+            errors_total += status_result["errors"]
+        except SyncCancelled:
+            cancelled = True
     if not cancelled and cancel_requested():
         cancelled = True
 

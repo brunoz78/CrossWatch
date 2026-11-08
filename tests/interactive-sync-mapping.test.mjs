@@ -7,6 +7,38 @@ import {readFileSync} from "node:fs";
 import vm from "node:vm";
 import {mappingAppliesToRow, candidateConflict, correctedItem, correctedEpisode, mappingGroups, sameSeason, seriesTitle} from "../assets/js/interactive-sync-mapping.js";
 
+test("status conflicts show actual labels and default to leaving both sides unchanged", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const render = source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
+  const value = source.slice(source.indexOf("  function value("), source.indexOf("  const duration ="));
+  const row = {id:"status-1",result:"conflict",feature:"history",key:"private-scope-json",source:"AniList",target:"SIMKL",winner:"",
+    left:{title:"Example",watch_status:"on_hold",_cw_status_mapping:true},right:{title:"Example",watch_status:"dropped",_cw_status_mapping:true}};
+  const update = {id:"status-2",result:"update",operation:"update",feature:"history",provider:"SIMKL",selectable:true,
+    item:{title:"Other",type:"show",watch_status:"dropped",_cw_status_mapping:{from:"watching",to:"dropped"}},
+    before:{watch_status:"watching",_cw_status_mapping:true}};
+  const context = {host:{contains:()=>false,innerHTML:""},document:{activeElement:null},window:{},
+    session:{status:"review",pair:{source:"ANILIST",target:"SIMKL"},counts:{changes:1,selected:0,conflicts:1},features:["history"]},
+    pageData:{total:2,items:[row,update]},page:0,PAGE_SIZE:100,pageLoading:false,downloadOpen:false,downloading:false,
+    query:"",feature:"",result:"",labels:{update:"Update"},pending:()=>false,origin:()=>["main","Main"],aiButton:()=>"",
+    esc:value=>String(value ?? ""),endpoint:p=>p,progressHTML:()=>"",number:value=>Number(value || 0),title:item=>item.title,
+    reasonDetailsHTML:()=>""};
+  vm.createContext(context);
+  vm.runInContext(value + render + "render();", context);
+  assert.match(context.host.innerHTML,/AniList: On hold/);
+  assert.match(context.host.innerHTML,/SIMKL: Dropped/);
+  assert.match(context.host.innerHTML,/<option value="" selected>Leave unchanged<\/option>/);
+  assert.doesNotMatch(context.host.innerHTML,/private-scope-json|data-map="status-2"/);
+  assert.match(context.host.innerHTML,/Watching/);
+  context.session.status_mappings = [{src:"TRAKT",dst:"WETRAKR",state:"complete",preview:true,matched:3,proposed:1,unchanged:2,updated:0}];
+  vm.runInContext("render();", context);
+  assert.match(context.host.innerHTML, /Status mapping/);
+  assert.match(context.host.innerHTML, /Preview checked/);
+  assert.match(context.host.innerHTML, /3 matched · 1 proposed · 2 unchanged/);
+  row.winner = "SIMKL";
+  vm.runInContext("render();", context);
+  assert.match(context.host.innerHTML,/<option value="SIMKL" selected>Use SIMKL<\/option>/);
+});
+
 test("a season can move to a separate show while preserving episode order and watched dates", () => {
   const originals = Array.from({length:10}, (_,i) => ({type:"episode", series_title:"Monster", title:`S02E${i+1}`,
     ids:{tvdb:String(1000+i)}, show_ids:{tmdb:"113988"}, season:2, episode:i+1, watched_at:"2024-09-19T08:00:00Z"}));
@@ -240,9 +272,149 @@ test("mapping removal only offers rules for this item, source instance and pair"
 });
 
 
+test("matching evidence escapes provider metadata and renders legacy rows", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  function matchDetailsHTML(row)"), source.indexOf("  function reportIssuesHTML()"));
+  const context = {esc:value=>String(value ?? "").replaceAll("<","&lt;").replaceAll(">","&gt;"), row:{
+    reason_origin:"previous_attempt", previous_attempt:{ts:1234567890}, item:{type:"episode",show_ids:{tvdb:"42"}},
+    match_details:{candidate_count:11,truncated:true,candidates:[{local_id:"<id>",title:"<img src=x>",ids:{tmdb:"<bad>"},season:1,episode:2}]}
+  }};
+  vm.createContext(context);
+  vm.runInContext(fn + "globalThis.html = matchDetailsHTML(row) + previousAttemptHTML(row);", context);
+  assert.match(context.html, /Possible matches \(11\) from previous attempt/);
+  assert.match(context.html, /show tvdb:42/);
+  assert.match(context.html, /&lt;img src=x&gt;/);
+  assert.match(context.html, /&lt;bad&gt;/);
+  assert.match(context.html, /Only the first candidates/);
+  assert.doesNotMatch(context.html, /<img|<bad>|<id>/);
+  context.row = {};
+  vm.runInContext("globalThis.html = matchDetailsHTML(row) + previousAttemptHTML(row);", context);
+  assert.equal(context.html, "");
+});
+
+test("report issues preserve and escape the additional provider hint", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  function matchDetailsHTML(row)"), source.indexOf("  function reportHTML()"));
+  const row = {item:{title:"Movie"},reason:"write_failed",hint:"<provider_hint>",explanation:"Could not mark watched"};
+  const context = {session:{report:{issue_count:1,features:[]}},pageData:{total:1,items:[row]},PAGE_SIZE:75,page:0,
+    pageLoading:false,query:"",feature:"",result:"",labels:{},endpoint:()=>"EMBY",title:item=>item.title,
+    number:value=>Number(value || 0),matchDetailsHTML:()=>"",
+    esc:value=>String(value ?? "").replaceAll("<","&lt;").replaceAll(">","&gt;")};
+  vm.createContext(context);
+  vm.runInContext(fn + "globalThis.html = reportIssuesHTML();", context);
+  assert.match(context.html, /write_failed/);
+  assert.match(context.html, /&lt;provider_hint&gt;/);
+  assert.doesNotMatch(context.html, /<provider_hint>/);
+  delete row.hint;
+  vm.runInContext("globalThis.html = reportIssuesHTML();", context);
+  assert.doesNotMatch(context.html, /provider_hint|undefined/);
+});
+
+test("long reasons stay collapsed behind a short label with full details available", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  function matchDetailsHTML(row)"), source.indexOf("  function reportIssuesHTML()"));
+  const message = "Multiple possible destination matches were found. " + "Check their IDs before retrying. ".repeat(10);
+  const context = {row:{reason:"ambiguous",reason_label:"Multiple matching items found",explanation:message,
+    match_details:{candidate_count:1,candidates:[{title:"<Movie>",local_id:"42"}]}},
+    esc:value=>String(value ?? "").replaceAll("<","&lt;").replaceAll(">","&gt;")};
+  vm.createContext(context);
+  vm.runInContext(fn + "globalThis.html = reasonDetailsHTML(row);", context);
+  assert.equal(context.html.split("<details>")[0], '<small class="is-reason">Multiple matching items found</small>');
+  assert.match(context.html, /<details><summary>Details<\/summary>/);
+  assert.ok(context.html.includes(message));
+  assert.match(context.html, /&lt;Movie&gt;/);
+  assert.match(context.html, /<small>ambiguous<\/small>/);
+  assert.equal((context.html.match(/<details/g) || []).length, 1);
+  assert.doesNotMatch(context.html, /<details[^>]*open/);
+  context.row = {reason_origin:"previous_attempt",reason_label:"Could not mark as watched",
+    reason:"Previous attempt: Could not mark watched. Select and apply to retry.",previous_attempt:{reason:"write_failed",hint:"mark_played_failed",ts:1234567890}};
+  vm.runInContext("globalThis.html = reasonDetailsHTML(row);", context);
+  assert.match(context.html, /<small class="is-reason">Could not mark as watched<\/small><details>/);
+  assert.match(context.html, /Select and apply to retry/);
+  assert.match(context.html, /mark_played_failed/);
+  context.row = {reason:"x".repeat(2000)};
+  vm.runInContext("globalThis.html = reasonDetailsHTML(row);", context);
+  assert.match(context.html, /^<small class="is-reason">Needs attention<\/small><details>/);
+  assert.ok(context.html.includes(context.row.reason));
+  context.row = {};
+  vm.runInContext("globalThis.html = reasonDetailsHTML(row);", context);
+  assert.equal(context.html, "");
+});
+
+test("failed plans identify partial progress proposals and expose failure details", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  const noticeSubject"), source.indexOf("  function aiQuestion()"))
+    + source.slice(source.indexOf("  function statusMappingHTML("), source.indexOf("  const duration ="))
+    + source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
+  const rows = [1,2].map(id => ({id:String(id), key:`movie:${id}`, item:{type:"movie",title:`Movie ${id}`},
+    feature:"progress", operation:"add", result:"add", provider:"FLOPPY", instance:"default", selectable:true}));
+  const context = {host:{contains:()=>false,innerHTML:""},document:{activeElement:null},window:{},
+    session:{status:"error",pair:{source:"WETRAKR",target:"FLOPPY"},counts:{changes:2,selected:0,attention:0,conflicts:0},
+      features:["progress"],notices:[{event:"feature:error",feature:"history",provider:"WETRAKR",side:"source",route:"WETRAKR to FLOPPY",reason:"feature:error",
+        detail:"Provider <diagnostic>",error:"History <failure>"}]},
+    pageData:{total:2,items:rows},page:0,PAGE_SIZE:100,pageLoading:false,downloadOpen:false,downloading:false,
+    query:"",feature:"",result:"",labels:{add:"Add"},pending:()=>false,origin:()=>["main","Main"],aiButton:()=>"",
+    esc:value=>String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"),
+    endpoint:(p,i)=>p,progressHTML:()=>"",number:value=>Number(value || 0),title:item=>item.title,
+    value:()=>"25%",reasonDetailsHTML:()=>"",reportHTML:()=>"Completed report"};
+  vm.createContext(context);
+  vm.runInContext(fn + "render();", context);
+  const html = context.host.innerHTML;
+  assert.match(html, /Partial plan: review incomplete/);
+  assert.match(html, /<strong>2<\/strong><span>Partial proposals/);
+  assert.match(html, /Unknown<\/strong><span>Item checks incomplete/);
+  assert.doesNotMatch(html, /Need attention/);
+  assert.match(html, /<details class="is-notices" open>/);
+  assert.match(html, /history \/ WETRAKR \(source\)/);
+  assert.doesNotMatch(html, /history \/ FLOPPY/);
+  assert.match(html, /Planning failed for history from WETRAKR \(source\)\. Those features have no proposals in this plan/);
+  assert.match(html, /History &lt;failure&gt;/);
+  assert.match(html, /Provider &lt;diagnostic&gt;/);
+  assert.doesNotMatch(html, /<failure>|<diagnostic>/);
+  assert.match(html, /Apply and Download review are disabled until a complete plan/);
+  assert.match(html, /Events or logs/);
+  assert.match(html, /reread providers and retry/);
+  assert.match(html, /data-action="apply"[^>]*disabled/);
+  assert.match(html, /data-action="toggle-download"[^>]*disabled/);
+  assert.doesNotMatch(html, /data-action="refresh"[^>]*disabled/);
+  assert.equal((html.match(/<td>progress<\/td>/g) || []).length, 2);
+  context.session.status = "review";
+  context.session.failed_features = ["history"];
+  context.session.completed_features = ["progress"];
+  context.session.counts.selected = 2;
+  vm.runInContext("render();", context);
+  assert.match(context.host.innerHTML, /You can apply changes from completed features/);
+  assert.match(context.host.innerHTML, /Failed features \(history\) are excluded/);
+  assert.doesNotMatch(context.host.innerHTML, /data-action="apply"[^>]*disabled/);
+  assert.doesNotMatch(context.host.innerHTML, /data-action="toggle-download"[^>]*disabled/);
+  assert.match(context.host.innerHTML, /History &lt;failure&gt;/);
+  context.session.status = "error";
+  context.session.failed_features = [];
+  context.session.counts.selected = 0;
+  context.session.notices = [];
+  context.session.counts.changes = 0;
+  context.pageData = {total:0,items:[]};
+  vm.runInContext("render();", context);
+  assert.match(context.host.innerHTML, /No detailed failure notice was captured/);
+  assert.match(context.host.innerHTML, /The proposals below were collected before planning stopped/);
+  assert.match(context.host.innerHTML, /No proposals available from this partial plan/);
+  assert.doesNotMatch(context.host.innerHTML, /done_all|No changes proposed/);
+  context.session.status = "review";
+  context.session.notices = [{reason:"Existing notice"}];
+  vm.runInContext("render();", context);
+  assert.doesNotMatch(context.host.innerHTML, /Partial plan:|Item checks incomplete|class="is-notices" open/);
+  assert.match(context.host.innerHTML, /<strong>0<\/strong><span>Need attention/);
+  context.session.status = "error";
+  context.session.report = {outcome:"failed"};
+  vm.runInContext("render();", context);
+  assert.match(context.host.innerHTML, /Completed report/);
+  assert.doesNotMatch(context.host.innerHTML, /Partial plan:/);
+});
+
 test("completion report distinguishes cloud outcomes and escapes titles", () => {
   const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
-  const fn = source.slice(source.indexOf("  function reportHTML()"), source.indexOf("  function render()"));
+  const fn = source.slice(source.indexOf("  function statusMappingHTML("), source.indexOf("  const duration ="))
+    + source.slice(source.indexOf("  function reportHTML()"), source.indexOf("  function render()"));
   const report = {outcome:"success", totals:{added:1,updated:0,removed:0}, features:[], cloud_results:
     ["dated","present","cached","plex_discover_date_pending"].map(outcome => ({title:"<Example>",key:"movie:1",provider:"PLEX",instance:"own",outcome}))};
   const context = {session:{report}, esc:value=>String(value ?? "").replaceAll("<","&lt;").replaceAll(">","&gt;"),
@@ -265,4 +437,14 @@ test("completion report distinguishes cloud outcomes and escapes titles", () => 
   report.cloud_results = [];
   vm.runInContext("globalThis.html = reportHTML();", context);
   assert.doesNotMatch(context.html, /<h2>Plex Discover fallback/);
+  report.status_mappings = [{src:"TRAKT",src_instance:"default",dst:"WETRAKR",dst_instance:"<other>",state:"complete",matched:1,updated:1,proposed:1}];
+  vm.runInContext("globalThis.html = reportHTML();", context);
+  assert.match(context.html, /Status mapping/);
+  assert.match(context.html, /WETRAKR \(&lt;other&gt;\): Checked/);
+  assert.match(context.html, /1 updated/);
+  report.status_mappings = [{state:"skipped",reason:"History is disabled. <not markup>"}];
+  vm.runInContext("globalThis.html = reportHTML();", context);
+  assert.match(context.html, /Not run/);
+  assert.match(context.html, /History is disabled. &lt;not markup&gt;/);
+  assert.doesNotMatch(context.html, /0 matched/);
 });

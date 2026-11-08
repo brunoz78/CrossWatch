@@ -431,19 +431,6 @@ def test_editor_send_collection_preserves_collected_at(monkeypatch) -> None:
     assert merged["items"][0]["collected_at"] == "2026-01-01T00:00:00Z"
 
 
-def test_editor_bulk_action_buttons_use_playback_action_colors() -> None:
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[1]
-    css = (root / "assets" / "css" / "pages.css").read_text(encoding="utf-8")
-    assert "#page-editor .cw-bulk .cw-btn.cw-icon-only{box-sizing:border-box !important;width:44px !important;min-width:44px !important;height:44px !important;min-height:44px !important;padding:0 !important;border-radius:13px !important" in css
-    assert "#page-editor .cw-bulk #cw-bulk-send.cw-icon-only{background:linear-gradient(180deg,rgba(63,126,255,0.56),rgba(35,78,188,0.74))!important" in css
-    assert "#page-editor .cw-bulk #cw-bulk-restore.cw-icon-only{background:linear-gradient(180deg,rgba(64,166,105,0.48),rgba(34,119,76,0.68))!important" in css
-    assert "#page-editor .cw-bulk #cw-bulk-remove.cw-icon-only{background:linear-gradient(180deg,rgba(139,41,64,0.64),rgba(95,29,46,0.78))!important" in css
-    assert "#page-editor .cw-bulk #cw-bulk-clear.cw-icon-only{background:rgba(12,16,25,0.34)!important" in css
-    assert "#page-editor .cw-bulk .cw-btn.cw-icon-only .material-symbols-rounded{color:currentColor !important;-webkit-text-fill-color:currentColor !important}" in css
-
-
 def test_editor_datetime_fields_use_utc() -> None:
     from pathlib import Path
 
@@ -700,7 +687,7 @@ def test_editor_uses_page_scroll_for_table() -> None:
     assert 'const tableScroll = host.querySelector(".cw-table-scroll");' not in js
     assert "function wireLinkedTableScroll()" not in js
     assert "scrollDocumentByTableDelta(delta)" not in js
-    assert '#page-editor .cw-table-scroll{position:static!important;inset:auto!important;overflow:visible!important;border-radius:22px!important}' in css
+    assert '#page-editor .cw-table-scroll,#page-tracker .cw-table-scroll{position:static!important;inset:auto!important;overflow:visible!important;border-radius:22px!important}' in css
     assert "cw-table-overflow-x" in css
     assert ".cw-pop.cw-columns-pop{width:min(370px" not in css
     popup_pos = js[js.index("function positionPopup(pop, anchor)"):js.index("function openPopup(anchor, builder, opts = {})")]

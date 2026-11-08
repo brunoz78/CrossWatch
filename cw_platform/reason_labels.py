@@ -4,6 +4,34 @@
 from __future__ import annotations
 
 from typing import Any
+import re
+from .reason_catalog import outcome_text
+
+_MATCH_MESSAGES = {
+    "ambiguous": "Multiple possible destination matches were found. No item was updated because a unique match could not be established. Check the candidates and their IDs before retrying.",
+    "resolve_ambiguous": "Multiple possible destination matches were found. No item was updated because a unique match could not be established. Check the candidates and their IDs before retrying.",
+    "path_ambiguous": "The path matches multiple destination items. No unique target could be established.",
+    "path_id_conflict": "The path and media IDs identify different destination items. Check the metadata before retrying.",
+    "not_found": "The destination provider could not find a matching item. Check the media IDs.",
+    "missing_write_ids": "The item is missing IDs required by the destination provider.",
+    "missing_ids_for_key": "The item is missing IDs needed for a safe provider match.",
+    "missing_auth": "The destination provider requires authentication.",
+    "rate_limited": "The provider's request limit was reached.",
+    "write_failed": "The destination update failed. Check the provider error before retrying.",
+    "mark_played_failed": "The destination could not mark this item as watched.",
+    "unmark_played_failed": "The destination could not mark this item as unwatched.",
+    "readback_not_played": "The destination did not report this item as watched when checked after the update.",
+    "apply:add:unaccounted": "The provider response did not account for this item.",
+    "nuvio_id_ambiguous": "Multiple Nuvio library entries match this item. Removal was skipped because a unique entry could not be established.",
+    "nuvio_id_missing": "The item is missing a supported media type or IDs needed to identify a Nuvio library entry.",
+    "ambiguous_media_identity": "Multiple destination entries match the supplied media IDs. Check their identities before retrying.",
+    "ambiguous_provider_instance": "The credentials match multiple provider connections. Select a specific connection before retrying.",
+    "ambiguous_watch_event": "An existing watch could not be uniquely matched to this history event. Check the watch dates and event IDs before retrying.",
+    "trakt_episode_title_ambiguous": "Multiple Trakt episodes match the title. Check the episode IDs and season and episode numbers before retrying.",
+    "trakt_history_event_ambiguous": "Multiple Trakt history events match this watch. Check the watch date and event ID before retrying.",
+    "trakt_response_ambiguous": "Trakt did not report enough detail to confirm the outcome for this item. Check destination history before retrying.",
+    "trakt_added_existing_split_ambiguous": "Trakt did not identify which watches were added and which already existed. Check destination history before retrying.",
+}
 
 _PLEX_HISTORY_MESSAGES = {
     "plex_discover_scope_unavailable": "Plex library scope could not be checked completely. Cloud fallback was deferred; retry when the server is available.",
@@ -41,13 +69,19 @@ _PLEX_HISTORY_MESSAGES = {
 }
 
 _MEDIA_SERVER_LIBRARY_MESSAGES = {
-    "not_in_library": "The media server library does not contain this item.",
-    "not_found": "The media server could not find a matching library item.",
+    "not_in_library": "No matching item was found in the selected destination libraries.",
+    "not_found": "No matching item was found in the selected destination libraries. Check library selection and media IDs.",
 }
 
 _SILO_MESSAGES = {
     "ignored_by_server": "Silo ignored this watch because the title was unwatched in Silo after this watch date.",
     "missing_duration": "Silo has no runtime for this item, so the watch cannot be written.",
+}
+
+_TOFA_MESSAGES = {
+    "file_not_found": "Tofa no longer has this file. Run the sync again after the next library scan.",
+    "not_confirmed": "Tofa accepted the write but did not report this item as watched afterwards.",
+    "missing_tmdb_id": "Tofa needs a TMDB ID for watchlist items. Check that a TMDB metadata key is set.",
 }
 
 _SCROB_MESSAGES = {
@@ -70,6 +104,23 @@ _SIMKL_HISTORY_MESSAGES = {
 }
 
 _DIRECT_LABELS = {
+    "ambiguous": "Multiple matching items found",
+    "resolve_ambiguous": "Multiple matching items found",
+    "not_found": "No matching item found",
+    "write_failed": "Destination update failed",
+    "mark_played_failed": "Could not mark as watched",
+    "unmark_played_failed": "Could not mark as unwatched",
+    "readback_not_played": "Watched status was not confirmed",
+    "readback_mismatch": "Updated status was not confirmed",
+    "missing_write_ids": "Required media IDs missing",
+    "missing_auth": "Authentication required",
+    "rate_limited": "Provider request limit reached",
+    "home_scope_not_applied": "Plex Home user scope unavailable",
+    "ambiguous_provider_instance": "Multiple provider connections",
+    "ambiguous_watch_event": "Watch event could not be matched uniquely",
+    "trakt_history_event_ambiguous": "Multiple matching watch events",
+    "trakt_response_ambiguous": "Trakt response unclear",
+    "trakt_added_existing_split_ambiguous": "Trakt added/existing result unclear",
     "path_match": "Matched by file path",
     "path_ambiguous": "Multiple file path matches",
     "path_id_conflict": "File path matches but IDs disagree",
@@ -119,6 +170,11 @@ def _code(raw: Any) -> str:
     return str(raw or "").strip()
 
 
+def reason_hint(raw: Any, reason: Any) -> str:
+    code = _code(raw)
+    return code if code != _code(reason) and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code) else ""
+
+
 def _base(provider: Any) -> str:
     return str(provider or "").split("@", 1)[0].split("#", 1)[0].split(":", 1)[0].strip().upper()
 
@@ -130,6 +186,9 @@ def friendly_reason(raw: Any) -> str:
         return "unresolved"
     if low in _DIRECT_LABELS:
         return _DIRECT_LABELS[low]
+    outcome = outcome_text(low)
+    if outcome:
+        return outcome[0]
     if low.startswith("simkl_write_failed:"):
         return "SIMKL request failed"
     if low.startswith("simkl_write_response_malformed:"):
@@ -169,10 +228,12 @@ def reason_message(raw: Any, *, provider: Any = None, feature: Any = None) -> st
         if low == "not_in_plex_catalog":
             return f"{msg} {TRACKER_TO_MEDIA_SERVER_MESSAGE}"
         return msg
-    if provider_base in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO"} and low in _MEDIA_SERVER_LIBRARY_MESSAGES:
+    if provider_base in {"PLEX", "EMBY", "JELLYFIN", "KODI", "SILO", "TOFA"} and low in _MEDIA_SERVER_LIBRARY_MESSAGES:
         return _MEDIA_SERVER_LIBRARY_MESSAGES[low]
     if provider_base == "SILO" and low in _SILO_MESSAGES:
         return _SILO_MESSAGES[low]
+    if provider_base == "TOFA" and low in _TOFA_MESSAGES:
+        return _TOFA_MESSAGES[low]
     if provider_base == "SCROB" and low in _SCROB_MESSAGES:
         return _SCROB_MESSAGES[low]
     if provider_base == "SIMKL" and feature_key == "history":
@@ -184,8 +245,9 @@ def reason_message(raw: Any, *, provider: Any = None, feature: Any = None) -> st
             return "SIMKL returned a response CrossWatch could not parse."
         if low.startswith("simkl_write_response_ambiguous:"):
             return "SIMKL did not report enough detail to safely confirm the history write."
-    if low == "missing_ids_for_key":
-        return "The item is missing IDs needed for a safe provider match."
     if low in {"apply:add:failed", "two:apply:add:failed"}:
         return "The provider did not confirm this write."
-    return ""
+    if low in _MATCH_MESSAGES:
+        return _MATCH_MESSAGES[low]
+    outcome = outcome_text(low)
+    return outcome[1] if outcome else ""

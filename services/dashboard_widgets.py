@@ -174,17 +174,19 @@ def _art_type(item: Mapping[str, Any]) -> str:
     return "movie" if _media_type(item) == "movie" else "tv"
 
 
-def _rating_value(item: Mapping[str, Any]) -> int | None:
+def _rating_value(item: Mapping[str, Any]) -> int | float | None:
     raw = item.get("rating")
     if raw in (None, ""):
         raw = item.get("user_rating")
     if raw in (None, ""):
         return None
     try:
-        n = int(round(float(raw)))
+        n = float(raw)
     except Exception:
         return None
-    return n if 1 <= n <= 10 else None
+    if isinstance(raw, bool) or not 0 < n <= 10:
+        return None
+    return int(n) if n.is_integer() else n
 
 
 def _text(value: Any) -> str:
@@ -421,7 +423,7 @@ def _episode_still_url(item: Mapping[str, Any], *, size: str) -> str:
     episode = _episode_number(item)
     if tmdb in (None, "", 0, False) or season is None or episode is None:
         return ""
-    return f"/art/tmdb/tv/{tmdb}?kind=still&season={season}&episode={episode}&size={size}&artv=2"
+    return f"/art/tmdb/tv/{tmdb}?fallback=2&kind=still&season={season}&episode={episode}&size={size}&artv=2"
 
 
 def _resolved_art_type(item: Mapping[str, Any], tmdb: Any) -> str:
@@ -453,7 +455,7 @@ def _poster_url(item: Mapping[str, Any], *, size: str = "w342", episode_still: b
     tmdb = _tmdb_id(item)
     if tmdb in (None, "", 0, False):
         return ""
-    return f"/art/tmdb/{_resolved_art_type(item, tmdb)}/{tmdb}?size={size}"
+    return f"/art/tmdb/{_resolved_art_type(item, tmdb)}/{tmdb}?fallback=2&size={size}"
 
 
 def _grid_art_url(item: Mapping[str, Any], *, size: str = "w300") -> str:
@@ -463,7 +465,7 @@ def _grid_art_url(item: Mapping[str, Any], *, size: str = "w300") -> str:
     tmdb = _tmdb_id(item)
     if tmdb in (None, "", 0, False):
         return ""
-    return f"/art/tmdb/{_resolved_art_type(item, tmdb)}/{tmdb}?kind=backdrop&size={size}"
+    return f"/art/tmdb/{_resolved_art_type(item, tmdb)}/{tmdb}?fallback=2&kind=backdrop&size={size}"
 
 
 def _cover_url(item: Mapping[str, Any], *, size: str = "w342") -> str:

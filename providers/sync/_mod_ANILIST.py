@@ -56,6 +56,7 @@ def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any)
     return out
 
 __VERSION__ = "1.0"
+_MANUAL_RATING_SCALE = {"step": 1}
 os.environ.setdefault("CW_ANILIST_UA", http_user_agent("AniList", override_env="CW_ANILIST_UA"))
 __all__ = ["get_manifest", "ANILISTModule", "OPS"]
 
@@ -236,6 +237,7 @@ class ANILISTClient:
         *,
         feature: str | None = None,
         tolerate_errors: bool = False,
+        max_retries: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"query": query}
         if variables is not None:
@@ -247,7 +249,7 @@ class ANILISTClient:
             GQL_URL,
             json=payload,
             timeout=self.cfg.timeout,
-            max_retries=self.cfg.max_retries,
+            max_retries=self.cfg.max_retries if max_retries is None else max_retries,
         )
 
         try:
@@ -323,6 +325,7 @@ def get_manifest() -> Mapping[str, Any]:
             "index_semantics": "present",
             "observed_deletes": False,
             "ratings": {
+                "manual_scale": _MANUAL_RATING_SCALE,
                 "types": {"movies": True, "shows": True, "seasons": False, "episodes": False},
                 "upsert": True,
                 "unrate": True,
@@ -553,6 +556,7 @@ class _ANILISTOPS:
             "index_semantics": "present",
             "observed_deletes": False,
             "ratings": {
+                "manual_scale": _MANUAL_RATING_SCALE,
                 "types": {"movies": True, "shows": True, "seasons": False, "episodes": False},
                 "upsert": True,
                 "unrate": True,

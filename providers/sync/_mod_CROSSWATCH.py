@@ -110,11 +110,23 @@ except Exception as e:
     cw_log("CROSSWATCH", "module", "warn", "feature_import_failed", import_feature="playlists", error=str(e))
 
 try:
+    from .crosswatch import _dropped as feat_dropped
+except Exception as e:
+    feat_dropped = None
+    cw_log("CROSSWATCH", "module", "warn", "feature_import_failed", import_feature="dropped", error=str(e))
+
+from .crosswatch._common import tracker_store
+from cw_platform.tracker_store import TrackerConflict
+
+_WRITE_ATTEMPTS = 3
+
+try:
     from ._mod_common import make_snapshot_progress
 except Exception:
     make_snapshot_progress = None  # type: ignore[assignment]
 
-__VERSION__ = "1.4"
+__VERSION__ = "2.0"
+_MANUAL_RATING_SCALE = {"step": 0.5}
 __all__ = ["get_manifest", "CROSSWATCHModule", "OPS"]
 
 _FEATURES: dict[str, Any] = {}
@@ -174,6 +186,7 @@ def get_manifest() -> Mapping[str, Any]:
             "index_semantics": "present",
             "observed_deletes": True,
             "ratings": {
+                "manual_scale": _MANUAL_RATING_SCALE,
                 "types": {"movies": True, "shows": True, "seasons": True, "episodes": True},
                 "upsert": True,
                 "unrate": True,
@@ -234,7 +247,7 @@ class CROSSWATCHConfig:
     root_dir: str = "/config/.cw_provider"
     retention_days: int = 30
     auto_snapshot: bool = True
-    max_snapshots: int = 64
+    max_snapshots: int = 14
     
     restore_watchlist: str | None = None
     restore_history: str | None = None
@@ -284,7 +297,7 @@ class CROSSWATCHModule:
             root_dir=root_dir,
             retention_days=_int("retention_days", 30),
             auto_snapshot=_bool("auto_snapshot", True),
-            max_snapshots=_int("max_snapshots", 64),
+            max_snapshots=_int("max_snapshots", 14),
             restore_watchlist=_restore_id("restore_watchlist"),
             restore_history=_restore_id("restore_history"),
             restore_ratings=_restore_id("restore_ratings"),
@@ -315,6 +328,18 @@ class CROSSWATCHModule:
 
         self.progress_factory: Callable[[str], Any] = _mk_prog
 
+    def _guarded(self, feature: str, run: Callable[[], Any]) -> Any:
+        store = tracker_store(self)
+        for attempt in range(1, _WRITE_ATTEMPTS + 1):
+            try:
+                with store.mutation(), store.guarded():
+                    return run()
+            except TrackerConflict:
+                if attempt == _WRITE_ATTEMPTS:
+                    raise
+                _info(feature, "write_retry", reason="changed_by_another_writer", attempt=attempt)
+        raise TrackerConflict("changed_since")
+
     @staticmethod
     def supported_features() -> dict[str, bool]:
         toggles = {
@@ -343,7 +368,7 @@ class CROSSWATCHModule:
             _info(feature, "index_skipped", reason="module_missing")
             return {}
         started = time.perf_counter()
-        out = mod.build_index(self, **kwargs)
+        out = self._guarded(feature, lambda: mod.build_index(self, **kwargs))
         _info(feature, "index_done", count=len(out), dur_ms=int((time.perf_counter() - started) * 1000))
         return out
 
@@ -368,7 +393,7 @@ class CROSSWATCHModule:
             return {"ok": True, "count": 0, "unresolved": []}
         try:
             started = time.perf_counter()
-            cnt, unresolved = mod.add(self, lst)
+            cnt, unresolved = self._guarded(feature, lambda: mod.add(self, lst))
             _info(feature, "write_done", op="add", ok=len(unresolved) == 0, applied=int(cnt), unresolved=len(unresolved), dur_ms=int((time.perf_counter() - started) * 1000))
             confirmed_keys = _confirmed_keys(_crosswatch_key_of, lst, unresolved)
             return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
@@ -397,7 +422,7 @@ class CROSSWATCHModule:
             return {"ok": True, "count": 0, "unresolved": []}
         try:
             started = time.perf_counter()
-            cnt, unresolved = mod.remove(self, lst)
+            cnt, unresolved = self._guarded(feature, lambda: mod.remove(self, lst))
             _info(feature, "write_done", op="remove", ok=len(unresolved) == 0, applied=int(cnt), unresolved=len(unresolved), dur_ms=int((time.perf_counter() - started) * 1000))
             confirmed_keys = _confirmed_keys(_crosswatch_key_of, lst, unresolved)
             return {"ok": True, "count": int(cnt), "unresolved": unresolved, "confirmed_keys": confirmed_keys}
@@ -527,6 +552,16 @@ class _CrossWatchOPS:
 
     def health(self, cfg: Mapping[str, Any]) -> Mapping[str, Any]:
         return self._adapter(cfg).health()
+
+    def dropped_show_tokens(self, cfg: Mapping[str, Any]) -> set[str]:
+        if not feat_dropped:
+            raise RuntimeError("CrossWatch dropped shows are unavailable")
+        return feat_dropped.dropped_show_tokens(self._adapter(cfg))
+
+    def tag_dropped_shows(self, cfg: Mapping[str, Any], items: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        if not feat_dropped:
+            raise RuntimeError("CrossWatch dropped shows are unavailable")
+        return feat_dropped.tag_dropped_shows(self._adapter(cfg), items)
 
     def list_playlist_resources(self, cfg: Mapping[str, Any], *, instance: str | None = None):
         return list(feat_playlists.list_resources(self._playlist_adapter(cfg, instance))) if feat_playlists else []

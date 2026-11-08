@@ -136,6 +136,7 @@
     if (row.error === "undated_not_supported") return { ok: false, skipped: true, error: `${name} needs a watch date` };
     if (row.error === "undated_rewatch_not_supported") return { ok: false, skipped: true, error: `Already watched on ${name}, another play needs a date` };
     if (row.error === "provider_not_allowed") return { ok: false, error: `You cannot change ${name}` };
+    if (row.error === "unsupported_rating") return { ok: false, error: `${name} does not support that score. Choose a rating from its available scale.` };
     if (row.error) return { ok: false, error: `${name} could not be updated` };
     const result = row.result || {};
     if (Number(result.confirmed) > 0) return { ok: true };
@@ -414,7 +415,7 @@
   function ratingOf(ctx, ref) {
     const hit = (ctx.refs?.present || []).find((entry) => refKey(entry) === refKey(ref));
     const value = Number(hit?.rating ?? ctx.rating);
-    return Number.isFinite(value) && value >= 1 && value <= 10 ? Math.round(value) : null;
+    return Number.isFinite(value) && value >= 0.5 && value <= 10 ? value : null;
   }
 
   const REASONS = {
@@ -504,6 +505,32 @@
       el.hidden = true;
       document.body.appendChild(el);
       el.addEventListener("click", onClick);
+      el.addEventListener("pointerover", event => {
+        const star = event.target.closest("[data-ia-score]");
+        if (star && !star.disabled) previewScore(Number(star.dataset.iaScore));
+      });
+      el.addEventListener("pointerout", event => {
+        if (event.target.closest(".cw-ia-rating-choices") && !event.relatedTarget?.closest?.(".cw-ia-rating-choices")) previewScore(score);
+      });
+      el.addEventListener("focusin", event => {
+        const star = event.target.closest("[data-ia-score]");
+        if (star && !star.disabled) previewScore(Number(star.dataset.iaScore));
+      });
+      el.addEventListener("focusout", event => {
+        if (event.target.closest(".cw-ia-rating-choices") && !event.relatedTarget?.closest?.(".cw-ia-rating-choices")) previewScore(score);
+      });
+      el.addEventListener("keydown", event => {
+        const star = event.target.closest("[data-ia-score]");
+        if (!star) return;
+        const values = scoreScale().values;
+        const index = values.indexOf(Number(star.dataset.iaScore));
+        const next = event.key === "ArrowRight" || event.key === "ArrowUp" ? values[Math.min(values.length - 1, index + 1)]
+          : event.key === "ArrowLeft" || event.key === "ArrowDown" ? values[Math.max(0, index - 1)]
+          : event.key === "Home" ? values[0] : event.key === "End" ? values.at(-1) : null;
+        if (next === null) return;
+        event.preventDefault();
+        el.querySelector(`[data-ia-score="${next}"]`)?.focus();
+      });
       el.addEventListener("change", (event) => {
         if (!event.target?.matches?.("[data-ia-act=date]")) return;
         customDate = String(event.target.value || "");
@@ -579,11 +606,66 @@
 
     const item = (action, symbol, label, tone = "", extra = "") => `<button type="button" class="cw-ia-item${tone ? ` is-${tone}` : ""}" data-ia-act="${action}"${extra}>${icon(symbol)}<span>${esc(label)}</span></button>`;
     const section = (label) => `<div class="cw-ia-section">${esc(label)}</div>`;
-    const stepper = () => `<div class="cw-ia-score"><span>Your score</span><button type="button" data-ia-act="score-down" aria-label="Lower score">${icon("remove")}</button><strong>${esc(score)}<small>/10</small></strong><button type="button" data-ia-act="score-up" aria-label="Raise score">${icon("add")}</button></div>`;
+    function scoreScale() {
+      const empty = { values: [], max: 10, display_factor: 1 };
+      const refs = ctx?.focus ? [ctx.focus] : missingRefs();
+      const scales = refs.map(scaleFor);
+      if (scales.some(scale => scale.unavailable)) return {...empty, unavailable: true};
+      const first = scales[0] || empty;
+      const display = scale => JSON.stringify([scale.max, scale.display_factor, scale.labels]);
+      const shared = scales.every(scale => display(scale) === display(first));
+      return {...(shared ? first : empty), values: first.values.filter(value => scales.every(scale => scale.values.includes(value)))};
+    }
+
+    function scaleFor(ref) {
+      const scale = list.find(row => refKey(row) === refKey(ref))?.rating_scale;
+      return Array.isArray(scale?.values) ? scale : {values:[],max:10,display_factor:1,unavailable:true};
+    }
+
+    function projectedScore(value, scale) {
+      if (value == null) return null;
+      if (scale.bands) return scale.bands.find(band => value >= band.min && value < band.max)?.value ?? null;
+      if (scale.round_step) return Math.max(scale.values[0], Math.min(scale.values.at(-1), Math.floor(value / scale.round_step + 0.5) * scale.round_step));
+      return value;
+    }
+
+    function selectableScore(value, scale) {
+      if (!scale.values.length || value == null) return null;
+      const projected = projectedScore(value, scale) ?? value;
+      return scale.values.includes(projected) ? projected : scale.values.reduce((best, choice) => {
+        const distance = Math.abs(choice - projected) - Math.abs(best - projected);
+        return distance < 0 || (distance === 0 && choice > best) ? choice : best;
+      });
+    }
+
+    function scoreText(value, scale = scoreScale()) {
+      const projected = projectedScore(value, scale);
+      return projected == null ? "Not rated" : scale.labels?.[projected] || `${projected * scale.display_factor}/${scale.max}`;
+    }
+
+    function ratingStars() {
+      const scale = scoreScale();
+      if (scale.unavailable) return '<p class="cw-ia-note">Rating choices are unavailable for a selected provider. Reload and try again.</p>';
+      const half = scale.values.some(value => !Number.isInteger(value * scale.display_factor));
+      const label = value => value == null ? "Not rated" : scale.labels?.[value] || `${value * scale.display_factor}`;
+      const slots = half && !scale.labels ? Array.from({length: 20}, (_, i) => (i + 1) / 2) : scale.values;
+      const buttons = slots.map(value => `<button type="button" class="${scale.labels ? "cw-ia-seg" : "cw-ia-star"}${half && Number.isInteger(value) ? " is-right" : ""}${(scale.labels ? value === score : value <= score) ? " is-lit" : ""}${value === score ? " is-on" : ""}" data-ia-act="score" data-ia-score="${value}"${scale.values.includes(value) ? "" : " disabled"} aria-label="${scale.labels ? esc(label(value)) : `Rate ${label(value)} out of ${scale.max}`}" aria-pressed="${value === score}">${scale.labels ? esc(label(value)) : icon("star")}</button>`).join("");
+      return `<div class="cw-ia-score"><div class="cw-ia-score-summary"><span>Your score</span><strong><b data-ia-score-value>${esc(label(score))}</b>${scale.labels || score == null ? "" : `<small>/${scale.max}</small>`}</strong></div><div class="cw-ia-rating-choices ${scale.labels ? "cw-ia-segs" : `cw-ia-stars${half ? "" : " is-whole"}`}" style="--ia-score-count:${scale.values.length}" role="group" aria-label="Your rating">${buttons}</div>${scale.values.length ? "" : '<p class="cw-ia-note">These providers have no shared rating choices. Rate each provider separately.</p>'}</div>`;
+    }
+
+    function previewScore(value) {
+      const scale = scoreScale();
+      el.querySelectorAll("[data-ia-score]").forEach(button => {
+        button.classList.toggle("is-lit", scale.labels ? Number(button.dataset.iaScore) === value : Number(button.dataset.iaScore) <= value);
+        if (scale.labels) button.classList.toggle("is-on", Number(button.dataset.iaScore) === value);
+      });
+      const label = el.querySelector("[data-ia-score-value]");
+      if (label) label.textContent = value == null ? "Not rated" : scale.labels?.[value] || String(value * scale.display_factor);
+    }
 
     function head(symbol, title, sub, logoProvider = "") {
       const mark = logoProvider ? logoHtml(logoProvider) : `<span class="cw-ia-logo is-icon">${icon(symbol)}</span>`;
-      return `<div class="cw-ia-head">${mark}<span class="cw-ia-head-copy"><strong>${esc(title)}</strong><small>${esc(sub)}</small></span></div>`;
+      return `<div class="cw-ia-head">${mark}<span class="cw-ia-head-copy"><strong>${esc(title)}</strong>${sub ? `<small>${esc(sub)}</small>` : ""}</span></div>`;
     }
 
     function links() {
@@ -594,7 +676,7 @@
     }
 
     function addLabel(target) {
-      if (ctx.feature === "ratings") return `Rate ${score} on ${target}`;
+      if (ctx.feature === "ratings") return `Rate ${scoreText(score)} on ${target}`;
       if (ctx.feature === "history") return when === "copy" ? `Copy the watch of ${fmtDate(ctx.epoch)} to ${target}` : `Mark watched on ${target}`;
       if (ctx.feature === "collection") return `Add to ${target} collection`;
       return `Add to ${target} watchlist`;
@@ -623,7 +705,7 @@
       const present = (refs.present || []).some((ref) => refKey(ref) === refKey(focus));
       const name = providerName(focus.provider);
       const rating = present && feature === "ratings" ? ratingOf(ctx, focus) : null;
-      const sub = present ? (rating ? `Rated ${rating}/10` : FEATURES[feature].present) : FEATURES[feature].missing;
+      const sub = feature === "ratings" ? "" : present ? FEATURES[feature].present : FEATURES[feature].missing;
       const top = head("", `${name} · ${accountName(focus, list)}`, sub, focus.provider);
       const body = [];
       const unpaired = list.some((row) => refKey(row) === refKey(focus) && row.in_pair === false);
@@ -631,15 +713,14 @@
         body.push(`<p class="cw-ia-note">${icon("lock")}${esc(hiddenReason(focus) || "Not one of your accounts for this")}</p>`);
       } else if (present) {
         if (feature === "ratings") {
-          body.push(stepper());
-          if (score !== rating) body.push(item("add-one", "star", `Change to ${score} on ${name}`, "accent"));
+          body.push(ratingStars());
         }
         const armed = isArmed("one");
         body.push(item("remove-one", armed ? "warning" : "delete", armed ? "Click again to remove every watch here" : removeLabel(name), "danger"));
       } else {
-        if (feature === "ratings") body.push(stepper());
+        if (feature === "ratings") body.push(ratingStars());
         body.push(whenHtml());
-        body.push(item("add-one", feature === "ratings" ? "star" : "add", addLabel(name), "accent", dateReady() ? "" : " disabled"));
+        if (feature !== "ratings") body.push(item("add-one", "add", addLabel(name), "accent", dateReady() ? "" : " disabled"));
       }
       if (unpaired) body.push(`<p class="cw-ia-note">${icon("info")}${esc(pairNote())}</p>`);
       return `${top}<div class="cw-ia-list">${body.join("")}</div>${links()}`;
@@ -656,23 +737,23 @@
         const key = refKey(ref);
         const canWrite = writable(ref);
         const rating = on && feature === "ratings" ? ratingOf(ctx, ref) : null;
-        const pill = on ? `<span class="cw-ia-pill is-on">${esc(rating ? `${rating}/10` : "On")}</span>` : `<span class="cw-ia-pill is-off">Missing</span>`;
+        const pill = on ? `<span class="cw-ia-pill is-on">${esc(rating != null ? scoreText(rating, scaleFor(ref)) : "On")}</span>` : `<span class="cw-ia-pill is-off">Missing</span>`;
         const armed = isArmed(`row:${key}`);
         const action = !canWrite
           ? `<span class="cw-ia-lock" title="${esc(hiddenReason(ref) || "Not one of your accounts for this")}">${icon("lock")}</span>`
           : on
             ? `<button type="button" class="cw-ia-link is-danger${armed ? " is-armed" : ""}" data-ia-act="row" data-ia-ref="${esc(key)}" data-ia-on="1">${armed ? "Confirm" : "Remove"}</button>`
-            : `<button type="button" class="cw-ia-link" data-ia-act="row" data-ia-ref="${esc(key)}" data-ia-on="0">${feature === "ratings" ? `Rate ${score}` : "Add"}</button>`;
+            : `<button type="button" class="cw-ia-link" data-ia-act="${feature === "ratings" && !scoreScale().values.length ? "choose-rating" : "row"}" data-ia-ref="${esc(key)}" data-ia-on="0"${feature === "ratings" && scaleFor(ref).unavailable ? " disabled" : ""}>${feature === "ratings" ? scoreScale().values.length ? `Rate ${scoreText(score, scaleFor(ref))}` : "Choose rating" : "Add"}</button>`;
         return `<div class="cw-ia-row${on ? " is-on" : ""}">${logoHtml(ref.provider)}<span class="cw-ia-row-copy"><strong>${esc(providerName(ref.provider))}</strong><small>${esc(accountName(ref, list))}</small></span>${pill}${action}</div>`;
       }).join("");
       const removable = present.filter(writable);
       const foot = [];
-      if (missing.length) foot.push(`<button type="button" class="cw-ia-btn is-primary" data-ia-act="add-all"${dateReady() ? "" : " disabled"}>${esc(missing.length === 1 ? addLabel(providerName(missing[0].provider)).replace(/ (watchlist|collection)$/, "") : `Add to ${missing.length} missing`)}</button>`);
+      if (missing.length && (feature !== "ratings" || scoreScale().values.length)) foot.push(`<button type="button" class="cw-ia-btn is-primary" data-ia-act="add-all"${dateReady() && (feature !== "ratings" || scoreScale().values.includes(score)) ? "" : " disabled"}>${esc(missing.length === 1 ? addLabel(providerName(missing[0].provider)).replace(/ (watchlist|collection)$/, "") : `Add to ${missing.length} missing`)}</button>`);
       if (removable.length > 1) {
         const armed = isArmed("all");
         foot.push(`<button type="button" class="cw-ia-btn is-danger${armed ? " is-armed" : ""}" data-ia-act="remove-all">${esc(armed ? "Click again to confirm" : "Remove from all")}</button>`);
       }
-      return `${head(FEATURE_ICONS[feature], title, sub)}${feature === "ratings" && missing.length ? `<div class="cw-ia-list">${stepper()}</div>` : ""}${missing.length ? whenHtml() : ""}${section("Your accounts")}<div class="cw-ia-rows">${rows || `<p class="cw-ia-note">${icon("info")}None of your accounts can hold this.</p>`}</div>${links()}${foot.length ? `<div class="cw-ia-foot">${foot.join("")}</div>` : ""}`;
+      return `${head(FEATURE_ICONS[feature], title, sub)}${feature === "ratings" && missing.length ? `<div class="cw-ia-list">${ratingStars()}</div>` : ""}${missing.length ? whenHtml() : ""}${section("Your accounts")}<div class="cw-ia-rows">${rows || `<p class="cw-ia-note">${icon("info")}None of your accounts can hold this.</p>`}</div>${links()}${foot.length ? `<div class="cw-ia-foot">${foot.join("")}</div>` : ""}`;
     }
 
     function progressHtml() {
@@ -754,7 +835,7 @@
 
     function onClick(event) {
       const button = event.target?.closest?.("[data-ia-act]");
-      if (!button || !ctx) return;
+      if (!button || button.disabled || !ctx) return;
       const action = button.dataset.iaAct;
       const current = ctx;
       if (action === "ev-toggle") {
@@ -785,9 +866,18 @@
         render();
         return;
       }
-      if (action === "score-down" || action === "score-up") {
-        score = Math.max(1, Math.min(10, score + (action === "score-up" ? 1 : -1)));
+      if (action === "score") {
+        if (!scoreScale().values.includes(Number(button.dataset.iaScore))) return;
+        score = Number(button.dataset.iaScore);
+        if (current.focus && writable(current.focus)) {
+          const present = (current.refs.present || []).some(ref => refKey(ref) === refKey(current.focus));
+          const unchanged = present && score === projectedScore(ratingOf(current, current.focus), scoreScale());
+          close(true);
+          if (!unchanged) void run(addJob(current, [current.focus], list, { fields: { rating: score }, noUndo: true }));
+          return;
+        }
         render();
+        el.querySelector(`[data-ia-score="${score}"]`)?.focus({ preventScroll: true });
         return;
       }
       if (action === "history") {
@@ -810,6 +900,16 @@
         return {};
       };
       const all = [...(current.refs.present || []), ...(current.refs.missing || [])].map(cleanRef);
+      if (action === "choose-rating") {
+        const ref = all.find(entry => refKey(entry) === button.dataset.iaRef);
+        if (!ref || !writable(ref)) return;
+        ctx.focus = ref;
+        const scale = scoreScale();
+        score = selectableScore(score ?? ratingOf(ctx, ref) ?? 8, scale);
+        render();
+        el.querySelector(`[data-ia-score="${score}"]`)?.focus();
+        return;
+      }
       if (action === "row") {
         const ref = all.find((entry) => refKey(entry) === button.dataset.iaRef);
         if (!ref || !writable(ref)) return;
@@ -818,17 +918,20 @@
           close(true);
           void run(removeJob(current, [ref], list));
         } else {
+          if (current.feature === "ratings" && !scoreScale().values.includes(score)) return;
           close(true);
           void run(addJob(current, [ref], list, addOptions()));
         }
         return;
       }
       if (action === "add-one") {
+        if (current.feature === "ratings" && !scoreScale().values.includes(score)) return;
         close(true);
         void run(addJob(current, [current.focus], list, addOptions()));
         return;
       }
       if (action === "add-all") {
+        if (current.feature === "ratings" && !scoreScale().values.includes(score)) return;
         const refs = missingRefs();
         close(true);
         void run(addJob(current, refs, list, addOptions()));
@@ -861,7 +964,7 @@
       customDate = "";
       armedUntil = 0;
       armedRow = "";
-      score = ratingOf(ctx, ctx.focus || {}) || Math.round(Number(options.rating)) || 8;
+      score = ratingOf(ctx, ctx.focus || {}) || ratingOf({ rating: options.rating }, {}) || 8;
       list = Object.assign([], { loading: true });
       hidden = [];
       others = [];
@@ -888,8 +991,13 @@
         const seen = new Set([...ctx.refs.present, ...ctx.refs.missing].map(refKey));
         ctx.refs.missing = [...ctx.refs.missing, ...result.rows.filter((row) => !seen.has(refKey(row))).map(cleanRef)];
       }
+      if (ctx.feature === "ratings") {
+        const scale = scoreScale();
+        const saved = ctx.focus ? ratingOf(ctx, ctx.focus) : null;
+        score = selectableScore(saved ?? score, scale);
+      }
       render();
-      el.querySelector("button,input")?.focus({ preventScroll: true });
+      (el.querySelector(`[data-ia-score="${score}"]`) || el.querySelector("button,input"))?.focus({ preventScroll: true });
       return true;
     }
 

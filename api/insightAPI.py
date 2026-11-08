@@ -27,6 +27,8 @@ from cw_platform.provider_instances import (
     provider_display_key,
     sanitize_instance_label,
 )
+from cw_platform.config_base import CONFIG
+from cw_platform.tracker_store import TrackerStore, tracker_context
 
 _SHADOW_CACHE_LOCK = threading.Lock()
 _SHADOW_CACHE: dict[str, tuple[tuple[int, int], dict[str, Any] | None]] = {}
@@ -266,6 +268,9 @@ def _settings_auth_summary(cfg: dict[str, Any]) -> dict[str, Any]:
         if provider == "silo":
             b = _dict(block)
             return bool(_txt(b.get("server_url")) and _txt(b.get("profile_id"))) and _has(b, "access_token", "refresh_token")
+        if provider == "tofa":
+            b = _dict(block)
+            return bool(_txt(b.get("server_url")) and _txt(b.get("server_id")) and _txt(b.get("profile_id"))) and _has(b, "access_token", "refresh_token")
         return _has(block, *_AUTH_KEYS.get(provider, ("access_token", "api_key", "token")))
 
     profiles: list[dict[str, Any]] = []
@@ -2047,22 +2052,19 @@ def register_insights(app: FastAPI) -> None:
 
                 def _profile_snapshot_info(inst: str, block: dict[str, Any]) -> dict[str, Any]:
                     root_dir = str((block or {}).get("root_dir") or "/config/.cw_provider").strip() or "/config/.cw_provider"
-                    snap_dir = Path(root_dir).joinpath("snapshots")
                     selected: dict[str, str] = {
                         feat: str((block or {}).get(f"restore_{feat}") or "latest").strip() or "latest"
                         for feat in ("watchlist", "history", "ratings", "progress", "collection")
                     }
 
-                    files: list[Path] = []
-                    if snap_dir.is_dir():
-                        files = list(snap_dir.glob("*.json"))
+                    from services.tracker_migration import migrating
 
-                    by_feat: dict[str, list[str]] = {"watchlist": [], "history": [], "ratings": [], "progress": [], "playlists": [], "collection": []}
-                    for p in files:
-                        name = p.name
-                        for feat in by_feat.keys():
-                            if name.endswith(f"-{feat}.json"):
-                                by_feat[feat].append(name)
+                    tracker_root = tracker_context(cfg, CONFIG, inst)[1]
+                    store = TrackerStore(tracker_root)
+                    by_feat: dict[str, list[str]] = {
+                        feat: [] if migrating(tracker_root) else [point.name for point in store.restore_points(feat)]
+                        for feat in ("watchlist", "history", "ratings", "progress", "playlists", "collection")
+                    }
 
                     profile_info: dict[str, Any] = {}
                     for feat, arr in by_feat.items():

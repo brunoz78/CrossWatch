@@ -10,6 +10,7 @@ import pytest
 
 from providers.sync import _mod_SCROB as mod
 from providers.sync.scrob import _collection, _history, _progress, _ratings, _watchlist
+from cw_platform.id_map import minimal as id_minimal
 
 
 @dataclass
@@ -54,6 +55,66 @@ class FakeAdapter:
         if handler is None:
             return ResponseStub(200, {})
         return handler(kwargs) if callable(handler) else handler
+
+
+@pytest.mark.parametrize("provider", [_progress, _ratings, _collection, _watchlist])
+@pytest.mark.parametrize("operation", ["add", "remove"])
+def test_failed_writes_preserve_reason_and_source_item(monkeypatch, provider, operation):
+    items = [
+        {"type": "movie", "ids": {"tmdb": str(tmdb)}, "title": title, "rating": 7,
+         "progress_percent": 40, "duration_ms": 100000, "_scrob_media_id": str(tmdb),
+         "_scrob_list_id": "1", "_scrob_list_item_id": str(tmdb)}
+        for tmdb, title in [(550, "First movie"), (551, "Second movie")]
+    ]
+    monkeypatch.setattr(provider, "scrob_request", lambda *a, **kw: ResponseStub(503, {"detail": "unavailable"}))
+    if provider is _progress:
+        monkeypatch.setattr(provider, "webhook_post", lambda *a, **kw: ResponseStub(503, {}))
+    if provider is _watchlist:
+        monkeypatch.setattr(provider, "resolve_list_id", lambda *a, **kw: 1)
+    result = getattr(provider, operation)(FakeAdapter(), iter(items))
+    assert len(result["unresolved"]) == 2
+    assert not result["confirmed_keys"]
+    for row, item in zip(result["unresolved"], items):
+        assert row["status"] == row["reason"] == "http:503"
+        assert row["item"] == id_minimal(item)
+
+
+@pytest.mark.parametrize("provider,operation,item,reason", [
+    (_progress, "add", {"type": "movie", "ids": {"tmdb": "550"}, "progress_percent": 95, "duration_ms": 100000}, "outside_supported_progress_window"),
+    (_progress, "add", {"type": "movie", "ids": {"tmdb": "550"}}, "missing_duration_or_percent"),
+    (_progress, "remove", {"type": "movie", "ids": {"tmdb": "550"}}, "missing_scrob_media_id"),
+    (_ratings, "add", {"type": "movie", "ids": {"tmdb": "550"}}, "missing_supported_id_or_rating"),
+    (_collection, "add", {"type": "movie", "ids": {"imdb": "tt0137523"}}, "missing_supported_id_or_type"),
+    (_watchlist, "add", {"type": "movie", "ids": {"imdb": "tt0137523"}}, "missing_supported_id_or_type"),
+])
+def test_validation_failures_preserve_reason_and_source_item(provider, operation, item, reason):
+    result = getattr(provider, operation)(FakeAdapter(), [item])
+    row = result["unresolved"][0]
+    assert row["reason"] == row["status"] == reason
+    assert row["item"] == id_minimal(item)
+
+
+def test_watchlist_creation_failure_preserves_each_source(monkeypatch):
+    monkeypatch.setattr(_watchlist, "resolve_list_id", lambda *a, **kw: None)
+    items = [{"type": "movie", "ids": {"tmdb": str(tmdb)}} for tmdb in (550, 551)]
+    rows = _watchlist.add(FakeAdapter(), iter(items))["unresolved"]
+    assert [row["item"] for row in rows] == [id_minimal(item) for item in items]
+    assert all(row["reason"] == "watchlist_unavailable" for row in rows)
+
+
+@pytest.mark.parametrize("raises", [True, False])
+def test_progress_transport_or_body_failure_has_a_stable_reason(monkeypatch, raises):
+    def respond(*args, **kwargs):
+        if raises:
+            raise TimeoutError("transport detail")
+        return ResponseStub(200, {"status": "ignored"})
+
+    monkeypatch.setattr(_progress, "webhook_post", respond)
+    item = {"type": "movie", "ids": {"tmdb": "550"}, "progress_percent": 40, "duration_ms": 100000}
+    row = _progress.add(FakeAdapter(), [item])["unresolved"][0]
+    assert row["reason"] == "progress_write_failed"
+    assert row["status"] == ("TimeoutError" if raises else "http:200")
+    assert row["item"] == id_minimal(item)
 
 
 @pytest.fixture(autouse=True)
@@ -203,6 +264,69 @@ def test_history_index_follows_pagination():
     }
     adapter = FakeAdapter({("GET", "history"): lambda kw: ResponseStub(200, pages[kw["params"]["page"]])})
     assert len(_history.build_index(adapter)) == 2
+
+
+@pytest.mark.parametrize("total", [50_000, 50_001])
+def test_history_index_reads_past_old_page_cap(total: int):
+    def page(kw: Any) -> ResponseStub:
+        number = kw["params"]["page"]
+        size = kw["params"]["page_size"]
+        start = (number - 1) * size
+        return ResponseStub(200, {
+            "results": [history_row(id=i + 1) for i in range(start, min(start + size, total))],
+            "total_pages": (total + size - 1) // size,
+            "total_results": total,
+        })
+
+    adapter = FakeAdapter({("GET", "history"): page})
+    adapter.config["scrob"]["history_max_pages"] = 1
+
+    index = _history.build_index(adapter)
+
+    assert len(index) == total
+    assert {row["_scrob_history_id"] for row in index.values()} == {str(i) for i in range(1, total + 1)}
+    assert [call["params"]["page"] for call in adapter.calls] == list(range(1, (total + 99) // 100 + 1))
+
+
+def test_history_index_rejects_changing_total():
+    from providers.sync.scrob._common import ScrobError
+
+    def page(kw: Any) -> ResponseStub:
+        number = kw["params"]["page"]
+        return ResponseStub(200, {"results": [history_row(id=number)], "total_pages": 3, "total_results": number + 2})
+
+    with pytest.raises(ScrobError, match="scrob_history_total_changed:3->4"):
+        _history.build_index(FakeAdapter({("GET", "history"): page}))
+
+
+def test_history_index_rejects_missing_rows_on_last_page():
+    from providers.sync.scrob._common import ScrobError
+
+    adapter = FakeAdapter({("GET", "history"): ResponseStub(200, {
+        "results": [history_row()], "total_pages": 1, "total_results": 2,
+    })})
+
+    with pytest.raises(ScrobError, match="scrob_history_incomplete_read:1/2"):
+        _history.build_index(adapter)
+
+
+def test_history_index_can_be_cancelled_between_pages(monkeypatch: pytest.MonkeyPatch):
+    from cw_platform.run_control import SyncCancelled
+    from providers.sync.scrob import _common
+
+    adapter = FakeAdapter({("GET", "history"): ResponseStub(200, {
+        "results": [history_row()], "total_pages": 2, "total_results": 2,
+    })})
+
+    def cancel():
+        if adapter.calls:
+            raise SyncCancelled()
+
+    monkeypatch.setattr(_common, "raise_if_cancelled", cancel)
+
+    with pytest.raises(SyncCancelled):
+        _history.build_index(adapter)
+    assert len(adapter.calls) == 1
 
 
 def test_history_add_sends_watched_at_for_movies():

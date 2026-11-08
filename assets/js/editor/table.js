@@ -18,7 +18,7 @@
 
   function dataColumnOrder(ctx = {}) {
     const order = Array.isArray(ctx.state?.columnOrder) ? ctx.state.columnOrder : [];
-    const valid = ["key", "type", "title", "year", "id", "imdb", "tvdb", "trakt", "simkl", "anilist", "extra"];
+    const valid = ["key", "type", "title", "year", "id", "imdb", "tvdb", "trakt", "simkl", "anilist", "extra", "status"];
     const seen = new Set();
     const out = [];
     order.forEach(column => {
@@ -61,7 +61,7 @@
         chip.appendChild(text);
       }
       if (entry) {
-        chip.title = [unverified ? `Sent to ${name}` : `On ${name}`, entry[1] > 1 ? `${entry[1]} entries` : "", entry[2] != null ? String(entry[2]) : ""].filter(Boolean).join(" Â· ")
+        chip.title = [unverified ? `Sent to ${name}` : `On ${name}`, entry[1] > 1 ? `${entry[1]} entries` : "", entry[2] != null ? String(entry[2]) : ""].filter(Boolean).join(" · ")
           + (unverified ? ". Not validated, missing sync pair." : "");
         chip.setAttribute("role", "img");
         chip.setAttribute("aria-label", chip.title);
@@ -289,6 +289,7 @@
       if (value) row.raw.ids[idKey] = value;
       else delete row.raw.ids[idKey];
       call(ctx, "markChanged");
+      call(ctx, "updateStatusCells", row);
     };
 
     const makeIdInput = (idKey, label) => {
@@ -382,15 +383,20 @@
     dataCells.simkl = cell(simklIn, "cw-col-simkl");
     dataCells.anilist = cell(anilistIn, "cw-col-anilist");
 
-    const extraBtn = document.createElement("button");
-    extraBtn.type = "button";
-    extraBtn.className = "cw-extra-display";
-    call(ctx, "updateExtraDisplay", row, extraBtn);
+    const inlineDate = !ctx.merged && (state.kind === "history" || state.kind === "collection") && ctx.createDateTimeEditor;
+    const extraBtn = inlineDate ? ctx.createDateTimeEditor(row) : document.createElement("button");
+    if (!inlineDate) {
+      extraBtn.type = "button";
+      extraBtn.className = "cw-extra-display";
+      call(ctx, "updateExtraDisplay", row, extraBtn);
+    }
 
     if (!call(ctx, "isExtraKindEditable")) {
       extraBtn.disabled = true;
       extraBtn.style.opacity = "0.6";
       extraBtn.style.cursor = "default";
+    } else if (inlineDate) {
+      extraBtn.disabled = false;
     } else if (state.kind === "ratings") {
       extraBtn.onclick = () => call(ctx, "openRatingEditor", row, extraBtn, extraBtn);
     } else if (state.kind === "history") {
@@ -401,6 +407,13 @@
       extraBtn.onclick = () => call(ctx, "openProgressEditor", row, extraBtn, extraBtn);
     }
     dataCells.extra = cell(extraBtn, "cw-col-extra");
+    dataCells.extra.classList.toggle("cw-empty-extra", extraBtn.disabled && !extraBtn.textContent.trim());
+    const status = call(ctx, "statusForRow", row) || {label: "—", hint: ""};
+    const statusText = document.createElement("span");
+    statusText.dataset.statusRow = String(row._rid);
+    statusText.textContent = status.label;
+    statusText.title = status.hint;
+    dataCells.status = cell(statusText, "cw-col-status");
 
     dataColumnOrder(ctx).forEach(column => {
       const td = dataCells[column];
@@ -408,7 +421,7 @@
       td.dataset.column = column;
       td.dataset.label = ({key: 'Key', type: 'Type', title: 'Title', year: 'Year',
         id: anilistMode ? 'MAL' : 'TMDB', imdb: 'IMDb', tvdb: 'TVDB', trakt: 'Trakt',
-        simkl: 'SIMKL', anilist: 'AniList', extra: call(ctx, 'columnLabel', 'extra') || 'Extra'})[column];
+        simkl: 'SIMKL', anilist: 'AniList', status: 'Status', extra: call(ctx, 'columnLabel', 'extra') || 'Extra'})[column];
       td.querySelectorAll('input,button').forEach(control => {
         if (!control.hasAttribute('aria-label')) control.setAttribute('aria-label', td.dataset.label);
       });

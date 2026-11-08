@@ -448,6 +448,8 @@ def _non_admin_permission_allowed(user: dict, path: str, method: str = "GET") ->
         return bool(perms.get("scrobbler"))
     if path == "/api/scheduling/profiles" or path.startswith("/api/scheduling/profiles/"):
         return bool(perms.get("schedule"))
+    if path == "/api/tracker" or path.startswith("/api/tracker/"):
+        return write
     if m in {"POST", "PUT", "PATCH", "DELETE"}:
         if not write:
             return False
@@ -1079,6 +1081,18 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
 
 
     try:
+        from cw_platform.config_base import CONFIG as _tracker_config_dir
+        from services.tracker_migration import start as _start_tracker_migration
+        from services.tracker_storage_maintenance import start as _start_tracker_storage
+
+        _start_tracker_migration(load_config() or {}, _tracker_config_dir)
+        _start_tracker_storage(load_config, _tracker_config_dir)
+    except Exception as e:
+        try:
+            _UIHostLogger("SYNC")(f"tracker database move startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
         global scheduler
         if scheduler is not None:
             from services.scheduling import scheduler_should_run
@@ -1132,6 +1146,12 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        try:
+            from services.tracker_storage_maintenance import stop as _stop_tracker_storage
+
+            _stop_tracker_storage()
+        except Exception:
+            pass
         try:
             from services.health_alerts import stop_worker as _stop_health_alerts
 

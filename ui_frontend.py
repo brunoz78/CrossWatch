@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.staticfiles import StaticFiles
 from api.versionAPI import CURRENT_VERSION
-from cw_platform.access_policy import clean_managed_permissions, managed_settings_access, reconnect_connection_keys
+from cw_platform.access_policy import clean_managed_permissions, managed_profile_instances, managed_settings_access, provider_display_key, reconnect_connection_keys
 
 __all__ = ["register_assets_and_favicons", "register_ui_root", "get_index_html"]
 
@@ -133,17 +133,17 @@ def register_ui_root(app: FastAPI) -> None:
 
 
 _HELPER_SCRIPTS = (
-    "help-links.js", "provider-meta.js", "feature-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js", "details-log.js",
-    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js", "providers-ui.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
+    "selection-bar.js", "help-links.js", "touch-help.js", "provider-meta.js", "feature-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js", "details-log.js",
+    "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js", "month-bar.js", "providers-ui.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
     "restart_apply.js",
 )
 _APP_SCRIPTS = (
-    "syncbar.js", "run-summary-stream.js", "overview-profile.js", "settings-scope.js", "sync-reviews.js", "plex-recovery-notifications.js", "main.js", "connections.overlay.js", "connections.pairs.overlay.js", "scheduler.js", "scheduler-profiles.js",
+    "syncbar.js", "run-summary-stream.js", "overview-profile.js", "settings-scope.js", "sync-reviews.js", "plex-recovery-notifications.js", "tracker-notifications.js", "main.js", "connections.overlay.js", "connections.pairs.overlay.js", "scheduler.js", "scheduler-profiles.js",
     "schedulerbanner.js", "playingcard.js", "insights.js", "activity.js", "item-actions.js", "profile-media-modal.js", "dashboard-widgets.js", "auth-dots.js", "main-status.js",
     "scrobbler.js", "user-profiles.js", "app-users.js", "mcp-access.js", "assistant-settings.js",
 )
 _USER_HELPER_SCRIPTS = (
-    "help-links.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js",
+    "selection-bar.js", "help-links.js", "touch-help.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js",
     "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js",
 )
 _USER_APP_SCRIPTS = (
@@ -211,6 +211,8 @@ _ADMIN_ONLY_MARKERS: tuple[tuple[str, str], ...] = (
     ('id="app_user_manager"', "user manager"),
     ("app_auth_oidc_client_secret", "OIDC credentials form"),
     ("cwAboutMenuSelect('assistant')", "assistant menu item"),
+    ('id="page-tracker"', "tracker page"),
+    ('id="tab-tracker"', "tracker tab"),
 )
 _ASSISTANT_MENU_ITEM = (
     '        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect(\'assistant\')">'
@@ -231,6 +233,17 @@ _SETTINGS_LEFT_END = "      </div>\n    </div>\n  </section>\n\n\n</main>"
 _MANAGED_SETTINGS_PANES = (("connections", "providers"), ("pairs", "sync"), ("schedule", "scheduling"), ("scrobbler", "scrobbler"))
 _SETTINGS_PANE_CLASSES = frozenset({"cw-settings-pane", "cw-settings-nav-btn"})
 _SETTINGS_NAV_BUTTON = re.compile(r'          <button type="button" class="cw-settings-nav-btn(?: active)?" data-pane="(?P<pane>[a-z]+)"[^\n]*\n.*?          </button>\n', re.S)
+
+
+def _managed_tracker_allowed(user: dict | None) -> bool:
+    if not _managed_user_permissions(user).get("write"):
+        return False
+    try:
+        from cw_platform.config_base import load_config
+
+        return bool(managed_profile_instances(load_config() or {}, user).get(provider_display_key("CROSSWATCH")))
+    except Exception:
+        return False
 
 
 def _managed_settings_panes(user: dict | None) -> set[str]:
@@ -267,9 +280,10 @@ def _remaining_settings_panes(html: str) -> set[str]:
     return scanner.panes
 
 
-def _assert_admin_shell_stripped(html: str, *, settings_panes: set[str] | None = None) -> None:
+def _assert_admin_shell_stripped(html: str, *, settings_panes: set[str] | None = None, tracker: bool = False) -> None:
     allowed = settings_panes or set()
-    leaked = [label for marker, label in _ADMIN_ONLY_MARKERS if marker in html and not (allowed and marker == 'id="page-settings"')]
+    kept = {'id="page-tracker"', 'id="tab-tracker"'} if tracker else set()
+    leaked = [label for marker, label in _ADMIN_ONLY_MARKERS if marker in html and marker not in kept and not (allowed and marker == 'id="page-settings"')]
     if allowed:
         leaked += [f"settings pane {pane or '?'}" for pane in sorted(_remaining_settings_panes(html) - allowed)]
     if not leaked:
@@ -288,13 +302,13 @@ def _profile_nav_tab(label: str, href: str, active: bool = False) -> str:
 
 def _profile_bulk_bar(bar_id: str, scope: str) -> str:
     return (
-        f'    <div id="{bar_id}" class="cw-tl-bulk" hidden>\n'
-        f'      <span class="cw-tl-bulk-count"><strong data-{scope}-count>0</strong><span>selected</span></span>\n'
-        f'      <button class="cw-tl-ghost" type="button" data-{scope}-select="visible"><span class="material-symbols-rounded" aria-hidden="true">select_all</span>Visible</button>\n'
-        f'      <button class="cw-tl-ghost" type="button" data-{scope}-select="all"><span class="material-symbols-rounded" aria-hidden="true">checklist</span>All results</button>\n'
-        f'      <button class="cw-tl-ghost" type="button" data-{scope}-select="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>\n'
-        '      <span class="cw-tl-bulk-actions">\n'
-        f'        <button class="cw-tl-action cw-tl-remove" type="button" data-{scope}-remove><span class="material-symbols-rounded" aria-hidden="true">delete</span>Remove</button>\n'
+        f'    <div id="{bar_id}" class="cw-tl-bulk cw-selection-bar" role="group" aria-label="Selected items" hidden>\n'
+        f'      <span class="cw-selection-count" aria-live="polite"><span class="material-symbols-rounded" aria-hidden="true">check_box_outline_blank</span><strong data-{scope}-count>0</strong><span>selected</span></span>\n'
+        f'      <button class="cw-selection-button" type="button" data-{scope}-select="visible"><span class="material-symbols-rounded" aria-hidden="true">visibility</span>Visible</button>\n'
+        f'      <button class="cw-selection-button" type="button" data-{scope}-select="all"><span class="material-symbols-rounded" aria-hidden="true">checklist</span>All results</button>\n'
+        f'      <button class="cw-selection-button" type="button" data-{scope}-select="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>\n'
+        '      <span class="cw-selection-actions">\n'
+        f'        <button class="cw-selection-button is-danger" type="button" data-{scope}-remove><span class="material-symbols-rounded" aria-hidden="true">delete</span>Remove</button>\n'
         '      </span>\n'
         '    </div>\n'
     )
@@ -484,15 +498,15 @@ def _profile_playback_panel() -> str:
         </select>
       </div>
     </div>
-    <div id="profile-playback-bulk" class="cw-tl-bulk" hidden>
-      <span class="cw-tl-bulk-count"><strong data-playback-count>0</strong><span>selected</span></span>
-      <button class="cw-tl-ghost" type="button" data-playback-bulk-select="visible"><span class="material-symbols-rounded" aria-hidden="true">select_all</span>Visible</button>
-      <button class="cw-tl-ghost" type="button" data-playback-bulk-select="all"><span class="material-symbols-rounded" aria-hidden="true">checklist</span>All results</button>
-      <button class="cw-tl-ghost" type="button" data-playback-bulk-select="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>
-      <span class="cw-tl-bulk-actions">
-        <button class="cw-tl-action cw-tl-text" type="button" data-playback-bulk="update_progress" title="Edit progress"><span class="material-symbols-rounded" aria-hidden="true">edit</span>Edit progress</button>
-        <button class="cw-tl-action cw-tl-text is-good" type="button" data-playback-bulk="mark_watched" title="Mark as watched"><span class="material-symbols-rounded" aria-hidden="true">check_circle</span>Mark watched</button>
-        <button class="cw-tl-action cw-tl-remove" type="button" data-playback-bulk="remove_progress" title="Remove progress"><span class="material-symbols-rounded" aria-hidden="true">delete</span>Remove</button>
+    <div id="profile-playback-bulk" class="cw-tl-bulk cw-selection-bar" role="group" aria-label="Selected items" hidden>
+      <span class="cw-selection-count" aria-live="polite"><span class="material-symbols-rounded" aria-hidden="true">check_box_outline_blank</span><strong data-playback-count>0</strong><span>selected</span></span>
+      <button class="cw-selection-button" type="button" data-playback-bulk-select="visible"><span class="material-symbols-rounded" aria-hidden="true">visibility</span>Visible</button>
+      <button class="cw-selection-button" type="button" data-playback-bulk-select="all"><span class="material-symbols-rounded" aria-hidden="true">checklist</span>All results</button>
+      <button class="cw-selection-button" type="button" data-playback-bulk-select="none"><span class="material-symbols-rounded" aria-hidden="true">close</span>Clear</button>
+      <span class="cw-selection-actions">
+        <button class="cw-selection-button" type="button" data-playback-bulk="update_progress" title="Edit progress"><span class="material-symbols-rounded" aria-hidden="true">edit</span>Edit progress</button>
+        <button class="cw-selection-button is-good" type="button" data-playback-bulk="mark_watched" title="Mark as watched"><span class="material-symbols-rounded" aria-hidden="true">check_circle</span>Mark watched</button>
+        <button class="cw-selection-button is-danger" type="button" data-playback-bulk="remove_progress" title="Remove progress"><span class="material-symbols-rounded" aria-hidden="true">delete</span>Remove</button>
       </span>
     </div>
     <dialog id="profile-playback-edit" class="cw-tl-dialog" aria-labelledby="profile-playback-edit-title">
@@ -604,6 +618,10 @@ __CW_NAV_PROFILE_ITEMS__
 
 def _managed_user_shell(html: str, user: dict | None = None) -> str:
     html = html.replace('  <section id="page-maintenance" class="card hidden tab-page"></section>\n\n', "")
+    tracker = _managed_tracker_allowed(user)
+    if not tracker:
+        html = html.replace('  <section id="page-tracker" class="card hidden tab-page cw-themed-page"></section>\n\n', "")
+    html = html.replace('    <button id="tab-tracker" class="tab" type="button" onclick="showTab(\'tracker\')">Tracker</button>\n', "")
     perms = _managed_user_permissions(user)
     write_allowed = bool(perms.get("write"))
     dashboard_allowed = bool(perms.get("dashboard")) and write_allowed
@@ -613,6 +631,7 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
             '    <button id="tab-main" class="tab active" type="button" onclick="showTab(\'main\')">Main</button>',
             '    <button id="tab-snapshots" class="tab" type="button" onclick="showTab(\'snapshots\')">Captures</button>',
             '    <button id="tab-playlists" class="tab" type="button" onclick="showTab(\'playlists\')">Playlists</button>',
+            *(['    <button id="tab-tracker" class="tab" type="button" onclick="showTab(\'tracker\')">Tracker</button>'] if tracker else []),
             '    <button id="tab-editor" class="tab" type="button" onclick="showTab(\'editor\')">Editor</button>',
             *(['    <button id="tab-settings" class="tab" type="button" onclick="showTab(\'settings\')">Settings</button>'] if settings_panes else []),
             _nav_profile_link(user),
@@ -672,7 +691,7 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
             "\n\n</main>",
         )
     html = _remove_line(html, _ASSISTANT_MENU_ITEM)
-    _assert_admin_shell_stripped(html, settings_panes=settings_panes)
+    _assert_admin_shell_stripped(html, settings_panes=settings_panes, tracker=tracker)
     return html
 
 
@@ -697,6 +716,9 @@ def _asset_block(include_admin: bool = True, user: dict | None = None) -> str:
             *(("scrobbler.js",) if "scrobbler" in panes else ()),
             *(("scheduler-profiles.js",) if "scheduling" in panes else ()),
         )
+    if full_user and _managed_tracker_allowed(user):
+        helper_scripts = (*helper_scripts, "month-bar.js")
+        app_scripts = (*app_scripts, "tracker-notifications.js")
     helper_tags = "\n".join(f'<script src="/assets/helpers/{name}?v=__CW_VERSION__" defer></script>' for name in helper_scripts)
     app_tags = "\n".join(f'<script src="/assets/js/{name}?v=__CW_VERSION__" defer></script>' for name in app_scripts)
     admin_only_tags = (
@@ -762,6 +784,7 @@ def _get_index_html_static() -> str:
     snapshots: "Captures",
     capture_compare: "Capture Compare",
     playlists: "Playlists",
+    tracker: "Tracker",
     editor: "Editor",
     analyzer: "Analyzer",
     events: "Events",
@@ -925,6 +948,7 @@ html[data-cw-initial-tab]:not([data-cw-initial-tab="main"]) #log-panel{display:n
 html[data-cw-initial-tab="snapshots"] #page-snapshots,
 html[data-cw-initial-tab="capture_compare"] #page-capture_compare,
 html[data-cw-initial-tab="playlists"] #page-playlists,
+html[data-cw-initial-tab="tracker"] #page-tracker,
 html[data-cw-initial-tab="editor"] #page-editor,
 html[data-cw-initial-tab="analyzer"] #page-analyzer,
 html[data-cw-initial-tab="maintenance"] #page-maintenance,
@@ -981,6 +1005,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
     <button id="tab-main" class="tab active" type="button" onclick="showTab('main')">Main</button>
     <button id="tab-snapshots" class="tab" type="button" onclick="showTab('snapshots')">Captures</button>
     <button id="tab-playlists" class="tab" type="button" onclick="showTab('playlists')">Playlists</button>
+    <button id="tab-tracker" class="tab" type="button" onclick="showTab('tracker')">Tracker</button>
     <button id="tab-editor" class="tab" type="button" onclick="showTab('editor')">Editor</button>
     <div class="cw-tabmenu" id="tab-settings-menu">
       <button id="tab-settings" class="tab" type="button"
@@ -1281,6 +1306,8 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
 
   <section id="page-playlists" class="card hidden tab-page cw-themed-page"></section>
 
+  <section id="page-tracker" class="card hidden tab-page cw-themed-page"></section>
+
   <section id="page-editor" class="card hidden tab-page cw-themed-page"></section>
 
   <section id="page-analyzer" class="card hidden tab-page"></section>
@@ -1456,7 +1483,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
             <div>
               <div class="cw-settings-pane-kicker">Connections</div>
               <h3>Providers and metadata</h3>
-              <p>Connect media servers and/or Trackers first (Providers) then configure Metadata (TMDb)</p>
+              <p>Connect media servers and/or Trackers first (Providers) then configure Metadata</p>
             </div>
             <div class="cw-settings-pane-head-actions">
               <div class="cw-conn-hero-summary" aria-label="Connection actions">
@@ -2240,12 +2267,12 @@ __CW_ASSET_BLOCK__
 <script>(()=>{const list=p=>[...p.querySelectorAll(':scope>.section')].filter(s=>s.dataset.accordion!=='off'),set=(s,on)=>{s.classList.toggle('open',!!on);s.querySelector('.head')?.setAttribute('aria-expanded',String(!!on));const c=s.querySelector('.chev');if(c)c.textContent=''},siblings=s=>s?.parentElement?list(s.parentElement):[];window.toggleSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;const on=!s.classList.contains('open');siblings(s).forEach(x=>set(x,x===s&&on))};window.openSection=id=>{const s=document.getElementById(id);if(!s||s.dataset.accordion==='off')return;siblings(s).forEach(x=>set(x,x===s))};document.addEventListener('click',e=>{const h=e.target?.closest?.('[data-toggle-section]');if(!h)return;e.preventDefault();window.toggleSection?.(h.dataset.toggleSection)},true);document.addEventListener('DOMContentLoaded',()=>[...new Set([...document.querySelectorAll('.section')].map(s=>s.parentElement).filter(Boolean))].forEach(p=>{const open=list(p).find(s=>s.classList.contains('open'));list(p).forEach(s=>set(s,s===open))}),{once:true})})();</script>
 
 
-<script>(()=>{const panes='#page-settings .cw-settings-pane',nav='#cw-settings-nav .cw-settings-nav-btn',norm=v=>String(v||'overview').trim().toLowerCase(),apply=p=>{const name=norm(p);let found=false;document.querySelectorAll(panes).forEach(n=>{const on=norm(n.dataset.pane)===name;n.classList.toggle('active',on);found=found||on});if(!found){const first=norm(document.querySelector(panes)?.dataset?.pane);if(first&&first!==name)return apply(first)}document.querySelectorAll(nav).forEach(b=>{const on=norm(b.dataset.pane)===name;b.classList.toggle('active',on);b.setAttribute('aria-current',on?'page':'false')});window.__cwSettingsPane=name;delete document.documentElement.dataset.cwInitialPane;document.dispatchEvent(new CustomEvent('cw-settings-pane-changed',{detail:{pane:name}}))};window.cwSettingsSelect=p=>{apply(p);const main=document.getElementById('cw-settings-left');if(main&&window.innerWidth<1200)main.scrollIntoView({behavior:'smooth',block:'start'})};apply(window.__cwSettingsPane||'overview');document.addEventListener('DOMContentLoaded',()=>apply(window.__cwSettingsPane||'overview'),{once:true});document.addEventListener('tab-changed',e=>((e?.detail?.id||e?.detail?.tab)==='settings')&&setTimeout(()=>apply(window.__cwSettingsPane||'overview'),0))})();</script>
+<script>(()=>{const panes='#page-settings .cw-settings-pane',nav='#cw-settings-nav .cw-settings-nav-btn',norm=v=>String(v||'overview').trim().toLowerCase(),apply=p=>{const name=norm(p);let found=false;document.querySelectorAll(panes).forEach(n=>{const on=norm(n.dataset.pane)===name;n.classList.toggle('active',on);found=found||on});if(!found){const first=norm(document.querySelector(panes)?.dataset?.pane);if(first&&first!==name)return apply(first)}document.querySelectorAll(nav).forEach(b=>{const on=norm(b.dataset.pane)===name;b.classList.toggle('active',on);b.setAttribute('aria-current',on?'page':'false')});window.__cwSettingsPane=name;delete document.documentElement.dataset.cwInitialPane;document.dispatchEvent(new CustomEvent('cw-settings-pane-changed',{detail:{pane:name}}))};window.cwSettingsSelect=p=>{const changed=norm(p)!==window.__cwSettingsPane;apply(p);const main=document.getElementById('cw-settings-left');if(changed&&main&&window.innerWidth<1200)main.scrollIntoView({behavior:'instant',block:'start'})};apply(window.__cwSettingsPane||'overview');document.addEventListener('DOMContentLoaded',()=>apply(window.__cwSettingsPane||'overview'),{once:true});document.addEventListener('tab-changed',e=>((e?.detail?.id||e?.detail?.tab)==='settings')&&setTimeout(()=>apply(window.__cwSettingsPane||'overview'),0))})();</script>
 <script>(()=>{const sync=e=>{const pane=String(e?.detail?.pane||window.__cwSettingsPane||'overview').toLowerCase();document.querySelectorAll('#cw-settings-menu .cw-menu-item[data-settings-pane]').forEach(item=>{const active=item.dataset.settingsPane===pane;item.classList.toggle('active',active);if(active)item.setAttribute('aria-current','page');else item.removeAttribute('aria-current')})};document.addEventListener('cw-settings-pane-changed',sync);document.addEventListener('DOMContentLoaded',sync,{once:true})})();</script>
 
 <script>(()=>{const ready=()=>{const input=document.querySelector('#cw-settings-nav .cw-settings-search input'),items=[...document.querySelectorAll('#cw-settings-nav .cw-settings-nav-btn')];if(!input||!items.length)return;const apply=()=>{const q=input.value.trim().toLowerCase();items.forEach(btn=>{btn.hidden=!!q&&!btn.textContent.toLowerCase().includes(q)})};input.addEventListener('input',apply);document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&String(e.key).toLowerCase()==='k'){e.preventDefault();window.showTab?.('settings');setTimeout(()=>input.focus(),0)}})};document.readyState==='loading'?document.addEventListener('DOMContentLoaded',ready,{once:true}):ready()})();</script>
 
-<script>(()=>{const scrollTo=id=>document.getElementById(id)?.scrollIntoView({behavior:'smooth',block:'start'});window.cwSyncJump=()=>{window.cwSettingsSelect?.('sync');setTimeout(()=>scrollTo('sec-sync'),0)};window.cwProvidersJump=sectionId=>{if(sectionId==='sec-sync')return window.cwSyncJump?.();window.cwSettingsSelect?.('providers');setTimeout(()=>{window.openSection?.(sectionId);scrollTo(sectionId)},0)};window.cwOverviewJump=(sectionId,authGroupId='')=>{if(sectionId==='sec-sync')return window.cwSyncJump?.();return(window.cwSettingsSelect?.('providers'),setTimeout(async()=>{if(sectionId==='sec-auth'){window.openSection?.('sec-auth');try{await window.mountAuthProviders?.()}catch{}if(authGroupId){window.openSection?.(authGroupId);scrollTo(authGroupId)}else scrollTo('sec-auth');return}window.openSection?.(sectionId);scrollTo(sectionId)},0))}})();</script>
+<script>(()=>{const scrollTo=id=>document.getElementById(id)?.scrollIntoView({behavior:'smooth',block:'start'});window.cwSyncJump=()=>window.cwSettingsSelect?.('sync');window.cwProvidersJump=sectionId=>{if(sectionId==='sec-sync')return window.cwSyncJump?.();window.cwSettingsSelect?.('providers');setTimeout(()=>{window.openSection?.(sectionId);scrollTo(sectionId)},0)};window.cwOverviewJump=(sectionId,authGroupId='')=>{if(sectionId==='sec-sync')return window.cwSyncJump?.();return(window.cwSettingsSelect?.('providers'),setTimeout(async()=>{if(sectionId==='sec-auth'){window.openSection?.('sec-auth');try{await window.mountAuthProviders?.()}catch{}if(authGroupId){window.openSection?.(authGroupId);scrollTo(authGroupId)}else scrollTo('sec-auth');return}window.openSection?.(sectionId);scrollTo(sectionId)},0))}})();</script>
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
@@ -2455,6 +2482,7 @@ def get_index_html(include_admin: bool = True, user: dict | None = None) -> str:
             f'data-cw-perm-watchlist="{"on" if perms.get("watchlist") else "off"}" '
             f'data-cw-perm-playback="{"on" if perms.get("playback") else "off"}" '
             f'data-cw-perm-write="{"on" if perms.get("write") else "off"}" '
+            f'data-cw-perm-tracker="{"on" if _managed_tracker_allowed(user) else "off"}" '
             f'data-cw-profile-id="{profile_id}"'
         )
         html = html.replace('<html lang="en"', attrs, 1)
@@ -2470,6 +2498,11 @@ def get_index_html(include_admin: bool = True, user: dict | None = None) -> str:
 
 def get_profile_html(user: dict | None = None) -> str:
     is_admin = bool(isinstance(user, dict) and user.get("is_admin"))
+    shared_header_scripts = ""
+    if is_admin:
+        shared_header_scripts += '<script src="/assets/js/assistant-settings.js?v=__CW_VERSION__" defer></script>'
+    if is_admin or _managed_tracker_allowed(user):
+        shared_header_scripts += '<script src="/assets/js/tracker-notifications.js?v=__CW_VERSION__" defer></script>'
     perms = {"dashboard": True, "watchlist": True, "playback": True, "write": True} if is_admin else _managed_user_permissions(user)
     esc = lambda value: html_lib.escape(str(value or ""), quote=True)
     role = "admin" if is_admin else "user"
@@ -2546,6 +2579,7 @@ def get_profile_html(user: dict | None = None) -> str:
             _profile_nav_tab("Main", "/"),
             _profile_nav_tab("Captures", "/#snapshots"),
             _profile_nav_tab("Playlists", "/#playlists"),
+            _profile_nav_tab("Tracker", "/#tracker"),
             _profile_nav_tab("Editor", "/#editor"),
             settings_nav,
             about_nav,
@@ -2555,6 +2589,7 @@ def get_profile_html(user: dict | None = None) -> str:
             _profile_nav_tab("Main", "/?main=1#main"),
             _profile_nav_tab("Captures", "/?main=1#snapshots"),
             _profile_nav_tab("Playlists", "/?main=1#playlists"),
+            *([_profile_nav_tab("Tracker", "/?main=1#tracker")] if _managed_tracker_allowed(user) else []),
             _profile_nav_tab("Editor", "/?main=1#editor"),
         ])
     else:
@@ -2648,6 +2683,7 @@ def get_profile_html(user: dict | None = None) -> str:
 <link rel="stylesheet" href="/assets/css/account-menu.css?v=__CW_VERSION__">
 <link id="cw-notifications-css" rel="stylesheet" href="/assets/css/notifications.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/css/profile-page.css?v=__CW_VERSION__">
+<link rel="stylesheet" href="/assets/css/ai-settings.css?v=__CW_VERSION__">
 <link rel="preload" href="/assets/fonts/material-symbols-rounded-full-v355.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/fonts/material-symbols-rounded.css?v=__CW_VERSION__">
 <link rel="stylesheet" href="/assets/js/modals/core/styles.css?v=__CW_VERSION__">
@@ -2708,7 +2744,7 @@ def get_profile_html(user: dict | None = None) -> str:
           <span id="profile-last-provider"></span>
         </div>
       </div>
-      <img id="profile-last-poster" class="cw-profile-last-poster" src="/assets/img/placeholder_poster.svg" alt="">
+      <img id="profile-last-poster" class="cw-profile-last-poster" src="/assets/img/placeholder_poster.svg?v=2" alt="">
     </article>
     <div id="profile-now" class="cw-profile-now hidden" aria-live="polite">
       <div class="cw-profile-now-copy">
@@ -2721,7 +2757,7 @@ def get_profile_html(user: dict | None = None) -> str:
         <div class="cw-profile-now-track"><span id="profile-now-fill"></span></div>
         <div class="cw-profile-now-times"><span id="profile-now-pct"></span><span id="profile-now-left"></span></div>
       </div>
-      <img id="profile-now-poster" class="cw-profile-now-poster" src="/assets/img/placeholder_poster.svg" alt="">
+      <img id="profile-now-poster" class="cw-profile-now-poster" src="/assets/img/placeholder_poster.svg?v=2" alt="">
     </div>
   </section>
 {view_as_banner}
@@ -3066,9 +3102,11 @@ def get_profile_html(user: dict | None = None) -> str:
 }})();
 </script>
 <script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>
+<script src="/assets/helpers/selection-bar.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/provider-meta.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/icon-select.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/profile-select.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/auth-state.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/account-menu.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/notifications.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/update-notifications.js?v=__CW_VERSION__" defer></script>
@@ -3076,6 +3114,7 @@ def get_profile_html(user: dict | None = None) -> str:
 <script src="/assets/js/overview-profile.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/sync-reviews.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/plex-recovery-notifications.js?v=__CW_VERSION__" defer></script>
+{shared_header_scripts}
 <script src="/assets/helpers/api.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/media-meta.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/trailer.js?v=__CW_VERSION__" defer></script>
@@ -3087,6 +3126,7 @@ def get_profile_html(user: dict | None = None) -> str:
 <script src="/assets/helpers/profile-datetime.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/item-actions.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/profile-media-modal.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/month-bar.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/profile-page.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/js/theme-flat-runtime.js?v=__CW_VERSION__" defer></script>
 </body>
