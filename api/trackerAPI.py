@@ -5,19 +5,23 @@ from __future__ import annotations
 
 import math
 import re
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from cw_platform.access_policy import request_user, user_can_access_instance
+from cw_platform.anime_mapping.history_coords import alias_context, tmdb_coordinate
 from cw_platform.config_base import CONFIG, load_config
 from cw_platform.history_events import history_epoch_from_item
-from cw_platform.id_map import canonical_key, minimal as id_minimal
+from cw_platform.id_map import ID_KEYS, canonical_key, minimal as id_minimal
 from cw_platform.provider_instances import get_provider_block, list_instance_ids, normalize_instance_id, sanitize_instance_label
+from cw_platform.tracker_automation import instance_options
+from cw_platform.tracker_history_identity import TYPE_ORIGINS, event_identities
 from cw_platform.tracker_store import (
     ATTENTION_CODES,
     FEATURES,
@@ -32,16 +36,18 @@ from cw_platform.tracker_store import (
 )
 from cw_platform.value_coercion import coerce_bool
 from services import tracker_check, tracker_import, tracker_migration, tracker_storage_maintenance
+from services.tracker_overview import cached_overview, overview_events
+from services.tracker_month import available_month, available_wrapped, get_report as month_report
 
 router = APIRouter(prefix="/api/tracker", tags=["tracker"])
 
 _DATE_FIELDS = ("watched_at", "rated_at", "progress_at", "collected_at", "listed_at", "added_at")
 _EDIT_DATE = {"history": "watched_at", "ratings": "rated_at", "progress": "progress_at", "collection": "collected_at"}
 _EDIT_IDS = ("imdb", "tmdb", "tvdb", "trakt", "simkl", "mal", "anilist", "kitsu", "anidb")
+_ANIME_ALIASES: dict[str, Any] = {"at": float("-inf"), "context": ("", None)}
 _IDENTITY = ("ids", "show_ids", "title", "year")
 _IMDB = re.compile(r"^tt\d{5,10}$")
 _NUMERIC = re.compile(r"^\d{1,12}$")
-_MAX_DELETE = 1000
 _NOTE_KEY = re.compile(r"^(show|movie):(tmdb|imdb|title|key):.{1,500}$")
 _FIELD_ID = re.compile(r"^[a-z0-9]{1,16}$")
 _FIELD_TYPES = ("text", "number", "date", "bool", "choice")
@@ -85,7 +91,14 @@ def _int(value: Any) -> int | None:
         return None
 
 
-def _art(item: Mapping[str, Any]) -> dict[str, str] | None:
+def _anime_aliases() -> tuple[str, Any]:
+    now = time.monotonic()
+    if now - _ANIME_ALIASES["at"] > 5:
+        _ANIME_ALIASES.update(at=now, context=alias_context(_cfg()))
+    return _ANIME_ALIASES["context"]
+
+
+def _art(item: Mapping[str, Any]) -> dict[str, Any] | None:
     typ = str(item.get("type") or "").lower()
     ids = _map(item.get("ids"))
     show_ids = _map(item.get("show_ids"))
@@ -93,6 +106,9 @@ def _art(item: Mapping[str, Any]) -> dict[str, str] | None:
         tmdb = _text(ids.get("tmdb"))
         return {"kind": "movie", "tmdb": tmdb} if tmdb else None
     tmdb = _text(show_ids.get("tmdb")) or (_text(ids.get("tmdb")) if typ == "show" else None)
+    coordinate = tmdb_coordinate(item, _anime_aliases()) if typ == "episode" else None
+    if coordinate and tmdb in (None, coordinate[0]):
+        return {"kind": "tv", "tmdb": coordinate[0], "season": coordinate[1], "episode": coordinate[2]}
     return {"kind": "tv", "tmdb": tmdb} if tmdb else None
 
 
@@ -119,6 +135,7 @@ def _check_row(entry: tuple[str, dict[str, Any], int] | None) -> dict[str, Any] 
         "season": detail.get("season"),
         "episode": detail.get("episode"),
         "source": detail.get("source"),
+        "runtime": _int(detail.get("runtime")),
         "fetched_at": _iso_ts(detail.get("fetched_at")),
         "checked_at": _iso_ts(checked_ns / 1_000_000_000),
     }
@@ -325,7 +342,7 @@ def _edited(feature: str, item: Mapping[str, Any], changes: Mapping[str, Any]) -
 
 
 def _item_key(feature: str, key: str, before: Mapping[str, Any], after: Mapping[str, Any]) -> str:
-    identity = any(before.get(field) != after.get(field) for field in _IDENTITY)
+    identity = any(before.get(field) != after.get(field) for field in (*_IDENTITY, "type"))
     redated = feature == "history" and before.get("watched_at") != after.get("watched_at")
     if not identity and not redated:
         return key
@@ -556,6 +573,7 @@ def _change(batch: ChangeBatch) -> dict[str, Any]:
         })
     return {
         "batch": batch.batch,
+        "automatic_group": batch.automatic_group,
         "feature": batch.feature,
         "action": batch.action,
         "count": batch.count,
@@ -575,7 +593,7 @@ def tracker_summary(request: Request, provider_instance: str | None = Query("def
             counts = store.counts()
             attention = store.attention_counts()
             health = store.health_counts()
-            notes = store.note_summary()
+            notes = store.note_summary(personal_only=True)
             fields = store.note_fields()
         except TrackerUnreadable:
             return _unreadable()
@@ -599,6 +617,7 @@ def tracker_summary(request: Request, provider_instance: str | None = Query("def
         "import": imported,
         "tmdb_key": bool(_tmdb_key(cfg)),
         "delete_effects": effects,
+        "tracker_options": instance_options(cfg, inst),
     }
 
 
@@ -608,7 +627,10 @@ def tracker_items(
     feature: str = Query("history"),
     provider_instance: str | None = Query("default"),
     q: str = Query("", max_length=200),
+    status: str = Query(""),
+    tag: str = Query("", max_length=40),
     media: str = Query(""),
+    duplicates: bool = Query(False),
     sort: str = Query("recent"),
     offset: int = Query(0, ge=0),
     limit: int = Query(60, ge=1, le=200),
@@ -616,6 +638,8 @@ def tracker_items(
     health: str = Query(""),
     month: str = Query("", pattern=r"^(\d{4}-(0[1-9]|1[0-2]))?$"),
 ) -> Any:
+    if status and status not in (*NOTE_STATUSES, "none"):
+        return _error("invalid_status", 400)
     if feature not in FEATURES:
         return _error("unknown_feature", 400)
     _, inst, store = _store(provider_instance, request)
@@ -624,6 +648,9 @@ def tracker_items(
             total, rows = store.query(
                 feature,
                 text=q,
+                status=status,
+                duplicates=duplicates,
+                tag=tag,
                 media=media if media in ("movie", "show") else "",
                 sort=sort if sort in ("recent", "oldest", "title") else "recent",
                 offset=offset,
@@ -633,6 +660,8 @@ def tracker_items(
                 until=_month_end(month),
             )
             checks = store.checks_for(feature, [key for key, _ in rows])
+            note_keys = {key: _title_key(_identity_of(item, key)) for key, item in rows}
+            notes = store.notes_for(note_keys.values())
             ratings = {}
             if feature != "ratings":
                 for key, item in rows:
@@ -649,6 +678,7 @@ def tracker_items(
         row = _row(key, item, feature)
         row["user_rating"] = row["rating"] if feature == "ratings" else ratings.get(key)
         row["check"] = _check_row(checks.get(key))
+        row["status"] = (notes.get(note_keys[key]) or {}).get("status")
         items.append(row)
     return {
         "ok": True,
@@ -673,13 +703,18 @@ def tracker_months(
     feature: str = Query("history"),
     provider_instance: str | None = Query("default"),
     q: str = Query("", max_length=200),
+    status: str = Query(""),
+    tag: str = Query("", max_length=40),
     media: str = Query(""),
+    duplicates: bool = Query(False),
 ) -> Any:
+    if status and status not in (*NOTE_STATUSES, "none"):
+        return _error("invalid_status", 400)
     if feature not in FEATURES:
         return _error("unknown_feature", 400)
     _, inst, store = _store(provider_instance, request)
     try:
-        months = store.months(feature, text=q, media=media if media in ("movie", "show") else "")
+        months = store.months(feature, duplicates=duplicates, text=q, status=status, tag=tag, media=media if media in ("movie", "show") else "")
     except TrackerUnreadable:
         return _unreadable()
     return {"ok": True, "provider_instance": inst, "feature": feature, "months": months}
@@ -695,21 +730,33 @@ def tracker_edit(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
         return blocked
     if not key or not isinstance(changes, Mapping) or not changes:
         return _error("no_changes", 400)
+    if "status" in changes and (not isinstance(changes["status"], str) or changes["status"] not in ("", *NOTE_STATUSES)):
+        return _error("invalid_status", 400)
     _, inst, store = _store(payload.get("provider_instance"), request)
     try:
         current = store.item(feature, key)
         if not isinstance(current, Mapping):
             return _error("not_found", 404)
         try:
-            updated = _edited(feature, current, changes)
+            updated = _edited(feature, current, {k: v for k, v in changes.items() if k != "status"})
         except ValueError as exc:
             return _error(str(exc), 400)
-        if updated == dict(current):
+        if updated == dict(current) and "status" not in changes:
             return _error("no_changes", 400)
         new_key = _item_key(feature, key, current, updated)
+        note_status = None
+        if "status" in changes:
+            ident = _identity_of(updated, new_key)
+            child = updated.get("type") in _CHILD_TYPES
+            note_status = {
+                "key": _title_key(ident), "status": changes["status"],
+                "type": "show" if ident["show"] else "movie",
+                "title": updated.get("series_title") if child else updated.get("title"),
+                "year": updated.get("series_year") if child else updated.get("year"), "tmdb": ident.get("tmdb") or None,
+            }
         batch = store.change_items(
             feature, [(key, new_key, updated)], action="edit", expected={key: dict(current)},
-            follow=_note_follow(key, current, new_key, updated),
+            follow=_note_follow(key, current, new_key, updated), note_status=note_status,
         )
     except TrackerUnreadable:
         return _unreadable()
@@ -723,6 +770,31 @@ def tracker_edit(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
 _IDENTITY_FIELDS = ("type", "title", "year", "season", "episode", "series_title", "series_year", "ids", "show_ids", "part")
 
 
+def _matched_external_ids(item: Mapping[str, Any], cfg: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    typ = str(item.get("type") or "").lower()
+    field = "show_ids" if typ in ("episode", "season") else "ids"
+    ids = dict(_map(item.get(field)))
+    tmdb = str(ids.get("tmdb") or "")
+    if not _tmdb_key(cfg) or not _NUMERIC.fullmatch(tmdb) or typ not in ("movie", "show", "anime", "episode", "season"):
+        return out
+    entity = "movie" if typ == "movie" else "tv"
+    try:
+        external = _tmdb_provider().get_response(
+            f"https://api.themoviedb.org/3/{entity}/{tmdb}/external_ids", timeout=8, max_retries=0,
+        ).data
+        if not isinstance(external, Mapping) or str(external.get("id")) != tmdb:
+            raise ValueError("Invalid external IDs response")
+    except Exception as exc:
+        raise HTTPException(502, "Could not verify the match's external IDs with TMDB. Try again.") from exc
+    for namespace in ("imdb", "tvdb") if entity == "tv" else ("imdb",):
+        value = str(external.get(f"{namespace}_id") or "")
+        if (_IMDB if namespace == "imdb" else _NUMERIC).fullmatch(value):
+            ids[namespace] = value
+    out[field] = ids
+    return out
+
+
 @router.post("/replace", dependencies=_READY)
 def tracker_replace(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
     feature = str(payload.get("feature") or "")
@@ -733,13 +805,26 @@ def tracker_replace(request: Request, payload: dict[str, Any] = Body(...)) -> An
         return blocked
     if not key or not isinstance(corrected, Mapping) or not isinstance(corrected.get("ids"), Mapping):
         return _error("invalid_ids", 400)
-    _, inst, store = _store(payload.get("provider_instance"), request)
+    cfg, inst, store = _store(payload.get("provider_instance"), request)
     try:
         current = store.item(feature, key)
         if not isinstance(current, Mapping):
             return _error("not_found", 404)
+        converting = current.get("type") != corrected.get("type")
+        if converting and (feature != "history" or current.get("type") not in ("episode", "show") or corrected.get("type") != "movie"):
+            return _error("unsupported_type_change", 400)
+        if converting and not event_identities(current):
+            return _error("missing_watch_identity", 400)
+        corrected = _matched_external_ids(corrected, cfg)
         updated = {k: v for k, v in current.items() if k not in _IDENTITY_FIELDS}
         updated.update({k: corrected[k] for k in _IDENTITY_FIELDS if corrected.get(k) not in (None, "", {})})
+        if converting:
+            tmdb = str(_map(updated.get("ids")).get("tmdb") or "")
+            if not _NUMERIC.fullmatch(tmdb) or int(tmdb) < 1:
+                return _error("invalid_ids", 400)
+            for field in (*ID_KEYS, "season", "episode", "show_ids", "series_title", "series_year", "show_title", "_cw_anime_map", "_cw_episode_order", "_anime_absolute", "_simkl_episode_number", "_trakt_number_abs", "simkl_bucket", "anime_type"):
+                updated.pop(field, None)
+            updated[TYPE_ORIGINS] = sorted(set(current.get(TYPE_ORIGINS) or []) | event_identities(current))
         if updated == dict(current):
             return _error("no_changes", 400)
         new_key = _item_key(feature, key, current, updated)
@@ -805,7 +890,9 @@ def tracker_edit_title(request: Request, payload: dict[str, Any] = Body(...)) ->
     key = str(payload.get("key") or "")
     if not show and (feature not in FEATURES or not key):
         return _error("not_found", 404)
-    _, inst, store = _store(payload.get("provider_instance"), request)
+    cfg, inst, store = _store(payload.get("provider_instance"), request)
+    if not isinstance(changes, Mapping):
+        item = _matched_external_ids(item, cfg)
     try:
         with store.mutation():
             if show:
@@ -823,6 +910,8 @@ def tracker_edit_title(request: Request, payload: dict[str, Any] = Body(...)) ->
                         per["show_ids"] = per.pop("ids")
                     updated = _edited(name, data, per)
                 else:
+                    if (data.get("type") == "movie") != (item.get("type") == "movie"):
+                        return _error("type_change_requires_record", 400)
                     updated = _retitled(data, item)
                 if updated != data:
                     rows.append((name, item_key, _item_key(name, item_key, data, updated), updated, data))
@@ -850,6 +939,89 @@ def tracker_edit_title(request: Request, payload: dict[str, Any] = Body(...)) ->
     }
 
 
+@router.post("/titles/remove", dependencies=_READY)
+def tracker_titles_remove(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    blocked = _write_guard()
+    if blocked is not None:
+        return blocked
+    keys = payload.get("keys")
+    if not isinstance(keys, list) or not keys or any(not isinstance(k, str) or not _NOTE_KEY.fullmatch(k) for k in keys):
+        return _error("invalid_ids", 400)
+    if payload.get("scope") not in {"history", "all"}:
+        return _error("unknown_feature", 400)
+    _, inst, store = _store(payload.get("provider_instance"), request)
+    try:
+        result = store.title_removal(keys, payload["scope"] == "all", expected=payload.get("token"))
+        return {"ok": True, "provider_instance": inst, **result}
+    except TrackerConflict as exc:
+        return _error(exc.code, 409)
+    except KeyError:
+        return _error("not_found", 404)
+
+
+@router.get("/automatic-status/review", dependencies=_READY)
+def tracker_automatic_review(request: Request, provider_instance: str | None = Query("default")) -> Any:
+    _, inst, store = _store(provider_instance, request)
+    return {"ok": True, "provider_instance": inst, "review": store.review_status()}
+
+
+@router.post("/automatic-status", dependencies=_READY)
+def tracker_automatic_status(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    if payload.get("action") == "review-cancel":
+        _, _, store = _store(payload.get("provider_instance"), request)
+        return {"ok": True, "review": store.cancel_review()}
+    blocked = _write_guard()
+    if blocked is not None:
+        return blocked
+    cfg, inst, store = _store(payload.get("provider_instance"), request)
+    if not instance_options(cfg, inst)["automatic_status"]:
+        return _error("automatic_status_disabled", 409)
+    action = payload.get("action")
+    if action == "review-start":
+        try:
+            review = store.start_review()
+            from services.tracker_automation import wake
+            wake()
+            return {"ok": True, "review": review}
+        except ValueError as exc:
+            return _error(str(exc), 409)
+    if action == "enable-title":
+        key = payload.get("key")
+        if not isinstance(key, str) or not _NOTE_KEY.fullmatch(key):
+            return _error("invalid_note_key", 400)
+        return {"ok": True, "batch": store.enable_title_automation(key)}
+    if action == "apply":
+        from services.tracker_automation import cached_metadata
+        suggestions = payload.get("items")
+        if not isinstance(suggestions, list) or not 1 <= len(suggestions) <= 100:
+            return _error("invalid_suggestions", 400)
+        for item in suggestions:
+            if (not isinstance(item, dict) or not isinstance(item.get("key"), str)
+                    or not _NOTE_KEY.fullmatch(item["key"])
+                    or any(field not in item or item[field] is not None and (not isinstance(item[field], str) or item[field] not in NOTE_STATUSES) for field in ("before", "after"))):
+                return _error("invalid_suggestions", 400)
+        results, group = [], uuid.uuid4().hex
+        with store.session():
+            try:
+                for item in suggestions:
+                    key = item["key"]
+                    results.append(store.evaluate_status(key, lambda: cached_metadata(key), expected=item, prune=False, group=group))
+            finally:
+                if any(row.get("batch") for row in results):
+                    store.prune_status_changes()
+        return {"ok": True, "items": results, "updated": sum(bool(row.get("batch")) for row in results)}
+    if action in {"preview", "recalculate"}:
+        from services.tracker_automation import cached_metadata
+        after = str(payload.get("after") or "")[:1024]
+        with store.session():
+            keys = store.automation_candidates(after, 100)
+            results = [store.evaluate_status(key, lambda: cached_metadata(key), preview=True) for key in keys]
+            if action == "recalculate":
+                store.queue_statuses([r["key"] for r in results if not r.get("skipped")])
+        return {"ok": True, "items": results, "next": keys[-1] if len(keys) == 100 else ""}
+    return _error("unknown_action", 400)
+
+
 @router.post("/delete", dependencies=_READY)
 def tracker_delete(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
     feature = str(payload.get("feature") or "")
@@ -860,8 +1032,6 @@ def tracker_delete(request: Request, payload: dict[str, Any] = Body(...)) -> Any
     keys = list(dict.fromkeys(str(k) for k in raw if str(k or "").strip())) if isinstance(raw, list) else []
     if not keys:
         return _error("no_changes", 400)
-    if len(keys) > _MAX_DELETE:
-        return _error("too_many", 400, limit=_MAX_DELETE)
     _, inst, store = _store(payload.get("provider_instance"), request)
     try:
         batch = store.change_items(feature, [(key, None, None) for key in keys], action="delete")
@@ -879,7 +1049,8 @@ def tracker_undo(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
         return _error("not_found", 404)
     _, inst, store = _store(payload.get("provider_instance"), request)
     blocked = _error("pair_scoped", 409) if _pair_scoped() else None
-    if blocked is None and store.batch_features(batch) != {NOTES}:
+    features = store.batch_features(batch)
+    if blocked is None and (not features or not features <= {NOTES, "status_control"}):
         blocked = _write_guard()
     if blocked is not None:
         return blocked
@@ -927,7 +1098,7 @@ def tracker_check_start(request: Request, payload: dict[str, Any] = Body(default
     cfg, inst, store = _store(payload.get("provider_instance"), request)
     if not _tmdb_key(cfg):
         return _error("tmdb_key_missing", 400)
-    job = tracker_check.start(store, _tmdb_provider(), instance=inst)
+    job = tracker_check.start(store, _tmdb_provider(), instance=inst, aliases=alias_context(cfg))
     if job.get("error"):
         return _error(str(job["error"]), 409)
     return {"ok": True, "provider_instance": inst, "job": job}
@@ -1058,6 +1229,48 @@ def tracker_import_cancel(request: Request, payload: dict[str, Any] = Body(defau
     return {"ok": True, "provider_instance": inst, "cancelled": cancelled}
 
 
+@router.post("/import/preview", dependencies=_READY)
+def tracker_import_preview(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    from api import interactiveSyncAPI as review_api
+    from services import interactive_sync as review
+
+    blocked = _write_guard()
+    if blocked is not None:
+        return blocked
+    new_tracker = None
+    if payload.get("provider_instance") == "new":
+        if _user(request) is not None:
+            return _error("profile_scope_denied", 403)
+        cfg = _cfg()
+        try:
+            new_tracker = tracker_import.preview_tracker(cfg, payload.get("name"))
+        except ValueError as exc:
+            return _error(str(exc), 400)
+        inst = new_tracker["id"]
+    else:
+        cfg, inst, _ = _store(payload.get("provider_instance"), request)
+    if not user_can_access_instance(cfg, _user(request), payload.get("source"), payload.get("source_instance")):
+        return _error("profile_scope_denied", 403)
+    try:
+        features = payload.get("features")
+        pair, _ = tracker_import.prepare(
+            tracker_import.preview_config(cfg, new_tracker) if new_tracker is not None else cfg,
+            source=payload.get("source"), source_instance=payload.get("source_instance"), instance=inst,
+            features=features if isinstance(features, list) else [], dropped=coerce_bool(payload.get("dropped")),
+        )
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    with review.LOCK:
+        review.prune()
+        if len(review.SESSIONS) >= review.MAX_SESSIONS:
+            return _error("too_many_reviews", 429)
+        session = review.Session(pair_id=pair["id"], owner=review_api.owner(request), import_pair=pair, new_tracker=new_tracker)
+        session.pair = {k: pair.get(k) for k in ("source", "target", "source_instance", "target_instance", "mode", "name")}
+        review_api.launch(session, review.refresh, cfg, {})
+        review.SESSIONS[session.id] = session
+        return {"ok": True, "provider_instance": inst, "session": session.public()}
+
+
 _ADD_FEATURES = ("history", "watchlist", "ratings", "collection")
 _MAX_ADD = 200
 
@@ -1129,6 +1342,7 @@ def tracker_title(
     for name, item_key, data in related:
         row = _row(item_key, data, name)
         row["feature"] = name
+        row["status"] = saved.get("status") if saved else None
         row["check"] = _check_row(checks.get(name, {}).get(item_key))
         rows[name].append(row)
     head_source = anchor or next((data for _, _, data in related), {})
@@ -1156,6 +1370,7 @@ def tracker_title(
         "show_key": (f"tmdb:{ident['tmdb']}" if ident.get("tmdb") else f"title:{str(ident.get('title') or '').lower()}") if is_show else None,
         "title": head,
         "plays": plays,
+        "history_complete": len(related) < 5000,
         "ratings": rows["ratings"],
         "watchlist": rows["watchlist"],
         "collection": rows["collection"],
@@ -1163,6 +1378,7 @@ def tracker_title(
         "attention": attention,
         "seasons": [{"season": s, "episodes": [{"episode": e, "watched_at": w} for e, w in sorted(eps.items())]} for s, eps in sorted(seasons.items())],
         "note_key": note_key,
+        "status_control": store.status_control(note_key),
         "note": _note_out(note_key, saved),
     }
 
@@ -1172,15 +1388,19 @@ def tracker_shows(
     request: Request,
     provider_instance: str | None = Query("default"),
     q: str = Query("", max_length=200),
+    status: str = Query(""),
+    tag: str = Query("", max_length=40),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
     hide_dropped: bool = Query(False),
 ) -> Any:
+    if status and status not in (*NOTE_STATUSES, "none"):
+        return _error("invalid_status", 400)
     _, inst, store = _store(provider_instance, request)
     try:
         with store.session():
-            hidden = {k[5:] for k in store.status_keys("dropped") if k.startswith("show:")} if hide_dropped else set()
-            total, shows = store.show_summaries(text=q, offset=offset, limit=limit, exclude=hidden)
+            hidden = {k[5:] for k in store.status_keys("dropped") if k.startswith("show:")} if hide_dropped and not status else set()
+            total, shows = store.show_summaries(text=q, offset=offset, limit=limit, exclude=hidden, status=status, tag=tag)
             notes = store.notes_for(f"show:{show['key']}" for show in shows)
     except TrackerUnreadable:
         return _unreadable()
@@ -1194,6 +1414,120 @@ def tracker_shows(
     return {"ok": True, "provider_instance": inst, "total": total, "offset": offset, "shows": shows}
 
 
+def _overview_hero(store: TrackerStore, recent: list[dict[str, Any]], continuing: list[dict[str, Any]], instance: str) -> dict[str, Any] | None:
+    candidates = list(continuing)
+    _, watching = store.notes(status="watching", limit=1)
+    if watching:
+        key, note, updated = watching[0]
+        row = _note_out(key, note, updated)
+        if row:
+            candidates.append({**row, "date": row.get("updated"), "ref": {"note": key}})
+    try:
+        from cw_platform.event_archive import get_conn
+
+        conn = get_conn()
+        event = conn.execute("SELECT item_key, created_at, media_type FROM events WHERE domain='scrobble' AND event_type='scrobble_completed' AND destination_provider='CROSSWATCH' AND destination_instance=? ORDER BY created_at DESC LIMIT 1", (instance,)).fetchone() if conn is not None else None
+        if event:
+            token, timestamp, media_type = event
+            for row in recent:
+                if media_type and row.get("type") != media_type:
+                    continue
+                tokens = {f"{key}:{value}" for ids in (row.get("ids"), row.get("show_ids")) for key, value in (ids or {}).items()}
+                if token in tokens:
+                    candidates.append({**row, "date": datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")})
+                    break
+    except Exception:
+        pass
+    return max(candidates, key=lambda row: str(row.get("date") or "")) if candidates else next(iter(recent), None)
+
+
+@router.get("/overview/revision", dependencies=_READY)
+def tracker_overview_revision(request: Request, provider_instance: str | None = Query("default")) -> Any:
+    cfg, inst, store = _store(provider_instance, request)
+    return {"ok": True, "provider_instance": inst, "revision": store.revision(), "review_month": available_month(store, cfg), "wrapped": available_wrapped(store, cfg)}
+
+
+@router.get("/overview/month", dependencies=_READY)
+def tracker_month_review(request: Request, provider_instance: str | None = Query("default"), month: str = Query("", max_length=7)) -> Any:
+    cfg, inst, store = _store(provider_instance, request)
+    try:
+        return {**month_report(store, cfg, month), "provider_instance": inst}
+    except ValueError:
+        return _error("invalid_month", 400)
+
+
+@router.get("/overview/wrapped", dependencies=_READY)
+def tracker_wrapped(request: Request, provider_instance: str | None = Query("default"), year: str = Query("", max_length=4)) -> Any:
+    cfg, inst, store = _store(provider_instance, request)
+    try:
+        return {**month_report(store, cfg, year, yearly=True), "provider_instance": inst}
+    except ValueError:
+        return _error("invalid_year", 400)
+
+
+@router.get("/overview", dependencies=_READY)
+def tracker_overview(request: Request, provider_instance: str | None = Query("default"), day: str = Query("", max_length=10)) -> Any:
+    cfg, inst, store = _store(provider_instance, request)
+    try:
+        today = date.fromisoformat(day) if day else datetime.now(timezone.utc).date()
+    except ValueError:
+        return _error("invalid_date", 400)
+    recent: list[dict[str, Any]] = []
+    continuing: list[dict[str, Any]] = []
+    try:
+        with store.session():
+            history_total, history = store.query("history", limit=200)
+            progress_total, progress = store.query("progress", limit=200)
+            identities = {key: _identity_of(item, key) for key, item in progress}
+            notes = store.notes_for(_title_key(ident) for ident in identities.values())
+            history_notes = store.notes_for(_title_key(_identity_of(item, key)) for key, item in history)
+            previous = None
+            for key, item in history:
+                ident = _identity_of(item, key)
+                group = _title_key(ident) if item.get("type") == "episode" else key
+                if group == previous:
+                    recent[-1]["plays"] += 1
+                    continue
+                previous = group
+                recent.append({**_row(key, item, "history"), "status": (history_notes.get(_title_key(ident)) or {}).get("status"), "ref": {"feature": "history", "key": key}, "plays": 1})
+            seen = set()
+            for key, item in progress:
+                ident = identities[key]
+                group = _title_key(ident)
+                percent = item.get("progress_percent")
+                if type(percent) not in (int, float) or not 0 < percent < 100 or group in seen:
+                    continue
+                if (notes.get(group) or {}).get("status") in {"dropped", "completed"}:
+                    continue
+                matches = store.related(**ident, feature="history")
+                if any((data.get("season"), data.get("episode")) == (item.get("season"), item.get("episode")) and str(data.get("watched_at") or "") >= str(item.get("progress_at") or "") for _, _, data in matches):
+                    continue
+                seen.add(group)
+                row = {**_row(key, item, "progress"), "ref": {"feature": "progress", "key": key}}
+                duration, position = item.get("duration_ms"), item.get("progress_ms")
+                if all(type(value) in (int, float) and math.isfinite(value) for value in (duration, position)) and duration > position >= 0 and abs(position / duration * 100 - percent) <= 1:
+                    row["remaining_minutes"] = math.ceil((duration - position) / 60000)
+                continuing.append(row)
+    except TrackerUnreadable:
+        return _unreadable()
+    cached = cached_overview(store, today) if _tmdb_key(cfg) else None
+    return {"ok": True, "provider_instance": inst, "revision": store.revision(), "hero": _overview_hero(store, recent, continuing, inst), "shows": cached, "recent": recent, "continue": continuing,
+            "history_more": history_total > 200, "progress_more": progress_total > 200, "metadata_available": bool(_tmdb_key(cfg)), "review_month": available_month(store, cfg), "wrapped": available_wrapped(store, cfg)}
+
+
+@router.get("/overview/shows", dependencies=_READY)
+def tracker_overview_shows(request: Request, provider_instance: str | None = Query("default"), day: str = Query("", max_length=10)) -> Any:
+    cfg, inst, store = _store(provider_instance, request)
+    try:
+        today = date.fromisoformat(day) if day else datetime.now(timezone.utc).date()
+    except ValueError:
+        return _error("invalid_date", 400)
+    if not _tmdb_key(cfg):
+        return {"ok": True, "provider_instance": inst, "continue": [], "airing": [], "done": True, "total": 0, "unavailable": 0, "metadata_available": False}
+    return StreamingResponse(overview_events(store, _tmdb_provider(), today, request.is_disconnected),
+                             media_type="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+
 @router.get("/notes", dependencies=_READY)
 def tracker_notes(
     request: Request,
@@ -1204,13 +1538,13 @@ def tracker_notes(
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
 ) -> Any:
-    if status and status not in NOTE_STATUSES:
+    if status and status not in (*NOTE_STATUSES, "none"):
         return _error("invalid_status", 400)
     _, inst, store = _store(provider_instance, request)
     try:
         with store.session():
-            total, rows = store.notes(status=status, tag=tag, text=q, offset=offset, limit=limit)
-            summary = store.note_summary()
+            total, rows = store.notes(status=status, tag=tag, text=q, offset=offset, limit=limit, personal_only=True)
+            summary = store.note_summary(personal_only=True)
     except TrackerUnreadable:
         return _unreadable()
     return {
@@ -1245,7 +1579,8 @@ def tracker_note_save(request: Request, payload: dict[str, Any] = Body(...)) -> 
             **clean,
         }
         expected = payload.get("expected", ...)
-        batch = store.save_note(key, note, expected=expected if expected is None or isinstance(expected, Mapping) else ...)
+        manual = payload.get("status_manual") is True or (current or {}).get("status") != (note or {}).get("status")
+        batch = store.save_note(key, note, expected=expected if expected is None or isinstance(expected, Mapping) else ..., origin="manual" if manual else None)
     except ValueError as exc:
         return _error(str(exc), 400)
     except TrackerUnreadable:
@@ -1253,6 +1588,70 @@ def tracker_note_save(request: Request, payload: dict[str, Any] = Body(...)) -> 
     except TrackerConflict as exc:
         return _error(exc.code, 409, key=exc.key)
     return {"ok": True, "provider_instance": inst, "key": key, "batch": batch, "note": _note_out(key, store.note(key))}
+
+
+@router.post("/notes/bulk", dependencies=_READY)
+def tracker_notes_bulk(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    if _pair_scoped():
+        return _error("pair_scoped", 409)
+    raw = payload.get("keys")
+    if not isinstance(raw, list) or not raw:
+        return _error("no_changes", 400)
+    if any(not isinstance(key, str) or not _NOTE_KEY.fullmatch(key) for key in raw):
+        return _error("invalid_note_key", 400)
+    action = payload.get("action")
+    if action not in ("status", "remove"):
+        return _error("unknown_action", 400)
+    status = payload.get("status") if action == "status" else ""
+    if not isinstance(status, str) or status not in ("", *NOTE_STATUSES):
+        return _error("invalid_status", 400)
+    _, inst, store = _store(payload.get("provider_instance"), request)
+    try:
+        batch, count = store.change_notes(raw, status=status, remove=action == "remove", origin="manual")
+    except TrackerUnreadable:
+        return _unreadable()
+    except KeyError as exc:
+        return _error("not_found", 404, key=str(exc.args[0]))
+    return {"ok": True, "provider_instance": inst, "batch": batch, "count": count}
+
+
+@router.post("/titles/status", dependencies=_READY)
+def tracker_titles_status(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    if _pair_scoped():
+        return _error("pair_scoped", 409)
+    keys, status = payload.get("keys"), payload.get("status")
+    if not isinstance(keys, list) or not keys:
+        return _error("no_changes", 400)
+    if any(not isinstance(key, str) or not key or len(key) > 1024 for key in keys):
+        return _error("invalid_ids", 400)
+    if not isinstance(status, str) or status not in ("", *NOTE_STATUSES):
+        return _error("invalid_status", 400)
+    feature = payload.get("feature", "history")
+    shows = payload.get("view") == "shows"
+    if feature not in FEATURES or (shows and feature != "history"):
+        return _error("unknown_feature", 400)
+    _, inst, store = _store(payload.get("provider_instance"), request)
+    try:
+        with store.mutation(), store.session():
+            defaults: dict[str, dict[str, Any]] = {}
+            for key in dict.fromkeys(keys):
+                if shows:
+                    if not _NOTE_KEY.fullmatch(f"show:{key}"):
+                        return _error("invalid_note_key", 400)
+                    rows = store.related(**_show_identity(key), feature="history")
+                    item = rows[0][2] if rows else None
+                else:
+                    item = store.item(feature, key)
+                if not isinstance(item, Mapping):
+                    return _error("not_found", 404, key=key)
+                ident = _show_identity(key) if shows else _identity_of(item, key)
+                note_key = _title_key(ident)
+                defaults[note_key] = {"type": "show" if ident["show"] else "movie", "title": item.get("series_title") if item.get("type") in ("episode", "season") else item.get("title"),
+                                      "year": item.get("series_year") if item.get("type") in ("episode", "season") else item.get("year"), "tmdb": ident["tmdb"] or None}
+            batch, count = store.change_notes(defaults, status=status, defaults=defaults, origin="manual")
+    except TrackerUnreadable:
+        return _unreadable()
+    return {"ok": True, "provider_instance": inst, "batch": batch, "count": count}
 
 
 @router.post("/note-fields", dependencies=_READY)
@@ -1458,3 +1857,101 @@ def tracker_add(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
     except TrackerConflict as exc:
         return _error(exc.code, 409, key=exc.key)
     return {"ok": True, "provider_instance": inst, "batch": batch, "count": len(keys), "key": keys[0] if keys else None}
+
+
+@router.get("/watch-editor", dependencies=_READY)
+def tracker_watch_editor(request: Request, provider_instance: str | None = Query("default"), tmdb: str = Query("", max_length=20)) -> Any:
+    cfg, inst, store = _store(provider_instance, request)
+    detail = _show_detail(cfg, tmdb.strip())
+    if detail is None:
+        return _error("not_found", 404)
+    try:
+        with store.mutation():
+            plays = [{"key": key, "season": item.get("season"), "episode": item.get("episode"), "date": str(item.get("watched_at") or "")}
+                     for _, key, item in store.related(show=True, tmdb=tmdb.strip(), feature="history", limit=None)
+                     if item.get("type") == "episode"]
+            revision = store.revision()
+    except TrackerUnreadable:
+        return _unreadable()
+    return {"ok": True, "provider_instance": inst, "revision": revision, "plays": plays,
+            "seasons": [{"season": season, "episodes": count, "name": name} for season, count, name in _season_counts(detail, specials=True)]}
+
+
+@router.post("/history/bulk", dependencies=_READY)
+def tracker_history_bulk(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    blocked = _write_guard("history")
+    if blocked is not None:
+        return blocked
+    _, inst, store = _store(payload.get("provider_instance"), request)
+    action = payload.get("action")
+    scope = payload.get("scope", "latest")
+    episodes = payload.get("episodes")
+    pick = _map(payload.get("show"))
+    tmdb = str(_map(pick.get("ids")).get("tmdb") or "")
+    if not isinstance(action, str) or not isinstance(scope, str) or action not in {"add", "rewatch", "dates", "remove"} or scope not in {"latest", "all"}:
+        return _error("invalid_action", 400)
+    if not tmdb.isdecimal() or not isinstance(episodes, list) or not 1 <= len(episodes) <= _MAX_ADD:
+        return _error("invalid_episodes", 400)
+    try:
+        selected = {}
+        for raw in episodes:
+            row = _map(raw)
+            season, episode = _int(row.get("season")), _int(row.get("episode"))
+            if season is None or season < 0 or episode is None or episode < 1 or (season, episode) in selected:
+                return _error("invalid_episodes", 400)
+            stamp = _iso(row.get("watched_at")) if action != "remove" else None
+            if stamp and datetime.fromisoformat(stamp.replace("Z", "+00:00")) > datetime.now(timezone.utc):
+                return _error("invalid_date", 400)
+            selected[(season, episode)] = stamp
+        with store.mutation():
+            if not isinstance(payload.get("revision"), str) or payload["revision"] != store.revision():
+                return _error("changed_since", 409)
+            watched: dict[tuple[int, int], list[tuple[str, Any]]] = {}
+            for _, key, item in store.related(show=True, tmdb=tmdb, feature="history", limit=None):
+                if item.get("type") == "episode":
+                    watched.setdefault((item.get("season"), item.get("episode")), []).append((key, item))
+            changes = []
+            expected = {}
+            event_mode = store.history_event_mode()
+            for (season, episode), stamp in selected.items():
+                plays = sorted(watched.get((season, episode), []), key=lambda row: history_epoch_from_item(row[1]) or 0, reverse=True)
+                if action == "add" and plays or action in {"dates", "remove", "rewatch"} and not plays:
+                    return _error("changed_since", 409)
+                if action in {"add", "rewatch"}:
+                    item = _new_item("history", {"type": "episode", "series_title": pick.get("title"), "series_year": pick.get("year"), "show_ids": pick.get("ids"), "season": season, "episode": episode, "watched_at": stamp})
+                    if any(history_epoch_from_item(item) == history_epoch_from_item(current) for _, current in plays):
+                        return _error("duplicate_watch_times", 409)
+                    changes.append(("history", None, _new_key("history", item, action == "rewatch" or event_mode), item))
+                else:
+                    for key, current in plays if scope == "all" else plays[:1]:
+                        expected[("history", key)] = current
+                        date = stamp
+                        if action == "dates" and scope == "all":
+                            delta = datetime.fromisoformat(stamp.replace("Z", "+00:00")) - datetime.fromisoformat(_iso(plays[0][1].get("watched_at")).replace("Z", "+00:00"))
+                            date = (datetime.fromisoformat(_iso(current.get("watched_at")).replace("Z", "+00:00")) + delta).isoformat()
+                        updated = _edited("history", current, {"date": date}) if action == "dates" else None
+                        if updated and scope == "latest" and any(history_epoch_from_item(updated) == history_epoch_from_item(other) for other_key, other in plays if other_key != key):
+                            return _error("duplicate_watch_times", 409)
+                        if updated == current:
+                            continue
+                        new_key = _item_key("history", key, current, updated) if updated else None
+                        changes.append(("history", key, new_key, updated))
+            if not changes:
+                return _error("no_changes", 400)
+            targets = [new_key for _, _, new_key, item in changes if item is not None]
+            if len(set(targets)) != len(targets):
+                return _error("duplicate_watch_times", 409)
+            count = len(changes)
+            unlist = str(payload.get("remove_from_watchlist") or "") if action in {"add", "rewatch"} else ""
+            if unlist and isinstance(store.item("watchlist", unlist), Mapping):
+                changes.append(("watchlist", unlist, None, None))
+            batch = store.apply(changes, action="delete" if action == "remove" else "edit" if action == "dates" else "add", expected=expected)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except TrackerUnreadable:
+        return _unreadable()
+    except KeyError:
+        return _error("not_found", 404)
+    except TrackerConflict as exc:
+        return _error(exc.code, 409, key=exc.key)
+    return {"ok": True, "provider_instance": inst, "batch": batch, "count": count}

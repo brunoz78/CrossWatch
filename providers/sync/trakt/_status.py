@@ -3,17 +3,33 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from collections import Counter
+import copy
+import hashlib
+import threading
+import time
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from typing import Any
 
 from cw_platform.status_mapping import Capabilities, Observation, ReadState, Status
 from providers.sync._pagination import page_numbers
-from providers.sync._status_mapping import NativeStatusAdapter, Record, digest, observation
+from providers.sync._status_mapping import NativeStatusAdapter, Record, digest, observation, skipped
 from ._common import TraktPager
 
 
 BASE = "https://api.trakt.tv"
+MAX_AGE = 86400
+ENDED_PROGRESS_MAX_AGE = 7 * 86400
+LISTS = {
+    "history": ("/sync/history", {"extended": "full"}, (("movies", "watched_at"), ("episodes", "watched_at"))),
+    "watchlist": ("/sync/watchlist", {}, (("watchlist", "updated_at"), ("movies", "watchlisted_at"), ("shows", "watchlisted_at"))),
+    "dropped": ("/users/hidden/dropped", {"type": "show", "extended": "full"}, (("shows", "dropped_at"),)),
+    "ratings": ("/sync/ratings", {}, (("movies", "rated_at"), ("shows", "rated_at"), ("seasons", "rated_at"), ("episodes", "rated_at"))),
+    "playback": ("/sync/playback", {}, (("movies", "paused_at"), ("episodes", "paused_at"))),
+    "notes": ("/users/me/notes/all", {}, (("notes", "updated_at"),)),
+}
+_CACHE: dict[str, dict[str, Any]] = {}
+_CACHE_LOCK = threading.Lock()
 
 
 def object_read(adapter, path, **kwargs):
@@ -75,6 +91,18 @@ def preserved_row(row):
     return result
 
 
+def compact_row(row):
+    result = dict(row)
+    for kind in ("movie", "show", "season", "episode"):
+        if isinstance(result.get(kind), Mapping):
+            result[kind] = {key: value for key, value in result[kind].items() if key in {"ids", "season", "number", "title", "status"}}
+    return result
+
+
+def stamps(activities, fields):
+    return tuple((section, field, (activities.get(section) or {}).get(field)) for section, field in fields)
+
+
 def failures(value):
     return any(failures(child) for child in value.values()) if isinstance(value, Mapping) else bool(value)
 
@@ -96,59 +124,97 @@ class StatusAdapter(NativeStatusAdapter):
         from providers.sync._mod_TRAKT import TRAKTModule
         return TRAKTModule(self.cfg, connect=False)
 
+    def cache_key(self):
+        raw = self.cfg.get("trakt")
+        block = raw if isinstance(raw, Mapping) else {}
+        identity = f"{self.cfg.get('_cw_provider_instance') or 'default'}|{block.get('access_token') or ''}"
+        return hashlib.sha256(identity.encode()).hexdigest()
+
     def read(self):
         adapter = self.adapter()
+        now = time.time()
         before = object_read(adapter, "/sync/last_activities")
         if not before.get("all"):
             raise RuntimeError("trakt_status_invalid_activities")
-        history = read_pages(adapter, "/sync/history", extended="full")
-        watchlist = read_pages(adapter, "/sync/watchlist")
-        dropped = read_pages(adapter, "/users/hidden/dropped", type="show", extended="full")
-        ratings = read_pages(adapter, "/sync/ratings")
-        playback = read_pages(adapter, "/sync/playback")
-        notes = read_pages(adapter, "/users/me/notes/all")
+        cache_id = self.cache_key()
+        with _CACHE_LOCK:
+            cache = copy.deepcopy(_CACHE.get(cache_id) or {"lists": {}, "progress": {}})
+        fetched = False
+        lists = {}
+        for name, (path, params, fields) in LISTS.items():
+            marker = stamps(before, fields)
+            entry = cache["lists"].get(name)
+            if entry and entry[0] == marker and 0 <= now - entry[1] < MAX_AGE:
+                lists[name] = entry[2]
+                continue
+            lists[name] = [compact_row(row) for row in read_pages(adapter, path, **params)]
+            cache["lists"][name] = (marker, now, lists[name])
+            fetched = True
+        history, watchlist, dropped = lists["history"], lists["watchlist"], lists["dropped"]
+        ratings, playback, notes = lists["ratings"], lists["playback"], lists["notes"]
         protected = {name: sorted(digest(preserved_row(row)) for row in rows) for name, rows in
                      (("history", history), ("watchlist", watchlist), ("ratings", ratings), ("playback", playback), ("notes", notes))}
         titles, listed, hidden = {}, set(), set()
-        plays = Counter()
         counts = Counter()
+        play_ids = defaultdict(list)
+        bad = {}
         for rows, membership in ((history, None), (watchlist, listed), (dropped, hidden)):
             seen = set()
             for row in rows:
-                key, item, media = title(row)
+                found = self.identify(row)
+                if found is None:
+                    continue
+                key, item, media = found
                 titles[key] = (item, media)
                 if membership is not None:
                     if membership is hidden and key in seen:
-                        raise RuntimeError("trakt_status_duplicate_title")
+                        bad[key] = "trakt_status_duplicate_title"
                     seen.add(key)
                     membership.add(key)
                 else:
                     if not row.get("id") or row["id"] in seen:
-                        raise RuntimeError("trakt_status_invalid_history")
+                        bad[key] = "trakt_status_invalid_history"
+                        continue
                     seen.add(row["id"])
                     episode = row.get("episode") or {}
                     episode_id = (episode.get("ids") or {}).get("trakt")
                     if item["type"] == "show" and not episode_id:
-                        raise RuntimeError("trakt_status_missing_episode")
-                    plays[(key, episode_id)] += 1
+                        bad[key] = "trakt_status_missing_episode"
+                        continue
                     counts[key] += 1
-        active = {title(row)[0] for row in playback}
-        repeats = {key for (key, _), count in plays.items() if count > 1}
+                    play_ids[key].append(row["id"])
+        active = {found[0] for found in map(self.identify, playback) if found}
+        hidden_at = ((before.get("shows") or {}).get("hidden_at"), (before.get("seasons") or {}).get("hidden_at"))
+        kept_progress = {}
         result = {}
         for key, (item, media) in titles.items():
+            kind = "shows" if item["type"] == "show" else "movies"
+            if key in bad:
+                result[key] = skipped(key, kind, item, bad[key])
+                continue
             progress = {}
             partial = completed = False
-            repeat = key in repeats
+            repeat = False
             if item["type"] == "show":
-                progress = object_read(adapter, f"/shows/{item['ids']['trakt']}/progress/watched",
-                                       params={"hidden": "true", "specials": "false"})
+                marker = (tuple(sorted(str(value) for value in play_ids.get(key, ()))), hidden_at)
+                ended = media.get("status") in {"ended", "canceled"}
+                entry = cache["progress"].get(key)
+                if entry and entry[0] == marker and 0 <= now - entry[1] < (ENDED_PROGRESS_MAX_AGE if ended else MAX_AGE):
+                    progress = copy.deepcopy(entry[2])
+                    kept_progress[key] = entry
+                else:
+                    progress = object_read(adapter, f"/shows/{item['ids']['trakt']}/progress/watched",
+                                           params={"hidden": "true", "specials": "false"})
+                    kept_progress[key] = (marker, now, copy.deepcopy(progress))
+                    fetched = True
                 aired, watched = progress.get("aired"), progress.get("completed")
                 if (type(aired) is not int or type(watched) is not int or aired < 0 or watched < 0
                         or watched > aired or "reset_at" not in progress or not isinstance(progress.get("seasons"), list)):
-                    raise RuntimeError("trakt_status_invalid_progress")
+                    result[key] = skipped(key, kind, item, "trakt_status_invalid_progress")
+                    continue
                 partial = 0 < watched < aired
                 completed = aired > 0 and watched == aired and media.get("status") in {"ended", "canceled"}
-                repeat |= bool(progress["reset_at"])
+                repeat = bool(progress["reset_at"])
             else:
                 completed = bool(counts[key])
             native = ("planned" if key in listed else "dropped" if key in hidden else
@@ -158,9 +224,20 @@ class StatusAdapter(NativeStatusAdapter):
                 obs = Observation(ReadState.UNKNOWN, native_status="caught_up_or_untracked")
             result[key] = Record(key, "shows" if item["type"] == "show" else "movies", item, obs,
                                  {"partial": partial, "completed": completed, "has_history": bool(counts[key]), "has_playback": key in active})
-        if before != object_read(adapter, "/sync/last_activities"):
+        if fetched and before != object_read(adapter, "/sync/last_activities"):
             raise RuntimeError("trakt_status_snapshot_changed")
+        with _CACHE_LOCK:
+            _CACHE[cache_id] = {"lists": cache["lists"], "progress": kept_progress}
         return result
+
+    def identify(self, row):
+        try:
+            return title(row)
+        except RuntimeError as exc:
+            if str(exc) != "trakt_status_missing_identity":
+                raise
+            self.skip_unidentified(str(exc))
+            return None
 
     def blockers(self, record, desired):
         obs = record.observation

@@ -3,12 +3,20 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import copy
+import threading
 from collections import defaultdict
 from collections.abc import Mapping
 
 from cw_platform.status_mapping import Capabilities, Observation, ReadState, Status
 from providers.sync._status_mapping import NativeStatusAdapter, Record, digest, observation
-from ._common import WeTrakrSyncError, body_of, identifier, media_item, pages, request, write_lock
+from ._common import (
+    WeTrakrSyncError, _activities, account_key, body_of, commit_snapshot, identifier, media_item, pages, playing_rows,
+    request, tracking_rows, write_lock,
+)
+
+_SNAPSHOTS: dict[str, tuple[dict, dict]] = {}
+_SNAPSHOTS_LOCK = threading.Lock()
 
 
 def owner(media):
@@ -59,14 +67,25 @@ class StatusAdapter(NativeStatusAdapter):
         from providers.sync._mod_WETRAKR import WETRAKRModule
         return WETRAKRModule(self.cfg, instance_id=self.cfg.get("_cw_provider_instance", "default"))
 
+    def history_adapter(self):
+        from providers.sync._mod_WETRAKR import WETRAKRModule
+        return WETRAKRModule({**self.cfg, "_cw_history_rewatches": True}, instance_id=self.cfg.get("_cw_provider_instance", "default"))
+
     def read(self):
         adapter = self.adapter()
+        cache_key = f"{account_key(adapter)}|{adapter.instance_id}"
         with write_lock(adapter):
-            before = activity_state(body_of(request(adapter, "GET", "/sync/last_activities")))
+            before = activity_state(_activities(adapter, fresh=True))
+            with _SNAPSHOTS_LOCK:
+                cached = _SNAPSHOTS.get(cache_key)
+            if cached is not None and cached[0] == before:
+                return copy.deepcopy(cached[1])
+            history = self.history_adapter()
+            watched = tracking_rows(history, "history")
+            playing = playing_rows(adapter)
             preserved = defaultdict(lambda: defaultdict(list))
-            plays = defaultdict(lambda: defaultdict(int))
             for kind in ("movie", "episode"):
-                for row in pages(adapter, f"/sync/tracking/watched/history/{kind}s"):
+                for row in watched[kind]:
                     media = row.get(kind)
                     if not isinstance(media, Mapping) or not row.get("id"):
                         raise WeTrakrSyncError("status_invalid_history")
@@ -74,8 +93,7 @@ class StatusAdapter(NativeStatusAdapter):
                     protected = {k: v for k, v in row.items() if k != kind}
                     protected["media_id"] = media.get("id")
                     preserved[key]["history"].append(protected)
-                    plays[key][str(media.get("id"))] += 1
-                for row in pages(adapter, f"/sync/tracking/playing/{kind}s"):
+                for row in playing[kind]:
                     if not isinstance(row.get("playback"), Mapping):
                         raise WeTrakrSyncError("status_invalid_playback")
                     preserved[owner(row)]["playback"].append({"id": row.get("id"), "playback": row["playback"]})
@@ -108,9 +126,10 @@ class StatusAdapter(NativeStatusAdapter):
                             raise WeTrakrSyncError("status_duplicate_title")
                         seen.add(key)
                         grouped[key].append((state, item, user_state(row)))
-            after = activity_state(body_of(request(adapter, "GET", "/sync/last_activities")))
+            after = activity_state(_activities(adapter, fresh=True))
             if before != after:
                 raise WeTrakrSyncError("status_snapshot_changed")
+            commit_snapshot(history)
         result = {}
         for key, entries in grouped.items():
             states = {state for state, _, _ in entries}
@@ -127,18 +146,21 @@ class StatusAdapter(NativeStatusAdapter):
                     declared.add("hold" if last.get("status") == "paused" else last.get("status"))
                 users.append({**user, "tracking": {**tracking, "last": {k: v for k, v in last.items() if k not in {"status", "tracked_at"}}}
                               if isinstance(tracking, Mapping) and isinstance(last, Mapping) else {}})
-            if declared != {native}:
+            if not explicit and declared == {"none"}:
+                native = "untracked"
+            elif declared != {native}:
                 native = "ambiguous"
             protected = {part: sorted(digest(value) for value in values) for part, values in preserved[key].items() if values}
             protected["user"] = sorted({digest(user) for user in users})
-            rewatching = any(count > 1 for count in plays[key].values())
-            obs = observation(native, self.statuses, protected, watchlisted="planning" in states, rewatching=rewatching)
+            obs = observation(native, self.statuses, protected, watchlisted="planning" in states)
             item = entries[0][1]
-            if "waiting" in states:
+            if native == "waiting":
                 obs = Observation(ReadState.UNKNOWN, native_status="waiting")
             result[key] = Record(key, "movies" if item["type"] == "movie" else "shows", item, obs,
                                  {"completed_show": item["type"] == "show" and "watched" in states,
                                   "has_playback": bool(preserved[key].get("playback"))})
+        with _SNAPSHOTS_LOCK:
+            _SNAPSHOTS[cache_key] = (before, copy.deepcopy(result))
         return result
 
     def blockers(self, record, desired):

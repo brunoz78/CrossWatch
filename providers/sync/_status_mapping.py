@@ -34,10 +34,14 @@ class Record:
     raw: dict[str, Any]
 
 
+def skipped(native_id: str, media: str, item: dict[str, Any], code: str) -> Record:
+    return Record(native_id, media, item, Observation(ReadState.UNKNOWN, native_status=code), {"_cw_skipped": code})
+
+
 def observation(native: str, statuses: dict[str, Status], protected: Any, *, watchlisted: bool, rewatching: bool = False) -> Observation:
     status = statuses.get(native)
     if status is None:
-        return Observation(ReadState.UNKNOWN)
+        return Observation(ReadState.UNKNOWN, native_status=str(native or ""))
     return Observation(ReadState.PRESENT, status, native, digest(protected), watchlisted, rewatching)
 
 
@@ -61,12 +65,14 @@ def provider_caps(provider: str) -> dict[str, Any]:
                          for s in ORDER if Status(s) in caps.readable and Status(s) in caps.writable},
             "effects": cls.effects,
         } for media, caps in cls.capabilities.items()},
+        **({"notice": cls.notice} if cls.notice else {}),
     }
 
 
 class NativeStatusAdapter:
     capabilities: dict[str, Capabilities] = {}
     effects: dict[str, str] = {}
+    notice = ""
     creates_missing = False
 
     def __init__(self, cfg: dict[str, Any]):
@@ -84,6 +90,9 @@ class NativeStatusAdapter:
 
     def missing_record(self, source: Record, snapshot: dict[str, Record]) -> Record | None:
         return None
+
+    def skip_unidentified(self, code: str) -> None:
+        self.unidentified = [*getattr(self, "unidentified", []), code]
 
     def blockers(self, record: Record, desired: Status) -> tuple[str, ...]:
         if record.observation.rewatching:

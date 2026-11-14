@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -157,6 +157,9 @@ def parse_mapping(
     return MappingConfig(scope, conflict, ordered, fingerprint)
 
 
+UNTRACKED_STATES = frozenset({"waiting", "caught_up_or_untracked", "caught_up", "untracked", "dropped_seasons"})
+
+
 @dataclass(frozen=True)
 class Observation:
     state: ReadState
@@ -248,6 +251,9 @@ def plan_status(
     if config.scope != item.pair or item.media not in {"movies", "shows"} or not item.a_id or not item.b_id:
         return Decision("skip", "scope_mismatch")
     if a.state == ReadState.UNKNOWN or b.state == ReadState.UNKNOWN:
+        unknown = [side for side in (a, b) if side.state == ReadState.UNKNOWN]
+        if all(side.native_status in UNTRACKED_STATES for side in unknown):
+            return Decision("skip", "caught_up")
         return Decision("skip", "incomplete_read")
     if a.state == ReadState.CLEARED or b.state == ReadState.CLEARED:
         return Decision("skip", "explicit_clear_not_supported")
@@ -271,7 +277,7 @@ def plan_status(
         gate = execution.get(direction, ExecutionScope())
         if not authorized(direction):
             return Decision("skip", "opt_in_disabled", direction)
-        if source.rewatching or target.rewatching:
+        if target.rewatching:
             return Decision("skip", "rewatch_state_preserved", direction)
         if source.state == ReadState.ABSENT:
             return Decision("skip", "source_absent", direction)
@@ -287,6 +293,8 @@ def plan_status(
         if rule.target == target.status:
             return Decision("noop", "already_mapped", direction, rule.target)
         if target.status == Status.COMPLETED:
+            if source.status == Status.COMPLETED:
+                return Decision("noop", "same_status", direction, source.status)
             return Decision("skip", "completed_destination_preserved", direction)
         check = checks.get(direction)
         if check is None or not check.verified or (check.item, check.source, check.target, check.desired) != (item, source, target, rule.target):
@@ -312,9 +320,9 @@ def plan_status(
         if not a_changed and not b_changed:
             reason = "unchanged_since_baseline" if (a, b) == (baseline.a, baseline.b) else "status_unchanged"
             return Decision("noop", reason)
-        if a_changed and b == baseline.b:
+        if a_changed and replace(b, rewatching=False) == replace(baseline.b, rewatching=False):
             return forward
-        if b_changed and a == baseline.a and reverse is not None:
+        if b_changed and replace(a, rewatching=False) == replace(baseline.a, rewatching=False) and reverse is not None:
             return reverse
     elif not item.pair.two_way:
         return forward

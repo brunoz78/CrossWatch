@@ -290,10 +290,42 @@ class TmdbProvider:
     ) -> TmdbResponse:
         data = self._request_json(url, q, quiet_404=quiet_404, timeout=timeout, request=request, max_retries=retries)
         fetched_at = time.time()
+        show = url.removeprefix("https://api.themoviedb.org/3/tv/")
+        notify = show.isascii() and show.isdecimal() and set(q) == {"api_key", "language"} and q.get("language") == "en-US" and isinstance(data, dict) and data.get("id") == int(show) and isinstance(data.get("seasons"), list)
         with lock:
+            previous = (self._cache.get(key) or self._disk_read(key)) if notify else None
             self._disk_write(key, data, fetched_at)
             self._publish(key, (fetched_at, data), scope)
+        if notify:
+            fields = ("status", "number_of_episodes", "number_of_seasons", "next_episode_to_air")
+            def signature(value):
+                seasons = value.get("seasons")
+                counts = [(season.get("season_number"), season.get("episode_count")) for season in seasons if isinstance(season, dict)] if isinstance(seasons, list) else []
+                return tuple(value.get(field) for field in fields), counts
+            if not previous or not isinstance(previous[1], dict) or signature(previous[1]) != signature(data):
+                try:
+                    from services.tracker_automation import metadata_changed
+                    metadata_changed(show)
+                except Exception as exc:
+                    self._log_exc("Tracker metadata notification failed", exc)
         return TmdbResponse(data, fetched_at, "network")
+
+    def peek_show(self, tmdb_id: str, *, max_age: float = 7 * 86400) -> TmdbResponse | None:
+        identifier = str(tmdb_id)
+        if not identifier.isascii() or not identifier.isdecimal() or int(identifier) <= 0:
+            return None
+        params = {"api_key": self._apikey(), "language": "en-US"}
+        key = f"https://api.themoviedb.org/3/tv/{int(identifier)}?" + "&".join(sorted(f"{k}={v}" for k, v in params.items()))
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        with _PROVIDERS_LOCK:
+            hit = self._cache.get(digest)
+        hit = hit or self._disk_read(digest)
+        if not hit or time.time() - hit[0] > max_age:
+            return None
+        data = hit[1]
+        if not isinstance(data, dict) or data.get("id") != int(identifier) or not isinstance(data.get("seasons"), list):
+            return None
+        return TmdbResponse(deepcopy(data), hit[0], "cache")
 
     def lookup(
         self, entity: str, tmdb_id: str | int, *, season: int | None = None,
@@ -623,6 +655,8 @@ class TmdbProvider:
             return {}
 
         include = f"{lang[:2]},{lang},null" if lang else "en,null"
+        if want_logo:
+            include = ",".join(dict.fromkeys([*include.split(","), "en"]))
         base = "https://api.themoviedb.org/3"
         if kind == "movie":
             imgs = self._get(f"{base}/movie/{tmdb_id}/images", {"include_image_language": include})

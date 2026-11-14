@@ -7,14 +7,15 @@
   const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
   const ORIGINS = { settings: ["settings/sync", "Synchronization"], playlists: ["playlists", "Playlists"] };
   const origin = () => {
+    if (session?.tracker_import) return [session.report ? `tracker?instance=${encodeURIComponent(session.pair.target_instance || "default")}` : "tracker", "Tracker"];
     try { return ORIGINS[sessionStorage.getItem("cw.interactive_sync.origin")] || ORIGINS.settings; } catch { return ORIGINS.settings; }
   };
-  const labels = { add: "Add", remove: "Remove", update: "Update", tag_dropped: "Mark dropped", unresolved: "Needs attention", blocked: "Blocked", conflict: "Conflict", not_in_library: "Not in library" };
+  const labels = { add: "Add", remove: "Remove", update: "Update", tag_dropped: "Mark dropped", rewatch_reset: "Mark unwatched", unresolved: "Needs attention", blocked: "Blocked", conflict: "Conflict", not_in_library: "Not in library" };
   let session = null, busy = false, timer = null, page = 0, route = "", generation = 0;
   let feature = "", result = "", query = "", mappingDirty = false, mappingWorkspace = null;
   let pageData = { items: [], total: 0 }, pageLoading = false, pageRequest = 0, pageController = null, searchTimer = null;
   let progressTimer = null, progressReceived = Date.now(), pollFailures = 0;
-  let downloadOpen = false, downloadScope = "all", downloadFormat = "csv", downloading = false;
+  let downloadOpen = false, downloadScope = "all", downloadFormat = "csv", downloading = false, noticesExpanded = null;
   const PAGE_SIZE = 75;
   const css = document.createElement("link");
   css.rel = "stylesheet";
@@ -70,7 +71,7 @@
       const state = row.state === "skipped" ? "Not run" : row.state === "checking" ? "Check not completed" : row.state === "attention" ? "Needs review" : row.preview || row.dry_run ? "Preview checked" : "Checked";
       const counts = row.state === "skipped" ? "" : [["matched", "matched"], ["proposed", "proposed"], ["updated", "updated"], ["unchanged", "unchanged"], ["excluded", "excluded"], ["unmatched", "unmatched"], ["recovered", "previous writes confirmed"], ["not_selected", "not selected"], ["unresolved", "review notices"], ["errors", "errors"]]
         .filter(([key]) => row[key] || key === "matched" || key === (row.preview || row.dry_run ? "proposed" : "updated"))
-        .map(([key, label]) => `${number(row[key])} ${label}`).join(" · ");
+        .map(([key, label]) => key === "unresolved" && (session?.notices || []).length ? `<button class="is-link" data-action="show-notices">${number(row[key])} ${label}</button>` : `${number(row[key])} ${label}`).join(" · ");
       return `<p><strong>${esc(endpoint(row.src, row.src_instance))} ${row.mode === "two-way" ? "↔" : "→"} ${esc(endpoint(row.dst, row.dst_instance))}: ${state}</strong>${row.reason ? `<br>${esc(row.reason)}` : ""}${counts ? `<br>${counts}` : ""}</p>`;
     }).join("")}</section>`;
   }
@@ -82,6 +83,15 @@
   const number = value => Number(value || 0).toLocaleString();
   const noticeSubject = n => n.provider ? `${n.provider}${n.side ? ` (${n.side})` : ""}` : n.route || "";
   const noticeReason = n => { const reason = String(n.reason || n.event || "Provider notice"); return reason.includes(" ") ? reason : reason.replaceAll("_", " ").replaceAll(":", ": "); };
+  function noticesHTML(failedPlan, partialReady) {
+    const notices = session?.notices || [];
+    if (!notices.length) return "";
+    const all = noticesExpanded ?? (notices.length <= 5 || !!failedPlan || !!partialReady);
+    const heading = failedPlan ? "Failure notices and sync protections" : "Sync protections and provider notices";
+    const line = n => `<p><strong>${esc([n.feature, noticeSubject(n)].filter(Boolean).join(" / "))}</strong> ${esc(noticeReason(n))}${n.detail ? ` - ${esc(n.detail)}` : ""}${n.error ? `<br><strong>Error:</strong> ${esc(n.error)}` : ""}</p>`;
+    const toggle = notices.length > 3 ? `<button class="is-link" data-action="toggle-notices" aria-expanded="${all}">${all ? "Show fewer" : `Show all ${number(notices.length)} notices`}</button>` : "";
+    return `<section id="is-notices" class="is-notices" aria-label="${heading}"><strong>${heading} (${number(notices.length)})</strong>${(all ? notices : notices.slice(0, 3)).map(line).join("")}${toggle}</section>`;
+  }
   function aiQuestion() {
     const pair = session?.pair || {};
     const route = `${endpoint(pair.source, pair.source_instance)} ${pair.mode === "two-way" ? "↔" : "→"} ${endpoint(pair.target, pair.target_instance)}`;
@@ -294,10 +304,13 @@
       <p class="is-report-item-range" role="status">${pageLoading ? "Loading..." : `${number(pageData.total ? page * PAGE_SIZE + 1 : 0)}&ndash;${number(Math.min((page + 1) * PAGE_SIZE, pageData.total))} of ${number(pageData.total)} matching items`}</p><div class="is-table-wrap"><table class="is-table is-report-items"><thead><tr><th>Item</th><th>Feature / destination</th><th>Result</th><th>Reason</th></tr></thead><tbody>${pageLoading ? `<tr><td colspan="4">Loading item details…</td></tr>` : pageData.items.map(row => `<tr><td><strong>${esc(title(row.item))}</strong><small>${esc(row.key || Object.entries(row.item?.ids || {}).map(([key,value]) => `${key}:${value}`).join(" · "))}</small></td><td>${esc(row.feature)}<small>${esc(endpoint(row.provider,row.instance))} · ${esc(labels[row.operation] || row.operation)}</small></td><td><span class="is-badge ${row.result === "blocked" ? "blocked" : "unresolved"}">${row.result === "blocked" ? "Blocked" : row.result === "unresolved" ? "Unresolved" : "Not confirmed"}</span></td><td class="is-report-reason">${reasonDetailsHTML(row)}</td></tr>`).join("") || `<tr><td colspan="4">No matching items.</td></tr>`}</tbody></table></div>
       <nav class="is-pagination" aria-label="Report item pages"><button class="is-btn is-small" data-action="first" ${pageLoading || !page ? "disabled" : ""}>First</button><button class="is-btn is-small" data-action="prev" ${pageLoading || !page ? "disabled" : ""}>Previous</button><label>Page <input type="number" data-page min="1" max="${pages}" value="${page + 1}" ${pageLoading ? "disabled" : ""}> of ${number(pages)}</label><button class="is-btn is-small" data-action="next" ${pageLoading || page + 1 >= pages ? "disabled" : ""}>Next</button><button class="is-btn is-small" data-action="last" ${pageLoading || page + 1 >= pages ? "disabled" : ""}>Last</button></nav></section>`;
   }
+  function closeButtonHTML() {
+    return `<button class="is-btn" data-action="discard" ${pending() || !session ? "disabled" : ""}>${session?.report ? "Close report" : "Close review"}</button>`;
+  }
   function reportHTML() {
     const report = session.report, totals = report.totals;
     const outcomes = {
-      success: ["check_circle", "Sync completed", report.requested === 0 ? "No changes applied. Your sync data has been refreshed." : "The sync engine finished processing your selected changes."],
+      success: ["check_circle", session?.tracker_import ? "Import completed" : "Sync completed", report.requested === 0 ? "No changes applied. Your sync data has been refreshed." : "The sync engine finished processing your selected changes."],
       attention: ["warning", "Finished with items to review", "Some changes need attention. Review the results and notices below."],
       cancelled: ["pause_circle", "Sync cancelled", "Changes already applied were kept."],
       incomplete: ["error", "Sync did not finish", "The report contains the results available before the operation stopped."]
@@ -322,7 +335,7 @@
       ${(report.review_notices || []).length ? `<details class="is-notices"><summary>Protections and notices from the preview (${number(report.review_notices.length)})</summary>${report.review_notices.map(n => `<p>${esc([n.feature, noticeSubject(n)].filter(Boolean).join(" / "))} · ${esc(n.reason)}${n.detail ? ` · ${esc(n.detail)}` : ""}</p>`).join("")}</details>` : ""}
       ${reportIssuesHTML()}
       <p class="is-report-accounting">${esc(report.accounting_note)}</p>
-      <footer class="is-report-footer"><div><strong>Keep a copy of this report</strong><small>Available while this review session is retained. Download it for your records.</small></div><div class="is-header-actions"><button class="is-btn" data-action="download-report"><span class="material-symbols-rounded" aria-hidden="true">download</span>Download JSON</button><a class="is-btn is-primary" href="#${origin()[0]}">Back to ${origin()[1]}</a></div></footer>
+      <footer class="is-footer is-report-footer"><div><strong>Keep a copy of this report</strong><small>Available while this review session is retained. Download it for your records.</small></div><div class="is-header-actions is-footer-actions">${closeButtonHTML()}<button class="is-btn" data-action="download-report"><span class="material-symbols-rounded" aria-hidden="true">download</span>Download JSON</button><a class="is-btn is-primary" href="#${origin()[0]}">Back to ${origin()[1]}</a></div></footer>
     </section>`;
   }
   function render() {
@@ -336,6 +349,7 @@
     const done = !!session?.report || session?.status === "complete";
     const partialReady = session?.status === "review" && (session?.failed_features || []).length > 0;
     const failedPlan = session?.status === "error" && !done;
+    const dryRun = !!session?.dry_run && !done && !failedPlan;
     const failedFeatures = [...new Set((session?.notices || []).filter(n => n.event === "feature:error").map(n => [n.feature, noticeSubject(n)].filter(Boolean).join(" from ")).filter(Boolean))];
     const locked = pending() || pageLoading || done || session?.status !== "review";
     const summary = session?.summary || {};
@@ -343,7 +357,7 @@
     const cursor = focused ? document.activeElement.selectionStart : null;
     host.innerHTML = `<div class="is-page">
       <a class="is-back" href="#${origin()[0]}"><span class="material-symbols-rounded" aria-hidden="true">arrow_back</span>${origin()[1]}</a>
-      <header class="is-header"><div><div class="is-eyebrow">INTERACTIVE SYNC</div><h1>${session?.report ? "Sync report" : failedPlan ? "Partial sync plan" : "Review your sync"}</h1></div><div class="is-header-actions">${aiButton()}${[pair.source,pair.target].includes("PLEX") ? `<button class="is-btn" data-action="recover-plex" title="Open a separate recovery activity for titles no longer in your Plex libraries. Review matches and import selected history into the CrossWatch tracker. This does not run this sync pair." ${pending() ? "disabled" : ""}>Recover Plex history</button>` : ""}${session?.report ? "" : `<button class="is-btn" data-action="refresh" ${pending() || done || !session ? "disabled" : ""}><span class="material-symbols-rounded" aria-hidden="true">refresh</span>Refresh plan</button>`}${session?.report ? "" : `<button class="is-btn" data-action="toggle-download" aria-expanded="${downloadOpen}" aria-controls="is-download-options" ${locked ? "disabled" : ""}><span class="material-symbols-rounded" aria-hidden="true">download</span>Download review</button>`}<button class="is-btn" data-action="discard" ${pending() || !session ? "disabled" : ""}>${session?.report ? "Close report" : "Close review"}</button></div></header>
+      <header class="is-header"><div><div class="is-eyebrow">${session?.tracker_import ? "TRACKER IMPORT" : "INTERACTIVE SYNC"}</div><h1>${session?.tracker_import ? (session?.report ? "Import report" : "Review your import") : session?.report ? "Sync report" : failedPlan ? "Partial sync plan" : "Review your sync"}</h1></div><div class="is-header-actions">${aiButton()}${[pair.source,pair.target].includes("PLEX") ? `<button class="is-btn" data-action="recover-plex" title="Open a separate recovery activity for titles no longer in your Plex libraries. Review matches and import selected history into the CrossWatch tracker. This does not run this sync pair." ${pending() ? "disabled" : ""}>Recover Plex history</button>` : ""}${session?.report ? "" : `<button class="is-btn" data-action="refresh" ${pending() || done || !session ? "disabled" : ""}><span class="material-symbols-rounded" aria-hidden="true">refresh</span>Refresh plan</button>`}${session?.report ? "" : `<button class="is-btn" data-action="toggle-download" aria-expanded="${downloadOpen}" aria-controls="is-download-options" ${locked ? "disabled" : ""}><span class="material-symbols-rounded" aria-hidden="true">download</span>Download review</button>`}${closeButtonHTML()}</div></header>
       ${downloadOpen && !done ? `<section id="is-download-options" class="is-notices" aria-label="Download review"><div class="is-toolbar"><label>Scope<select data-download="scope" ${downloading ? "disabled" : ""}><option value="all" ${downloadScope === "all" ? "selected" : ""}>Entire review</option><option value="filtered" ${downloadScope === "filtered" ? "selected" : ""}>Filtered results</option></select></label><label>Format<select data-download="format" ${downloading ? "disabled" : ""}><option value="csv" ${downloadFormat === "csv" ? "selected" : ""}>CSV</option><option value="json" ${downloadFormat === "json" ? "selected" : ""}>JSON</option></select></label><button class="is-btn" data-action="download-review" ${locked || downloading ? "disabled" : ""}>${downloading ? "Downloading..." : "Download"}</button></div><p>Entire review includes hidden items. Filtered results includes all matching pages. Both include selection state.</p></section>` : ""}
       <div class="is-route"><span class="material-symbols-rounded" aria-hidden="true">sync_alt</span>${window.CW?.syncProfileRouteHTML?.(pair) || `<strong>${esc(endpoint(pair.source, pair.source_instance))}</strong><span>${pair.mode === "two-way" ? "↔" : "→"}</span><strong>${esc(endpoint(pair.target, pair.target_instance))}</strong>`}<span class="is-route-mode">${pair.mode === "two-way" ? "Two-way" : "One-way"}</span></div>
       ${session?.report ? "" : `<div class="is-progress-host">${progressHTML()}</div>`}
@@ -353,15 +367,15 @@
       ${partialReady ? `<section class="is-notices" role="alert"><h2>Some features could not be planned</h2><p>You can apply changes from completed features. Failed features (${esc(session.failed_features.join(", "))}) are excluded. Review the notices and choose <strong>Refresh plan</strong> to retry them.</p></section>` : ""}
       ${failedPlan ? `<section class="is-notices" role="alert" aria-label="Incomplete sync plan"><h2>Partial plan: review incomplete</h2><p>${failedFeatures.length ? `Planning failed for ${esc(failedFeatures.join(", "))}. Those features have no proposals in this plan; the proposals below come from features that finished.` : "The proposals below were collected before planning stopped."} They are not the complete set of changes. Counts cover only this partial plan; a missing feature does not mean it has no changes.</p><p>Apply and Download review are disabled until a complete plan is available. Check the failure notices below and the matching provider or feature errors in Events or logs, then choose <strong>Refresh plan</strong> to reread providers and retry.</p>${(session.notices || []).length ? "" : "<p>No detailed failure notice was captured. Check Events or logs for the failed planning attempt.</p>"}</section>` : ""}
       ${done ? `<div class="is-metrics">${[["Added", summary.added], ["Updated", summary.updated], ["Removed", summary.removed], ["Unresolved", summary.unresolved], ["Errors", summary.errors], ["Changed since review", summary.not_applied]].map(([label, n]) => `<div><strong>${Number(n || 0)}</strong><span>${label}</span></div>`).join("")}</div>` : `<div class="is-metrics"><div><strong>${count}</strong><span>${failedPlan ? "Partial proposals" : "Proposed changes"}</span></div><div><strong>${selectedCount}</strong><span>Selected</span></div><div><strong>${session?.counts?.conflicts || 0}</strong><span>${failedPlan ? "Conflicts found so far" : "Conflicts to review"}</span></div><div><strong>${failedPlan && !session?.counts?.attention ? "Unknown" : session?.counts?.attention || 0}</strong><span>${failedPlan ? "Item checks incomplete" : "Need attention"}</span></div></div>`}
-      ${(session?.notices || []).length ? `<details class="is-notices" ${failedPlan || partialReady ? "open" : ""}><summary>${failedPlan ? "Failure notices and sync protections" : "Sync protections and provider notices"} (${session.notices.length})</summary>${session.notices.map(n => `<p><strong>${esc([n.feature, noticeSubject(n)].filter(Boolean).join(" / "))}</strong> ${esc(noticeReason(n))}${n.detail ? ` - ${esc(n.detail)}` : ""}${n.error ? `<br><strong>Error:</strong> ${esc(n.error)}` : ""}</p>`).join("")}</details>` : ""}
+      ${noticesHTML(failedPlan, partialReady)}
       <div class="is-toolbar"><label class="is-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input data-filter="query" type="search" maxlength="256" placeholder="Search titles or IDs" aria-label="Search proposed changes" value="${esc(query)}"></label><label>Feature<select data-filter="feature"><option value="">All features</option>${(session?.features || []).map(f => `<option value="${esc(f)}" ${feature === f ? "selected" : ""}>${esc(f.charAt(0).toUpperCase() + f.slice(1))}</option>`).join("")}</select></label><label>Result<select data-filter="result"><option value="">All results</option>${Object.entries(labels).map(([k, v]) => `<option value="${k}" ${result === k ? "selected" : ""}>${v}</option>`).join("")}</select></label></div>
-      <div class="is-list-actions"><span>${pageLoading ? "Loading page..." : `${pageData.total} matching items`}</span>${hiddenCount ? `<button class="is-link" data-action="toggle-library" title="Items that are not in the destination library are left out of this sync.">${result === "not_in_library" ? "Back to proposed changes" : `${number(hiddenCount)} not in library (hidden)`}</button>` : ""}<button class="is-btn is-small" data-action="map-selected" ${locked || !selectedCount ? "disabled" : ""} title="Edit checked items across all pages">Edit selected</button><button class="is-link" data-action="select" ${locked ? "disabled" : ""}>Select filtered</button><button class="is-link" data-action="deselect" ${locked ? "disabled" : ""}>Deselect filtered</button></div>
+      <div class="is-list-actions"><span>${pageLoading ? "Loading page..." : `${pageData.total} matching items`}</span>${hiddenCount ? `<button class="is-link" data-action="toggle-library" title="Items that are not in the destination library are left out of this sync.">${result === "not_in_library" ? "Back to proposed changes" : `${number(hiddenCount)} not in library (hidden)`}</button>` : ""}${session?.tracker_import ? "" : `<button class="is-btn is-small" data-action="map-selected" ${locked || !selectedCount ? "disabled" : ""} title="Edit checked items across all pages">Edit selected</button>`}<button class="is-link" data-action="select" ${locked ? "disabled" : ""}>Select filtered</button><button class="is-link" data-action="deselect" ${locked ? "disabled" : ""}>Deselect filtered</button></div>
       <div class="is-table-wrap" aria-busy="${pageLoading}"><table class="is-table"><thead><tr><th scope="col"><span class="sr-only">Selected</span></th><th scope="col">Item</th><th scope="col">Feature</th><th scope="col">Proposed change</th><th scope="col">Review</th></tr></thead><tbody>${rows.map(row => {
         if (row.result === "conflict") return `<tr class="is-conflict"><td><span class="material-symbols-rounded" aria-hidden="true">compare_arrows</span></td><td><strong>${esc(title(row.left))}</strong><small>${row.left?._cw_status_mapping ? "Title status" : esc(row.key)}</small></td><td>${esc(row.feature)}</td><td><span class="is-badge conflict">Conflict</span><small>${esc(row.source)}: ${esc(value(row.left, row.feature))} · ${esc(row.target)}: ${esc(value(row.right, row.feature))}</small></td><td><label class="is-sr-label" for="choice-${row.id}">Use value from</label><select id="choice-${row.id}" data-choice="${row.id}" ${locked ? "disabled" : ""}>${row.left?._cw_status_mapping ? `<option value="" ${!row.winner ? "selected" : ""}>Leave unchanged</option>` : ""}${[row.source, row.target].map(p => `<option value="${esc(p)}" ${p === row.winner ? "selected" : ""}>Use ${esc(p)}</option>`).join("")}</select></td></tr>`;
-        return `<tr><td><input type="checkbox" data-select="${row.id}" aria-label="Select ${esc(title(row.item))}" ${row.selected ? "checked" : ""} ${locked || !row.selectable ? "disabled" : ""}></td><td><strong>${esc(title(row.item))}</strong><small>${esc(row.item.type || "")} ${esc(row.item.year || "")} · ${esc(row.key)}</small>${reasonDetailsHTML(row)}</td><td>${esc(row.feature)}</td><td><span class="is-badge ${esc(row.result)}">${row.reason_origin === "previous_attempt" ? "Previous failure" : labels[row.result] || esc(row.result)}</span><span class="is-destination">${esc(endpoint(row.provider, row.instance))}</span>${row.destination_label ? `<small>${esc(row.destination_label)}</small>` : ""}<small>${esc(value(row.before, row.feature))} → ${row.operation === "remove" ? "Removed" : row.operation === "tag_dropped" ? "Dropped" : esc(value(row.item, row.feature))}</small></td><td>${["add", "update"].includes(row.operation) && row.feature !== "playlists" && !row.item?._cw_status_mapping ? `<button class="is-btn is-small" data-map="${row.id}" ${locked ? "disabled" : ""}>Mapping</button>` : "—"}</td></tr>`;
+        return `<tr><td><input type="checkbox" data-select="${row.id}" aria-label="Select ${esc(title(row.item))}" ${row.selected ? "checked" : ""} ${locked || !row.selectable ? "disabled" : ""}></td><td><strong>${esc(title(row.item))}</strong><small>${esc(row.item.type || "")} ${esc(row.item.year || "")} · ${esc(row.key)}</small>${reasonDetailsHTML(row)}</td><td>${esc(row.feature)}</td><td><span class="is-badge ${esc(row.result)}">${row.reason_origin === "previous_attempt" ? "Previous failure" : labels[row.result] || esc(row.result)}</span><span class="is-destination">${esc(endpoint(row.provider, row.instance))}</span>${row.destination_label ? `<small>${esc(row.destination_label)}</small>` : ""}<small>${esc(value(row.before, row.feature))} → ${row.operation === "remove" ? "Removed" : row.operation === "tag_dropped" ? "Dropped" : row.operation === "rewatch_reset" ? "Unwatched (rewatch reset)" : esc(value(row.item, row.feature))}</small></td><td>${!session?.tracker_import && ["add", "update"].includes(row.operation) && row.feature !== "playlists" && !row.item?._cw_status_mapping ? `<button class="is-btn is-small" data-map="${row.id}" ${locked ? "disabled" : ""}>Mapping</button>` : "—"}</td></tr>`;
       }).join("") || `<tr><td colspan="5"><div class="is-empty"><span class="material-symbols-rounded" aria-hidden="true">${pending() ? "sync" : failedPlan ? "warning" : "done_all"}</span><strong>${pending() ? "Reading your providers" : failedPlan ? (count || session?.counts?.conflicts ? "No partial proposals match these filters" : "No proposals available from this partial plan") : count || session?.counts?.conflicts ? "No items match these filters" : "No changes proposed"}</strong><p>${pending() ? "Your sync rules and mappings are being checked." : "Refresh the plan after changing sync settings or mappings."}</p></div></td></tr>`}</tbody></table></div>
       <div class="is-pagination"><button class="is-btn is-small" data-action="first" ${pageLoading || page === 0 ? "disabled" : ""}>First</button><button class="is-btn is-small" data-action="prev" ${pageLoading || page === 0 ? "disabled" : ""}>Previous</button><label>Page <input data-page type="number" min="1" max="${pages}" value="${page + 1}" aria-label="Page number" ${pageLoading ? "disabled" : ""}> of ${pages}</label><button class="is-btn is-small" data-action="next" ${pageLoading || page + 1 >= pages ? "disabled" : ""}>Next</button><button class="is-btn is-small" data-action="last" ${pageLoading || page + 1 >= pages ? "disabled" : ""}>Last</button></div>
-      <footer class="is-footer"><div><strong>${done ? "Operation finished" : failedPlan ? "Incomplete plan" : `${selectedCount} changes selected`}</strong><small>${done ? "Provider results are also available in Events." : failedPlan ? "Apply requires a complete plan. Review the notices and refresh." : "Mappings are saved permanently. Only selected sync changes will be applied."}</small></div>${done ? `<a class="is-btn is-primary" href="#${origin()[0]}">Back to ${origin()[1]}</a>` : `<button class="is-btn is-primary" data-action="apply" ${locked || !selectedCount ? "disabled" : ""}><span class="material-symbols-rounded" aria-hidden="true">check</span>Apply selected (${selectedCount})</button>`}</footer>
+      <footer class="is-footer"><div><strong>${done ? "Operation finished" : failedPlan ? "Incomplete plan" : dryRun ? "Dry run is on" : `${selectedCount} changes selected`}</strong><small>${done ? "Provider results are also available in Events." : failedPlan ? "Apply requires a complete plan. Review the notices and refresh." : dryRun ? "Apply selected will ask for confirmation to write these changes once. Global dry run stays on." : session?.tracker_import ? "Only selected changes are imported into this Tracker. Nothing is written back to the source." : "Mappings are saved permanently. Only selected sync changes will be applied."}</small></div><div class="is-footer-actions">${closeButtonHTML()}${done ? `<a class="is-btn is-primary" href="#${origin()[0]}">Back to ${origin()[1]}</a>` : `<button class="is-btn is-primary" data-action="apply" ${locked || !selectedCount ? "disabled" : ""}><span class="material-symbols-rounded" aria-hidden="true">check</span>Apply selected (${selectedCount})</button>`}</div></footer>
       </div>`}
     </div>`;
     if (focused) {
@@ -371,6 +385,11 @@
   }
   async function action(name, body = {}) {
     if (!session || pending() || (pageLoading && ["selection", "apply", "mapping"].includes(name))) return;
+    if (name === "apply" && session.dry_run) {
+      const count = Number(session.counts?.selected || 0);
+      if (!count || !window.confirm(`Global dry run is on.\n\nApply ${count} selected change${count === 1 ? "" : "s"} now? This will write the selected changes to the destination providers.\n\nGlobal dry run will stay enabled for future syncs.`)) return;
+      body = { ...body, confirm_dry_run: true };
+    }
     const current = generation, sid = session.id;
     const previousSelection = new Map();
     if (name === "selection" && body.ids) {
@@ -397,7 +416,7 @@
     }
   }
   async function mapping(row) {
-    if (mappingWorkspace || pending() || pageLoading) return;
+    if (session?.tracker_import || mappingWorkspace || pending() || pageLoading) return;
     const sid = session.id, revision = session.revision, selectionVersion = session.selection_version;
     mappingWorkspace = {};
     try {
@@ -465,6 +484,18 @@
       host.querySelector(downloadOpen ? '[data-download="scope"]' : '[data-action="toggle-download"]')?.focus();
       return;
     }
+    if (name === "toggle-notices") {
+      noticesExpanded = button.getAttribute("aria-expanded") !== "true";
+      render();
+      host.querySelector('[data-action="toggle-notices"]')?.focus();
+      return;
+    }
+    if (name === "show-notices") {
+      noticesExpanded = true;
+      render();
+      host.querySelector("#is-notices")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
     if (name === "download-review") return downloadReview();
     if (name === "map-selected") return mapping();
     if (name === "download-report" && session.report) {
@@ -524,7 +555,7 @@
     if (next === route && busy) return;
     route = next;
     const current = ++generation;
-    downloadOpen = false; downloadScope = "all"; downloadFormat = "csv";
+    downloadOpen = false; downloadScope = "all"; downloadFormat = "csv"; noticesExpanded = null;
     clearTimeout(timer); clearInterval(progressTimer); pollFailures = 0;
     const params = new URLSearchParams(next.split("?")[1] || "");
     if (params.has("pair")) {

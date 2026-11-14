@@ -323,19 +323,13 @@
         const premium = plan === "pro" || plan === "vip";
         const label = plan ? (plan === "vip" ? "VIP" : titleCase(plan)) : "";
         const lines = label ? [`Plan: ${label}`] : [];
-        const left = Number(data?.daily_remaining);
-        if (data?.daily_remaining != null && Number.isFinite(left)) {
-          const limit = Number(data?.daily_limit);
-          lines.push(`API calls left today: ${left}${Number.isFinite(limit) && limit > 0 ? ` / ${limit}` : ""}`);
-          if (data?.daily_resets_label) lines.push(`Resets: ${txt(data.daily_resets_label)}`);
-        }
+        lines.push(...(meta.dailyQuotaDetails?.(data) || []));
         return { vip: premium, detail: lines.join("\n") };
       }
       case "EMBY":
         return { vip: !!data?.premiere, detail: data?.premiere ? "Plan: Premiere" : "" };
       case "MDBLIST": {
-        const plan = txt(data?.vip_type || data?.patron_status || (data?.vip ? "VIP" : ""));
-        return { vip: !!data?.vip, detail: plan ? `Plan: ${titleCase(plan.replace(/^active[_ -]/i, ""))}` : "" };
+        return { vip: !!data?.vip, detail: (meta.mdblistAccountDetails?.(data) || []).join("\n") };
       }
       case "CROSSWATCH":
         return { vip: true, detail: ["Plan: VIP", txt(data?.vip_text) || "You've earned it"].join("\n") };

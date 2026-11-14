@@ -5,20 +5,21 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
 import {readFile, mkdir} from "node:fs/promises";
-import {chromium} from "playwright";
+import {chromium, webkit} from "playwright";
 
 const template = execFileSync("python", ["-c", "import ui_frontend; print(ui_frontend.get_profile_html({'is_admin':True,'username':'mobile','display_name':'Mobile preview'}))"], {encoding:"utf8",maxBuffer:1024*1024});
 const items = ["The Grand Budapest Hotel", "A long episode title with plenty of words", "Arrival"].map((title,index)=>({key:`movie:tmdb:${index+1}`,type:"movie",title,year:2014,ids:{tmdb:String(index+1)},tmdb:String(index+1),sort_epoch:1793989800,watched_at:"2026-11-06T18:30:00Z",last_collected_at:1793989800,rating:8.5,watch_count:3,watch_epochs:[1793989800],providers:["PLEX","TRAKT"],sources_by_provider:{PLEX:["default"],TRAKT:["default"]},progress:45,can_update_progress:true,can_mark_watched:true,can_remove_progress:true,provider:"PLEX",provider_instance:"default",duration:120,remaining_minutes:66,media:{resolution:"4k",hdr:"dolby_vision",audio:"truehd"}}));
 
-async function fixture(t,theme,width) {
-  const browser=await chromium.launch({headless:true});
+async function fixture(t,theme,width,{count=0}={}) {
+  const browser=await (process.env.CW_PROFILE_BROWSER === "webkit" ? webkit : chromium).launch({headless:true});
   t.after(()=>browser.close());
-  const page=await browser.newPage({viewport:{width,height:844},hasTouch:width<800,isMobile:width<800,reducedMotion:'reduce'});
+  const page=await browser.newPage({viewport:{width,height:844},hasTouch:width<=760,isMobile:width<=760,reducedMotion:'reduce'});
   page.setDefaultTimeout(6000);
   const errors=[];
   page.on('pageerror',error=>errors.push(error.message));
   t.after(()=>assert.deepEqual(errors,[]));
-  const state={empty:false};
+  const state={empty:false,queries:[]};
+  const fixtureItems = count ? Array.from({length:count},(_,index)=>({...items[index % items.length],key:`movie:tmdb:${index+1}`,title:`Movie ${index+1}`,tmdb:String(index+1),ids:{tmdb:String(index+1)}})) : items;
   const html=await page.evaluate(({source,theme})=>{
     const doc=new DOMParser().parseFromString(source,'text/html');
     doc.querySelectorAll('script').forEach(script=>script.remove());
@@ -43,7 +44,8 @@ async function fixture(t,theme,width) {
     }
     if(path.startsWith('/art/')) return route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="400" height="600"><rect width="400" height="600" fill="#243c57"/><circle cx="200" cy="200" r="100" fill="#447a89"/><path d="M0 600L200 250L400 600" fill="#c89162"/></svg>'});
     if(path.startsWith('/api/')) {
-      const list=state.empty?[]:items;
+      const list=state.empty?[]:fixtureItems;
+      state.queries.push({path,params:Object.fromEntries(url.searchParams)});
       let json={ok:true};
       if(path==='/api/profile') json={user:{is_admin:true,username:'mobile',display_name:'Mobile preview',permissions:{write:true},preferences:{},sessions:[]}};
       if(['/api/profile/collection','/api/profile/history','/api/profile/ratings','/api/profile/watchlist'].includes(path)) json={items:list,total:list.length,page:1,page_size:24,pages:1,counts:{total:list.length,movies:list.length},providers:['PLEX','TRAKT'],months:[]};
@@ -52,6 +54,10 @@ async function fixture(t,theme,width) {
       if(path==='/api/state/wall') json={items:list};
       if(path==='/api/profile/title') json={item:items[0],title:items[0].title};
       if(path==='/api/profile/preferences') json={preferences:{}};
+      if (count && ['/api/profile/collection','/api/profile/history','/api/profile/ratings','/api/profile/watchlist','/api/playback_progress/items'].includes(path)) {
+        const page = Number(url.searchParams.get('page') || 1), size = Number(url.searchParams.get('page_size') || 48);
+        Object.assign(json,{items:list.slice((page-1)*size,page*size),page,page_size:size,pages:Math.ceil(list.length/size)});
+      }
       return route.fulfill({json});
     }
     return route.fulfill({contentType:'text/html',body:html});
@@ -68,12 +74,55 @@ async function snapshot(page,name) {
   await page.locator('.cw-profile-panel.active').screenshot({path:`${process.env.CW_PROFILE_SCREENSHOTS}/${name}.png`});
 }
 
+for (const width of [390,1440]) test(`Account menu opens profile Settings and preserves media tabs at ${width}px`, async t => {
+  const {page} = await fixture(t,'flat-dark',width);
+  await page.locator('#cw-nav-profile-link').click();
+  await page.locator('[data-cw-profile-menu-action="account"]').click();
+  await page.locator('#profile-panel-account.active').waitFor();
+  assert.equal(new URL(page.url()).hash, '#account');
+  await page.locator('#cw-nav-profile-link').click();
+  assert.equal(await page.locator('[data-cw-profile-menu-action="account"]').getAttribute('aria-current'), 'page');
+  await page.locator('[data-cw-profile-menu-action="ratings"]').click();
+  await page.locator('#profile-panel-ratings.active').waitFor();
+  if (width <= 760) await page.locator('.cw-profile-mobile-view select').selectOption('history');
+  else await page.locator('[data-profile-tab="history"]').click();
+  await page.locator('#cw-nav-profile-link').click();
+  assert.equal(await page.locator('[data-cw-profile-menu-action="history"]').getAttribute('aria-current'), 'page');
+  await page.locator('[data-cw-profile-menu-action="profile"]').click();
+  await page.locator('#profile-panel-overview.active').waitFor();
+  assert.equal(new URL(page.url()).hash, '');
+});
+
+test('My Media Hub shortcut returns to Overview when the profile tab changed without a hash change', async t => {
+  const {page} = await fixture(t,'flat-dark',390);
+  await page.evaluate(()=>{
+    localStorage.setItem('cw.mobile.shortcuts.v1',JSON.stringify(['profile/overview','settings/sync']));
+    history.replaceState(null,'','/profile#overview');
+  });
+  await page.reload();
+  const hub = page.locator('#cw-mobile-bottom-nav [data-mobile-route="profile/overview"]');
+  await page.locator('#profile-panel-overview.active').waitFor();
+  assert.equal(await hub.getAttribute('aria-current'), 'page');
+  await page.locator('.cw-profile-mobile-view select').selectOption('history');
+  await page.locator('#profile-panel-history.active').waitFor();
+  assert.equal(new URL(page.url()).hash, '#overview');
+  await page.waitForFunction(()=>!document.querySelector('#cw-mobile-bottom-nav [data-mobile-route="profile/overview"]').hasAttribute('aria-current'));
+  await hub.focus();
+  await page.keyboard.press('Enter');
+  await page.locator('#profile-panel-overview.active').waitFor();
+  await page.waitForFunction(()=>document.querySelector('#cw-mobile-bottom-nav [data-mobile-route="profile/overview"]').getAttribute('aria-current')==='page');
+  await page.reload();
+  await page.locator('#profile-panel-overview.active').waitFor();
+  assert.equal(await hub.getAttribute('aria-current'), 'page');
+});
+
 for(const theme of ['original','flat-dark','flat-light']) {
-  for(const width of [320,390,1440]) {
-    test(`${theme}: profile covers and controls at ${width}px`,async t=>{
+  for(const [width, height] of [[320,740],[390,844],[740,360],[844,390],[932,430],[768,1024],[1024,768],[1194,834],[1366,1024],[1440,900]]) {
+    test(`${theme}: profile covers and controls at ${width}x${height}`,async t=>{
       const {page,state}=await fixture(t,theme,width);
+      await page.setViewportSize({width, height});
       for(const section of ['overview','collection','history','ratings','watchlist','playback','account']) {
-        if(width<800) await page.locator('.cw-profile-mobile-view select').selectOption(section);
+        if(width<=760) await page.locator('.cw-profile-mobile-view select').selectOption(section);
         else await page.locator(`[data-profile-tab="${section}"]`).click();
         const panel=page.locator(`#profile-panel-${section}`);
         await panel.waitFor();
@@ -85,7 +134,7 @@ for(const theme of ['original','flat-dark','flat-light']) {
         }
         await snapshot(page,`${theme}-${width}-${section}`);
         assert.equal(await page.evaluate(w=>document.documentElement.scrollWidth>w+1,width),false,section);
-        if(width<800&&section==='overview') {
+        if(width<=760&&section==='overview') {
           assert.ok((await panel.locator('.cw-cw-card').first().boundingBox()).width>=180);
           const cover=await panel.locator('.cw-cw-art').first().boundingBox();
           const badge=await panel.locator('.cw-cw-providers .cw-profile-provider-badge').first().boundingBox();
@@ -94,7 +143,7 @@ for(const theme of ['original','flat-dark','flat-light']) {
           const status=await panel.locator('.cw-profile-watchlist-status').first().boundingBox();
           assert.ok(title.y+title.height<=status.y);
         }
-        if(width<800&&['collection','history','ratings','watchlist','playback'].includes(section)) {
+        if(width<=760&&['collection','history','ratings','watchlist','playback'].includes(section)) {
           const select=panel.locator('.cw-tl-select').first();
           assert.ok((await select.boundingBox()).width>=44);
           assert.equal(await select.evaluate(el=>getComputedStyle(el,'::before').width),'22px');
@@ -111,7 +160,7 @@ for(const theme of ['original','flat-dark','flat-light']) {
             await panel.locator('[data-playback-action="update_progress"]').first().tap();
             await page.locator('#profile-playback-edit[open]').waitFor();
             const dialog=await page.locator('#profile-playback-edit').boundingBox();
-            assert.ok(dialog.x>=0&&dialog.x+dialog.width<=width,JSON.stringify(dialog));
+            assert.ok(dialog.x>=0&&dialog.x+dialog.width<=width&&dialog.y>=0&&dialog.y+dialog.height<=height+1,JSON.stringify(dialog));
             if(process.env.CW_PROFILE_SCREENSHOTS) await page.screenshot({path:`${process.env.CW_PROFILE_SCREENSHOTS}/${theme}-${width}-dialog.png`});
             await page.locator('#profile-playback-edit [data-playback-dialog-cancel]').tap();
           }
@@ -124,7 +173,7 @@ for(const theme of ['original','flat-dark','flat-light']) {
         }
       }
       state.empty=true;
-      if(width<800) await page.locator('.cw-profile-mobile-view select').selectOption('watchlist');
+      if(width<=760) await page.locator('.cw-profile-mobile-view select').selectOption('watchlist');
       else await page.locator('[data-profile-tab="watchlist"]').click();
       await page.locator('#profile-watchlist-refresh').click();
       await page.locator('#profile-watchlist-list .cw-profile-empty').waitFor();
@@ -132,3 +181,35 @@ for(const theme of ['original','flat-dark','flat-light']) {
     });
   }
 }
+
+
+test("Media Hub uses compact mobile previews and independent paged lists", async t => {
+  const {page,state} = await fixture(t,'flat-dark',390,{count:55});
+  await page.waitForFunction(()=>document.querySelectorAll('#profile-progress .cw-cw-card').length===3);
+  assert.equal(await page.locator('#profile-progress').evaluate(el=>el.scrollWidth>el.clientWidth),true);
+  const sections = [['history','/api/profile/history',48],['ratings','/api/profile/ratings',48],['watchlist','/api/profile/watchlist',48],['collection','/api/profile/collection',24],['playback','/api/playback_progress/items',48]];
+  for (const [section,path,desktopSize] of sections) {
+    const requested = page.waitForResponse(response=>new URL(response.url()).pathname===path && new URL(response.url()).searchParams.get('page_size')==='20');
+    await page.locator('.cw-profile-mobile-view select').selectOption(section);
+    await requested;
+    const selector = page.locator(`#profile-${section}-page-size`);
+    assert.equal(await selector.inputValue(),'20');
+    const changed = page.waitForResponse(response=>new URL(response.url()).pathname===path && new URL(response.url()).searchParams.get('page_size')==='10');
+    await selector.selectOption('10',{force:true});
+    await changed;
+    const saved = await page.evaluate(key=>JSON.parse(localStorage.getItem(key)),`cw.profile.${section}`);
+    assert.equal(saved.mobilePageSize,10);
+    assert.equal(saved.pageSize,desktopSize);
+  }
+  const unrelatedReads = state.queries.filter(query=>sections.slice(0,4).some(([,path])=>path===query.path)).length;
+  const desktop = page.waitForResponse(response=>new URL(response.url()).pathname==='/api/playback_progress/items' && new URL(response.url()).searchParams.get('page_size')==='48');
+  await page.setViewportSize({width:1440,height:900});
+  await desktop;
+  assert.equal(await page.locator('#profile-playback-page-size').inputValue(),'48');
+  assert.equal(state.queries.filter(query=>sections.slice(0,4).some(([,path])=>path===query.path)).length,unrelatedReads);
+  await page.setViewportSize({width:390,height:844});
+  await page.reload();
+  await page.locator('.cw-profile-mobile-view select').selectOption('playback');
+  await page.locator('#profile-panel-playback.active').waitFor();
+  assert.equal(await page.locator('#profile-playback-page-size').inputValue(),'10');
+});

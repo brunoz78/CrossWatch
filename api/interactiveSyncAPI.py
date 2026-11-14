@@ -39,6 +39,7 @@ class Refresh(Revision):
 class Apply(Revision):
     model_config = {"extra": "forbid"}
     selection_version: int = Field(ge=0)
+    confirm_dry_run: bool = Field(default=False, strict=True)
 
 
 class Selection(Revision):
@@ -82,14 +83,38 @@ def pair_for(cfg, request, pair_id):
     return pair
 
 
+def public(session, cfg=None):
+    cfg = load_config() if cfg is None else cfg
+    return {**session.public(), "dry_run": coerce_bool((cfg.get("sync") or {}).get("dry_run", False))}
+
+
 def get_session(sid, request, cfg):
     svc.prune()
     session = svc.SESSIONS.get(sid)
     if session is None or session.owner != owner(request):
         raise HTTPException(404, "Review expired or not found. Run the pair again.")
-    pair_for(cfg, request, session.pair_id)
+    session_pair(session, cfg, request)
     session.touched = time.monotonic()
     return session
+
+
+def session_pair(session, cfg, request):
+    if session.import_pair is None:
+        return pair_for(cfg, request, session.pair_id)
+    from cw_platform.access_policy import user_can_access_instance
+    from cw_platform.provider_instances import list_instance_ids
+
+    pair = session.import_pair
+    for side in ("source", "target"):
+        provider, instance = pair[side], pair[f"{side}_instance"]
+        if side == "target" and session.new_tracker is not None:
+            user = request_user(request)
+            if user and not user.get("is_admin"):
+                raise HTTPException(403, "Administrator access required to create a Tracker")
+            continue
+        if instance not in list_instance_ids(cfg, provider) or not user_can_access_instance(cfg, request_user(request), provider, instance):
+            raise HTTPException(403, "Import source or tracker is no longer available to this user")
+    return pair
 
 
 def check_revision(session, revision):
@@ -137,7 +162,7 @@ def reviews(request: Request, user_profile: str = Query(default="", max_length=6
             if session.owner != user_id:
                 continue
             try:
-                pair = pair_for(cfg, request, session.pair_id)
+                pair = session_pair(session, cfg, request)
             except HTTPException:
                 continue
             if profile:
@@ -167,13 +192,14 @@ def start(payload: Start, request: Request):
         session.pair = {k: pair.get(k) for k in ("source", "target", "source_instance", "target_instance", "mode", "name")}
         launch(session, svc.refresh, cfg, {})
         svc.SESSIONS[session.id] = session
-        return session.public()
+        return public(session, cfg)
 
 
 @router.get("/{sid}")
 def get(sid: str, request: Request):
     with svc.LOCK:
-        return get_session(sid, request, load_config()).public()
+        cfg = load_config()
+        return public(get_session(sid, request, cfg), cfg)
 
 
 @router.post("/{sid}/refresh")
@@ -192,7 +218,7 @@ def refresh(sid: str, payload: Refresh, request: Request):
                 raise HTTPException(400, "Invalid conflict choice")
             choices[cid] = winner
         launch(session, svc.recalculate if payload.choices or not payload.reread else svc.refresh, cfg, choices)
-        return session.public()
+        return public(session, cfg)
 
 
 @router.get("/{sid}/report-issues")
@@ -259,7 +285,7 @@ def selection(sid: str, payload: Selection, request: Request):
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
         session.selection_version += 1
-        return session.public()
+        return public(session)
 
 
 @router.post("/{sid}/apply")
@@ -271,16 +297,19 @@ def apply(sid: str, payload: Apply, request: Request):
         check_selection(session, payload.selection_version)
         if session.status != "review":
             raise HTTPException(409, "Build a complete plan before applying")
-        if coerce_bool((cfg.get("sync") or {}).get("dry_run", False)):
-            raise HTTPException(409, "Disable global dry run before applying changes")
+        dry_run = coerce_bool((cfg.get("sync") or {}).get("dry_run", False))
+        if dry_run and not payload.confirm_dry_run:
+            raise HTTPException(409, "Global dry run is on. Confirm applying these selected changes once.")
         selected = session.store.selected_ids() if session.store else set()
         if not selected:
             raise HTTPException(400, "Select valid changes from this review")
-        launch(session, svc.apply, cfg, selected, applying=True)
-        return session.public()
+        launch(session, svc.apply, cfg, selected, dry_run and payload.confirm_dry_run, applying=True)
+        return public(session, cfg)
 
 
 def mapping_row(session, row_id):
+    if session.import_pair is not None:
+        raise HTTPException(400, "Import review does not save sync mappings. Fix imported matches in Tracker.")
     row = session.plan.rows.get(row_id)
     if not row or row["operation"] not in ("add", "update") or row["feature"] == "playlists" or row["item"].get("_cw_status_mapping"):
         raise HTTPException(400, "This change cannot be remapped")
@@ -366,7 +395,7 @@ def save_mappings(session, cfg, request, changes, scope="pair"):
                                 selected=edit.selected))
     launch(session, svc.refresh_mappings, cfg, dict(session.plan.choices), corrections,
            prepare=lambda: _save_policy_manual_batch(prepared, mappings=mappings, pair_id=session.pair_id if scope == "pair" else ""))
-    return session.public()
+    return public(session, cfg)
 
 
 @router.post("/{sid}/mapping")

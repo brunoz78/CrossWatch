@@ -13,7 +13,7 @@ from cw_platform.orchestrator import _status_mapping as runtime
 from cw_platform.orchestrator._interactive import InteractivePlan
 from cw_platform.status_mapping import Capabilities, Observation, ReadState, Status
 from cw_platform.status_mapping_store import StatusStore
-from providers.sync._status_mapping import NativeStatusAdapter, Record
+from providers.sync._status_mapping import NativeStatusAdapter, Record, skipped
 
 
 def row(status, ident="1", *, note="unchanged"):
@@ -52,6 +52,90 @@ def sync_case(monkeypatch, tmp_path, config_base):
 
 def run(case, pairs=None):
     return runtime.run_status_mappings(case.ctx, pairs or [case.pair], {}, {}, store=case.store)
+
+
+@pytest.mark.parametrize("native,counted", [("untracked", False), ("caught_up", False), ("waiting", False), ("", True)])
+def test_unmatched_titles_without_a_status_are_not_reported(sync_case, native, counted):
+    case = sync_case
+    case.rows["a"]["9"] = Record("9", "shows", {"type": "show", "ids": {"tmdb": "9"}, "title": "Only A"},
+                                 Observation(ReadState.UNKNOWN, native_status=native), {})
+    case.rows["a"]["8"] = Record("8", "shows", {"type": "show", "ids": {"tmdb": "8"}, "title": "Absent A"}, Observation(ReadState.ABSENT), {})
+    run(case)
+    read = next(kwargs for name, kwargs in case.events if name == "status_mapping:read")
+    reviews = [kwargs["reason"] for name, kwargs in case.events if name == "status_mapping:review" and "no unique matching" in kwargs["reason"]]
+    assert read["unmatched"] == int(counted)
+    assert len(reviews) == int(counted)
+
+
+def test_status_writes_share_one_preflight_and_one_readback_per_side(sync_case, monkeypatch):
+    case = sync_case
+    for ident in ("2", "3", "4", "5"):
+        case.rows["a"][ident] = row(Status.DROPPED, ident)
+        case.rows["b"][ident] = row(Status.WATCHING, ident)
+    reads = {"a": 0, "b": 0}
+    original = case.adapter.read
+
+    def counted(self):
+        reads[self.cfg["endpoint"]] += 1
+        return original(self)
+
+    monkeypatch.setattr(case.adapter, "read", counted)
+    assert run(case)["updated"] == 5
+    assert len(case.writes) == 5
+    assert reads == {"a": 3, "b": 3}
+
+
+def test_chained_pair_does_not_forward_a_status_changed_earlier_in_the_batch(sync_case):
+    case = sync_case
+    case.rows["c"] = {"1": row(Status.ON_HOLD)}
+    second = deepcopy(case.pair)
+    second.update(id="chain", source="B", target="C")
+    second["status_mapping"]["a"] = {"provider": "b", "instance": "default"}
+    second["status_mapping"]["b"] = {"provider": "c", "instance": "default"}
+    result = run(case, [case.pair, second])
+    assert case.writes == [("b", "1", Status.DROPPED)]
+    assert result["updated"] == 1 and result["unresolved"] >= 1
+    assert case.rows["c"]["1"].observation.status == Status.ON_HOLD
+    assert not any(event == "status_mapping:updated" and value["pair_id"] == "chain" for event, value in case.events)
+
+
+def test_later_write_to_an_earlier_source_waits_for_the_next_run(sync_case):
+    case = sync_case
+    case.rows["c"] = {"1": row(Status.ON_HOLD)}
+    second = deepcopy(case.pair)
+    second.update(id="reverse", source="C", target="A")
+    second["status_mapping"]["a"] = {"provider": "c", "instance": "default"}
+    second["status_mapping"]["b"] = {"provider": "a", "instance": "default"}
+    result = run(case, [case.pair, second])
+    assert case.writes == [("b", "1", Status.DROPPED)]
+    assert result["updated"] == 1 and result["errors"] == 0
+    assert case.rows["a"]["1"].observation.status == Status.DROPPED
+    item = runtime.ItemScope(runtime.pair_scope(case.pair), "shows", "1", "1")
+    assert not case.store.get(item).get("pending")
+    result = run(case, [case.pair, second])
+    assert case.writes == [("b", "1", Status.DROPPED), ("a", "1", Status.ON_HOLD)]
+    assert result["updated"] == 1
+
+
+def test_failed_preflight_read_is_not_repeated_per_title(sync_case, monkeypatch):
+    case = sync_case
+    for ident in ("2", "3"):
+        case.rows["a"][ident] = row(Status.DROPPED, ident)
+        case.rows["b"][ident] = row(Status.WATCHING, ident)
+    reads = {"a": 0, "b": 0}
+    original = case.adapter.read
+
+    def failing(self):
+        endpoint = self.cfg["endpoint"]
+        reads[endpoint] += 1
+        if reads[endpoint] > 1:
+            raise RuntimeError("provider unavailable")
+        return original(self)
+
+    monkeypatch.setattr(case.adapter, "read", failing)
+    assert run(case)["errors"] == 3
+    assert case.writes == []
+    assert reads == {"a": 2, "b": 1}
 
 
 def test_one_way_write_persists_and_is_idempotent(sync_case):
@@ -806,6 +890,25 @@ def test_failed_read_never_writes_or_advances_baseline(sync_case, monkeypatch):
     assert not sync_case.writes and not sync_case.store.path.exists()
 
 
+@pytest.mark.parametrize("error,shown", [
+    (RuntimeError("scrob_status_ambiguous_watchlist"), "scrob_status_ambiguous_watchlist"),
+    (RuntimeError("GET https://api.example/lists?apikey=secret failed"), "RuntimeError"),
+    (RuntimeError("0123456789abcdef0123456789abcdef"), "RuntimeError"),
+    (RuntimeError("secret"), "RuntimeError"),
+    (RuntimeError(" scrob_status_ambiguous_watchlist"), "RuntimeError"),
+    (RuntimeError("scrob_status_0123456789abcdef0123456789abcdef"), "RuntimeError"),
+    (RuntimeError("scrob_status_write_http_401"), "scrob_status_write_http_401"),
+])
+def test_failed_read_reports_a_safe_reason(sync_case, monkeypatch, error, shown):
+    def failed(self):
+        raise error
+    monkeypatch.setattr(sync_case.adapter, "read", failed)
+    assert run(sync_case)["errors"] == 1
+    reasons = [value["reason"] for event, value in sync_case.events if event == "status_mapping:review"]
+    assert reasons == [f"Status read or planning failed ({shown}). Refresh before retrying."]
+    assert "secret" not in str(sync_case.events)
+
+
 def test_destination_changed_since_preview_blocks_write(sync_case, monkeypatch):
     case = sync_case
     original = case.adapter.read
@@ -921,3 +1024,158 @@ def test_real_crosswatch_instances_sync_new_notes_without_touching_history(tmp_p
     assert right.note("movie:tmdb:1").get("notes") != "Private source note"
     assert not right.has_state("history") and not right.has_state("watchlist")
     assert runtime.run_status_mappings(ctx, [pair], cfg, {}, store=store)["updated"] == 0
+
+
+def _reviews(case):
+    return [kwargs["reason"] for name, kwargs in case.events if name == "status_mapping:review"]
+
+
+def test_rewatching_destination_is_reported_with_its_provider(sync_case):
+    case = sync_case
+    target = case.rows["b"]["1"]
+    case.rows["b"]["1"] = replace(target, observation=replace(target.observation, rewatching=True))
+    result = run(case)
+    assert case.writes == [] and result["updated"] == 0
+    assert _reviews(case) == ["Skipped, being rewatched on B, status left unchanged"]
+
+
+def test_rewatching_source_still_writes_to_the_crosswatch_tracker(monkeypatch, tmp_path, config_base):
+    from cw_platform.tracker_store import TrackerStore
+    from providers.sync._status_mapping import adapter_class
+    source = row(Status.DROPPED)
+    source = replace(source, item={"type": "show", "ids": {"tmdb": "1"}, "title": "Rewatched show"},
+                     observation=replace(source.observation, rewatching=True))
+
+    class Source(NativeStatusAdapter):
+        capabilities = {"shows": Capabilities(frozenset(Status), frozenset())}
+
+        def read(self):
+            return {"1": deepcopy(source)}
+
+    monkeypatch.setattr(runtime, "adapter_class", lambda name: Source if name == "source" else adapter_class(name))
+    target = TrackerStore(tmp_path / "tracker")
+    cfg = {"crosswatch": {"root_dir": str(tmp_path / "tracker")}}
+    pair = {"id": "rewatch", "source": "SOURCE", "target": "CROSSWATCH", "mode": "one-way",
+            "features": {"history": {"enable": True, "use_source_status": True}},
+            "status_mapping": {"version": 1, "a": {"provider": "source", "instance": "default"},
+                               "b": {"provider": "crosswatch", "instance": "default"},
+                               "directions": {"a_to_b": {"shows": {"dropped": {"include": True, "target": "dropped"}}}}}}
+    events = []
+    ctx = SimpleNamespace(dry_run=False, interactive=None, emit=lambda name, **kwargs: events.append((name, kwargs)))
+    result = runtime.run_status_mappings(ctx, [pair], cfg, {}, store=StatusStore(tmp_path / "state.sqlite3"))
+    assert result["updated"] == 1
+    assert target.note("show:tmdb:1")["status"] == "dropped"
+    assert not any("rewatch" in str(kwargs.get("reason")) for name, kwargs in events)
+
+
+def test_a_skipped_title_is_reported_and_the_rest_still_syncs(sync_case):
+    case = sync_case
+    case.rows["a"]["2"] = row(Status.DROPPED, "2")
+    case.rows["b"]["2"] = skipped("2", "shows", {"type": "show", "ids": {"tmdb": "2"}, "title": "Title 2"}, "b_status_duplicate_entry")
+    case.rows["a"]["3"] = skipped("3", "shows", {"type": "show", "ids": {"tmdb": "3"}, "title": "Only A"}, "a_status_invalid_progress")
+    result = run(case)
+    assert case.writes == [("b", "1", Status.DROPPED)]
+    assert sorted(_reviews(case)) == ["Skipped (a_status_invalid_progress)", "Skipped (b_status_duplicate_entry)"]
+    assert result["errors"] == 0 and result["updated"] == 1
+    read = next(kwargs for name, kwargs in case.events if name == "status_mapping:read")
+    assert read["unmatched"] == 0
+
+
+@pytest.mark.parametrize("unidentified", [False, True])
+def test_rows_without_an_id_are_reported_and_stop_missing_record_creation(sync_case, monkeypatch, unidentified):
+    case = sync_case
+    case.rows["a"]["3"] = row(Status.DROPPED, "3")
+    created = []
+    original = case.adapter.read
+
+    def read(self):
+        if unidentified and self.cfg["endpoint"] == "b":
+            self.skip_unidentified("b_status_missing_identity")
+        return original(self)
+
+    monkeypatch.setattr(case.adapter, "read", read)
+    monkeypatch.setattr(case.adapter, "creates_missing", True)
+    monkeypatch.setattr(case.adapter, "missing_record", lambda self, source, snapshot: created.append(source.native_id))
+    result = run(case)
+    assert result["errors"] == 0 and case.writes == [("b", "1", Status.DROPPED)]
+    notice = "1 B status entries without a usable ID were skipped (b_status_missing_identity)."
+    assert (notice in _reviews(case)) is unidentified
+    assert created == ([] if unidentified else ["3"])
+
+
+@pytest.mark.parametrize("failures,errors", [(1, 0), (2, 1)])
+def test_a_changed_snapshot_is_read_again_once(sync_case, monkeypatch, failures, errors):
+    case = sync_case
+    left = {"a": failures}
+    original = case.adapter.read
+
+    def read(self):
+        endpoint = self.cfg["endpoint"]
+        if left.get(endpoint):
+            left[endpoint] -= 1
+            raise RuntimeError(f"{endpoint}_status_snapshot_changed")
+        return original(self)
+
+    monkeypatch.setattr(case.adapter, "read", read)
+    result = run(case)
+    assert result["errors"] == errors
+    assert case.writes == ([] if errors else [("b", "1", Status.DROPPED)])
+
+
+def test_a_skipped_destination_never_reaches_adapter_blockers(sync_case, monkeypatch):
+    case = sync_case
+    case.rows["b"] = {"0": skipped("0", "shows", {"type": "show", "ids": {"tmdb": "0"}, "title": "Title 0"}, "b_status_invalid_show_state"),
+                      **{key: replace(value, raw={"entry": {}}) for key, value in case.rows["b"].items()}}
+    case.rows["a"] = {"0": row(Status.DROPPED, "0"), **case.rows["a"]}
+    monkeypatch.setattr(case.adapter, "blockers", lambda self, record, desired: record.raw["entry"] and ())
+    result = run(case)
+    assert case.writes == [("b", "1", Status.DROPPED)]
+    assert _reviews(case) == ["Skipped (b_status_invalid_show_state)"]
+    assert result["errors"] == 0
+
+
+@pytest.mark.parametrize("unidentified", [False, True])
+def test_pre_write_rows_without_an_id_stop_missing_record_writes(sync_case, monkeypatch, unidentified):
+    case = sync_case
+    case.rows["b"] = {}
+    reads = {"b": 0}
+    original = case.adapter.read
+
+    def read(self):
+        if self.cfg["endpoint"] == "b":
+            reads["b"] += 1
+            if unidentified and reads["b"] > 1:
+                self.skip_unidentified("b_status_missing_identity")
+        return original(self)
+
+    def missing(self, source, snapshot):
+        return Record(source.native_id, source.media, source.item, Observation(ReadState.ABSENT, protected_token="none", watchlisted=False, rewatching=False), {})
+
+    monkeypatch.setattr(case.adapter, "read", read)
+    monkeypatch.setattr(case.adapter, "creates_missing", True)
+    monkeypatch.setattr(case.adapter, "missing_record", missing)
+    run(case)
+    assert case.writes == ([] if unidentified else [("b", "1", Status.DROPPED)])
+
+
+def test_a_title_skipped_during_pending_recovery_never_reaches_blockers(sync_case, monkeypatch):
+    case = sync_case
+    original_write = case.adapter.write
+    monkeypatch.setattr(case.adapter, "write", lambda self, record, desired: (_ for _ in ()).throw(RuntimeError("timeout")))
+    assert run(case)["errors"] == 1
+    monkeypatch.setattr(case.adapter, "write", original_write)
+    original_record = runtime._FreshReads.record
+
+    def record(self, endpoint, reference):
+        current = original_record(self, endpoint, reference)
+        if endpoint.provider == "b" and current is not None:
+            return skipped(current.native_id, current.media, current.item, "b_status_invalid_show_state")
+        return current
+
+    monkeypatch.setattr(runtime._FreshReads, "record", record)
+    monkeypatch.setattr(case.adapter, "blockers", lambda self, rec, desired: rec.raw["entry"] and ())
+    events_before = len(case.events)
+    result = run(case)
+    reviews = [kwargs["reason"] for name, kwargs in case.events[events_before:] if name == "status_mapping:review"]
+    assert reviews == ["Skipped (b_status_invalid_show_state)"]
+    assert result["errors"] == 0 and case.writes == []

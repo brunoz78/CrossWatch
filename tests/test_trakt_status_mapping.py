@@ -3,6 +3,8 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import hashlib
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -27,8 +29,20 @@ def response(value, headers=None, status=200):
     return SimpleNamespace(status_code=status, json=lambda: deepcopy(value), headers=headers or {}, raise_for_status=check)
 
 
+def activities(state):
+    stamp = f"{state.activity}:{hashlib.sha256(json.dumps(state.rows, sort_keys=True, default=str).encode()).hexdigest()}"
+    sections = {}
+    for _, _, fields in _status.LISTS.values():
+        for section, field in fields:
+            sections.setdefault(section, {})[field] = stamp
+    sections.setdefault("shows", {})["hidden_at"] = stamp
+    sections.setdefault("seasons", {})["hidden_at"] = stamp
+    return {"all": stamp, **sections}
+
+
 @pytest.fixture
 def server(monkeypatch):
+    _status._CACHE.clear()
     state = SimpleNamespace(rows={
         "/sync/history": [{"id": 1, "watched_at": "old", "show": show(1), "episode": {"ids": {"trakt": 11}, "season": 1, "number": 1}},
                           {"id": 2, "watched_at": "old", "show": show(2, "ended"), "episode": {"ids": {"trakt": 21}, "season": 1, "number": 1}},
@@ -48,7 +62,7 @@ def server(monkeypatch):
             if result is not None:
                 return result
         if path == "/sync/last_activities":
-            return response({"all": state.activity})
+            return response(activities(state))
         if path.startswith("/shows/"):
             assert kwargs["params"] == {"hidden": "true", "specials": "false"}
             return response(state.progress[int(path.split("/")[2])])
@@ -69,6 +83,63 @@ def server(monkeypatch):
     monkeypatch.setattr(_status.StatusAdapter, "adapter", lambda self: SimpleNamespace(client=state.client))
     state.adapter = _status.StatusAdapter({})
     return state
+
+
+def fixed_activities(server, base=None, **moved):
+    current = deepcopy(base) if base is not None else activities(server)
+    for name, stamp in moved.items():
+        section, field = name.split("__")
+        current[section][field] = stamp
+    server.hook = lambda path, kwargs: response(current) if path == "/sync/last_activities" else None
+    return current
+
+
+def test_unchanged_activity_reads_nothing_but_last_activities(server):
+    first = server.adapter.read()
+    server.calls.clear()
+    assert server.adapter.read() == first
+    assert [path for path, _ in server.calls] == ["/sync/last_activities"]
+
+
+def test_dropped_change_rereads_only_the_dropped_list(server):
+    base = fixed_activities(server)
+    server.adapter.read()
+    server.rows["/users/hidden/dropped"] = [{"show": show(1), "hidden_at": "new"}]
+    fixed_activities(server, base, shows__dropped_at="moved")
+    server.calls.clear()
+    assert server.adapter.read()["show:1"].observation.status == Status.DROPPED
+    assert {path for path, _ in server.calls} == {"/sync/last_activities", "/users/hidden/dropped"}
+
+
+def test_hidden_season_change_refreshes_show_progress(server):
+    base = fixed_activities(server)
+    first = server.adapter.read()["show:1"].observation.protected_token
+    server.progress[1]["hidden_seasons"] = [{"number": 1}]
+    fixed_activities(server, base, seasons__hidden_at="moved")
+    server.calls.clear()
+    assert server.adapter.read()["show:1"].observation.protected_token != first
+    assert "/shows/1/progress/watched" in {path for path, _ in server.calls}
+
+
+def test_airing_progress_refreshes_daily_and_ended_shows_weekly(server, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(_status.time, "time", lambda: now[0])
+    fixed_activities(server)
+    server.adapter.read()
+    progress_calls = lambda: sorted(path for path, _ in server.calls if path.startswith("/shows/"))
+    now[0] += _status.MAX_AGE - 60
+    server.calls.clear()
+    server.adapter.read()
+    assert progress_calls() == []
+    now[0] += 120
+    server.progress[1]["aired"] = 11
+    server.calls.clear()
+    server.adapter.read()
+    assert progress_calls() == ["/shows/1/progress/watched", "/shows/3/progress/watched"]
+    now[0] += _status.ENDED_PROGRESS_MAX_AGE
+    server.calls.clear()
+    server.adapter.read()
+    assert "/shows/2/progress/watched" in progress_calls()
 
 
 def test_complete_pagination_and_status_precedence(server):
@@ -110,12 +181,18 @@ def test_stale_early_counts_do_not_hide_later_history(server):
     assert any(path == "/sync/history" and kw["params"]["page"] == 4 for path, kw in server.calls)
 
 
-@pytest.mark.parametrize("case", ["reset", "repeat", "playback", "planned", "completed", "zero_history"])
+def test_repeated_plays_do_not_block_a_status_write(server):
+    server.rows["/sync/history"].append({**server.rows["/sync/history"][0], "id": 4})
+    row = server.adapter.read()["show:1"]
+    assert row.observation.rewatching is False
+    server.adapter.write(row, Status.DROPPED)
+    assert server.adapter.read()["show:1"].observation.status == Status.DROPPED
+
+
+@pytest.mark.parametrize("case", ["reset", "playback", "planned", "completed", "zero_history"])
 def test_unsafe_transitions_never_write(server, case):
     if case == "reset":
         server.progress[1]["reset_at"] = "now"
-    elif case == "repeat":
-        server.rows["/sync/history"].append({**server.rows["/sync/history"][0], "id": 4})
     elif case == "playback":
         server.rows["/sync/playback"] = [{"id": 9, "show": show(1), "progress": 50}]
     elif case == "planned":
@@ -133,12 +210,10 @@ def test_unsafe_transitions_never_write(server, case):
     assert not server.writes
 
 
-@pytest.mark.parametrize("case", ["missing_header", "empty_page", "changed_total", "bad_row", "activity", "progress", "duplicate_history"])
+@pytest.mark.parametrize("case", ["missing_header", "empty_page", "changed_total", "bad_row", "activity", "duplicate_history"])
 def test_failed_reads_are_not_complete_snapshots(server, case):
     if case == "duplicate_history":
         server.rows["/sync/history"].append(deepcopy(server.rows["/sync/history"][0]))
-    elif case == "progress":
-        server.progress[1].pop("reset_at")
     else:
         def hook(path, kwargs):
             if path == "/sync/ratings" and case == "activity":
@@ -227,3 +302,16 @@ def test_runtime_verifies_readback_instead_of_success_counters(server, config_ba
         assert run_status_mappings(ctx, [pair], cfg, {}, store=store)["updated"] == 1
         assert tracker.note("show:tmdb:1")["status"] == "watching"
         assert len(server.writes) == 1
+
+
+def _skipped(rows):
+    return {key: row.raw["_cw_skipped"] for key, row in rows.items() if isinstance(row.raw, dict) and row.raw.get("_cw_skipped")}
+
+
+def test_invalid_show_progress_skips_only_that_show(server):
+    server.progress[1].pop("reset_at")
+    rows = server.adapter.read()
+    skipped = _skipped(rows)
+    assert list(skipped.values()) == ["trakt_status_invalid_progress"]
+    assert len(rows) > len(skipped)
+    assert not server.writes

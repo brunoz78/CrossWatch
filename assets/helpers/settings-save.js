@@ -16,6 +16,7 @@ const _cwTouchedIds = [
   "floppy_server", "floppy_verify_ssl",
   "scrob_server", "scrob_username", "scrob_verify_ssl", "scrob_totp",
   "cw_tracker_label", "cw_tracker_retention_days", "cw_tracker_auto_snapshot", "cw_tracker_max_snapshots",
+  "cw_tracker_automatic_status", "cw_tracker_month_review", "cw_tracker_wrapped",
   "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress", "cw_tracker_restore_collection"
 ];
 
@@ -473,6 +474,14 @@ async function _cwValidateScrobSecret(inst, payload) {
 }
 
 async function _cwSaveAppAuth(serverCfg) {
+  const focusField = (id) => {
+    try {
+      const field = _cwEl(id);
+      const details = field?.closest?.("details");
+      if (details) details.open = true;
+      field?.focus?.();
+    } catch {}
+  };
   const MIN_PASSWORD_LENGTH = 8;
   const wantEnabled = true;
   const wantUser = _getVal("app_auth_username");
@@ -511,13 +520,13 @@ async function _cwSaveAppAuth(serverCfg) {
   if (wantsPwd && pass1 !== pass2) {
     _cwSetAuthError("Passwords do not match");
     _cwShowToast("Password mismatch", false);
-    try { _cwEl("app_auth_password2")?.focus?.(); } catch {}
+    focusField("app_auth_password2");
     _cwAbortSave("Password mismatch");
   }
   if (wantsPwd && pass1.length < MIN_PASSWORD_LENGTH) {
     _cwSetAuthError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
     _cwShowToast(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`, false);
-    try { _cwEl("app_auth_password")?.focus?.(); } catch {}
+    focusField("app_auth_password");
     _cwAbortSave("Password too short");
   }
   if (wantEnabled && !wantUser) {
@@ -528,6 +537,7 @@ async function _cwSaveAppAuth(serverCfg) {
   if (wantEnabled && (!status?.configured || status?.reset_required) && !_cwNorm(pass1)) {
     _cwSetAuthError("Password required to save sign-in");
     _cwShowToast("Set a password to save sign-in", false);
+    focusField("app_auth_password");
     _cwAbortSave("Password required");
   }
   if (rememberEnabled && (!rememberDaysValid || !rememberDaysRaw)) {
@@ -729,7 +739,7 @@ async function saveSettings() {
     [["ui_show_watchlist_preview", "show_watchlist_preview"], ["ui_show_playingcard", "show_playingcard"], ["ui_show_recent_activity", "show_recent_activity"], ["ui_show_recent_history_widget", "show_recent_history_widget"], ["ui_show_latest_ratings_widget", "show_latest_ratings_widget"], ["ui_show_recent_scrobble_widget", "show_recent_scrobble_widget"], ["ui_show_recent_progress_widget", "show_recent_progress_widget"], ["ui_show_recent_playlists_widget", "show_recent_playlists_widget"], ["ui_show_quick_add_desktop", "show_quick_add_desktop"], ["ui_show_quick_add_mobile", "show_quick_add_mobile"]].forEach(([id, key]) => {
       const el = _cwEl(id);
       if (!el) return;
-      const next = el.value !== "false";
+      const next = el.checked;
       if (next === prevUi[key]) return;
       ensureObj(cfg, "ui")[key] = next;
       mark();
@@ -780,6 +790,7 @@ async function saveSettings() {
       const trackerLabelEl = _cwEl("cw_tracker_label");
       const trackerFieldIds = [
         "cw_tracker_label", "cw_tracker_retention_days", "cw_tracker_auto_snapshot", "cw_tracker_max_snapshots",
+        "cw_tracker_automatic_status", "cw_tracker_month_review", "cw_tracker_wrapped",
         "cw_tracker_restore_watchlist", "cw_tracker_restore_history", "cw_tracker_restore_ratings", "cw_tracker_restore_progress", "cw_tracker_restore_collection"
       ];
       const trackerTouched = trackerFieldIds.some((id) => _cwTouched(id));
@@ -807,6 +818,9 @@ async function saveSettings() {
         if (_cwTouched("cw_tracker_label")) set("label", _cwNorm(labelEl?.value).slice(0, 12), _cwNorm(prevBlock?.label).slice(0, 12));
         if (_cwTouched("cw_tracker_retention_days")) set("retention_days", intOr("cw_tracker_retention_days", Number(prevBlock?.retention_days), 30), Number.isFinite(prevBlock?.retention_days) ? Number(prevBlock.retention_days) : 30);
         if (_cwTouched("cw_tracker_auto_snapshot")) set("auto_snapshot", _cwTruthy(_cwEl("cw_tracker_auto_snapshot")?.value), prevBlock?.auto_snapshot !== false);
+        for (const key of ["automatic_status", "month_review", "wrapped"]) {
+          if (_cwTouched(`cw_tracker_${key}`)) set(key, !!_cwEl(`cw_tracker_${key}`)?.checked, prevBlock?.[key] !== false);
+        }
         if (_cwTouched("cw_tracker_max_snapshots")) set("max_snapshots", intOr("cw_tracker_max_snapshots", Number(prevBlock?.max_snapshots), 14), Number.isFinite(prevBlock?.max_snapshots) ? Number(prevBlock.max_snapshots) : 14);
         ["watchlist", "history", "ratings", "progress", "collection"].forEach((key) => {
           const el = _cwEl(`cw_tracker_restore_${key}`);

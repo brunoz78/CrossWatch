@@ -14,6 +14,7 @@ function fakeDom() {
       get textContent() { return node._text + node.children.map(child => child.textContent || "").join(""); },
       set textContent(value) { node._text = String(value); node.children = []; },
       appendChild(child) { this.children.push(child); }, append(...children) { this.children.push(...children); },
+      prepend(...children) { this.children.unshift(...children); },
       replaceChildren(...children) { this._text = ""; this.children = [...children]; },
       hasAttribute(name) { return Object.hasOwn(this, name); },
       querySelectorAll(selector) { return this.children.flatMap(child => [
@@ -54,7 +55,7 @@ test("rows the Editor cannot trace get no origin action", () => {
 async function openOrigin(data, overrides = {}) {
   const {document} = fakeDom();
   const source = readFileSync(new URL("../assets/js/editor/origin.js", import.meta.url), "utf8")
-    .replace("export function openItemOrigin", "function openItemOrigin") + "\nthis.openItemOrigin = openItemOrigin;";
+    .replaceAll("export function ", "function ") + "\nthis.openItemOrigin = openItemOrigin;";
   const context = vm.createContext({window:overrides.window || {}, document, structuredClone});
   vm.runInContext(source, context);
   const pop = document.createElement("div");
@@ -222,4 +223,12 @@ test("provider chips use brand logo, colour and the custom profile name", async 
   assert.equal(chips[1].textContent, "PlexLiving room · alice");
   assert.equal(chips[1].style["--cw-origin-tone"], "#e5a000");
   assert.equal(chips[1].children[0].src, "/assets/img/PLEX-log.svg");
+});
+
+
+test("Tracker import sources are distinguished from a proven per-entry origin", async () => {
+  const {pop} = await openOrigin({title:"Heat",mode:"plain",sources:[],pairs:[{}],import_sources:[{provider:"PLEX",instance:"default"}]});
+  assert.match(pop.textContent,/Tracker import sources/);
+  assert.match(pop.textContent,/does not prove which service added this particular entry/);
+  assert.match(pop.textContent,/No matching source record/);
 });

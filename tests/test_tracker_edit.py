@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 import sqlite3
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -67,6 +68,94 @@ def test_edit_and_undo_restore_the_record_and_log_both(base):
     with pytest.raises(TrackerConflict) as nested:
         store.undo(log[0].batch)
     assert nested.value.code == "not_undoable"
+
+
+@pytest.mark.parametrize("status", ["watching", "planned", "completed", "on_hold", "dropped", ""])
+def test_edit_status_preserves_notes_and_undo_restores_both(client, base, status):
+    store = TrackerStore(base)
+    note_key = "movie:tmdb:949"
+    store.save_note(note_key, {"type": "movie", "title": "Heat", "status": "planned", "notes": "Keep this", "tags": ["Favorite"]})
+    before = store.note(note_key)
+    response = client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:949", "changes": {"title": "Heat edited", "status": status}})
+    assert response.status_code == 200, response.text
+    assert store.item("history", "tmdb:949")["title"] == "Heat edited"
+    assert store.note(note_key)["status"] == (status or None)
+    assert store.note(note_key)["notes"] == "Keep this"
+    assert store.note(note_key)["tags"] == ["Favorite"]
+    assert "status" not in store.item("history", "tmdb:949")
+    store.undo(response.json()["batch"])
+    assert store.item("history", "tmdb:949") == MOVIE
+    assert store.note(note_key) == before
+
+
+def test_edit_episode_status_updates_show_and_detail_records(client, base):
+    response = client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:95396#s01e02", "changes": {"status": "on_hold"}})
+    assert response.status_code == 200, response.text
+    store = TrackerStore(base)
+    assert store.note("show:tmdb:95396")["status"] == "on_hold"
+    assert store.item("history", "tmdb:95396#s01e02") == EPISODE
+    detail = client.get("/api/tracker/title", params={"key": "tmdb:95396#s01e02"}).json()
+    assert detail["plays"][0]["status"] == "on_hold"
+    store.undo(response.json()["batch"])
+    assert store.note("show:tmdb:95396") is None
+
+
+def test_edit_status_follows_changed_identity_and_undo(client, base):
+    store = TrackerStore(base)
+    old_key = "movie:tmdb:329865"
+    store.save_note(old_key, {"type": "movie", "title": "Arrival", "status": "planned", "notes": "Keep me"})
+    before = store.note(old_key)
+    response = client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:329865", "changes": {"ids": {"tmdb": "123"}, "status": "completed"}})
+    assert response.status_code == 200, response.text
+    assert store.note(old_key) is None
+    assert store.note("movie:tmdb:123")["notes"] == "Keep me"
+    assert store.note("movie:tmdb:123")["status"] == "completed"
+    store.undo(response.json()["batch"])
+    assert store.note(old_key) == before
+    assert store.note("movie:tmdb:123") is None
+    assert store.item("history", "tmdb:329865") == ARRIVAL
+
+
+@pytest.mark.parametrize("status", ["invalid", None, 1, [], {}])
+def test_edit_invalid_status_does_not_change_record(client, base, status):
+    response = client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:949", "changes": {"title": "Changed", "status": status}})
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_status"
+    assert TrackerStore(base).item("history", "tmdb:949") == MOVIE
+
+
+def test_edit_empty_status_excludes_automation_and_can_undo(client, base):
+    response = client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:949", "changes": {"status": ""}})
+    assert response.status_code == 200, response.text
+    assert response.json()["batch"]
+    store = TrackerStore(base)
+    assert store.status_control("movie:tmdb:949")["manual"] is True
+    assert client.post("/api/tracker/undo", json={"batch": response.json()["batch"]}).status_code == 200
+    assert store.status_control("movie:tmdb:949")["manual"] is False
+
+
+def test_edit_clearing_status_removes_empty_note_and_can_undo(client, base):
+    store = TrackerStore(base)
+    store.save_note("movie:tmdb:949", {"type": "movie", "title": "Heat", "status": "completed"})
+    response = client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:949", "changes": {"status": ""}})
+    assert response.status_code == 200, response.text
+    assert store.note("movie:tmdb:949") is None
+    assert store.item("history", "tmdb:949") == MOVIE
+    store.undo(response.json()["batch"])
+    assert store.note("movie:tmdb:949")["status"] == "completed"
+
+
+def test_edit_status_failure_rolls_back_record_change(client, base, monkeypatch):
+    def fail(*args):
+        raise RuntimeError("note write failed")
+
+    monkeypatch.setattr(TrackerStore, "_note_put", fail)
+    with pytest.raises(RuntimeError, match="note write failed"):
+        client.post("/api/tracker/edit", json={"feature": "history", "key": "tmdb:949", "changes": {"title": "Edited", "status": "completed"}})
+    store = TrackerStore(base)
+    assert store.item("history", "tmdb:949") == MOVIE
+    assert store.note("movie:tmdb:949") is None
+    assert store.change_count() == 0
 
 
 def test_bulk_delete_is_one_change_and_one_undo(base):
@@ -379,6 +468,83 @@ def test_api_replace_takes_the_mapped_identity_and_keeps_the_watch(client, base)
     assert (row["title"], row["year"], row["ids"]) == ("The Matrix", 1999, {"tmdb": "603", "imdb": "tt0133093"})
     assert row["watched_at"] == MOVIE["watched_at"]
     assert client.post("/api/tracker/replace", json={"feature": "history", "key": "tmdb:603", "item": {"title": "x"}}).status_code == 400
+
+def test_api_replace_fills_a_missing_year_from_the_same_match(client, base):
+    TrackerStore(base).write_state("history", {"tmdb:102899": {"type": "movie", "title": "Ant-Man", "ids": {"tmdb": "102899"}, "watched_at": MOVIE["watched_at"]}})
+    mapped = {"type": "movie", "title": "Ant-Man", "year": 2015, "ids": {"tmdb": "102899"}}
+    res = client.post("/api/tracker/replace", json={"feature": "history", "key": "tmdb:102899", "item": mapped})
+    assert res.status_code == 200, res.text
+    assert _items(base, "history")["tmdb:102899"]["year"] == 2015
+    again = client.post("/api/tracker/replace", json={"feature": "history", "key": "tmdb:102899", "item": mapped})
+    assert again.status_code == 400 and again.json()["error"] == "no_changes"
+
+
+@pytest.mark.parametrize("endpoint", ["replace", "edit-title"])
+@pytest.mark.parametrize("original_imdb", ["tt0113277", "tt0133093"])
+def test_tmdb_match_saves_verified_imdb_and_undo_restores_original(client, base, cfg, monkeypatch, endpoint, original_imdb):
+    original = {**MOVIE, "ids": {"imdb": original_imdb}}
+    key = f"imdb:{original_imdb}"
+    store = TrackerStore(base)
+    store.write_state("history", {key: original})
+    cfg["tmdb"] = {"api_key": "test"}
+    calls = []
+
+    def get_response(url, **kwargs):
+        calls.append(url)
+        return SimpleNamespace(data={"id": 949, "imdb_id": "tt0113277"})
+
+    monkeypatch.setattr(trackerAPI, "_tmdb_provider", lambda: SimpleNamespace(get_response=get_response))
+    response = client.post(f"/api/tracker/{endpoint}", json={
+        "feature": "history", "key": key,
+        "item": {"type": "movie", "title": "Heat", "year": 1995, "ids": {"tmdb": "949"}},
+    })
+    assert response.status_code == 200, response.text
+    assert calls == ["https://api.themoviedb.org/3/movie/949/external_ids"]
+    saved = store.read_current("history")["items"]["tmdb:949"]
+    assert saved["ids"] == {"tmdb": "949", "imdb": "tt0113277"}
+    assert saved["watched_at"] == original["watched_at"]
+    assert client.post("/api/tracker/undo", json={"batch": response.json()["batch"]}).status_code == 200
+    assert store.read_current("history")["items"] == {key: original}
+
+
+@pytest.mark.parametrize("endpoint", ["replace", "edit-title"])
+@pytest.mark.parametrize("failure", ["network", "malformed", "wrong_title"])
+def test_failed_match_id_lookup_leaves_tracker_unchanged(client, base, cfg, monkeypatch, endpoint, failure):
+    cfg["tmdb"] = {"api_key": "test"}
+
+    def get_response(*args, **kwargs):
+        if failure == "network":
+            raise OSError("Offline")
+        return SimpleNamespace(data=[] if failure == "malformed" else {"id": 603, "imdb_id": "tt0133093"})
+
+    monkeypatch.setattr(trackerAPI, "_tmdb_provider", lambda: SimpleNamespace(get_response=get_response))
+    response = client.post(f"/api/tracker/{endpoint}", json={
+        "feature": "history", "key": "tmdb:949", "item": {"type": "movie", "ids": {"tmdb": "949"}},
+    })
+    assert response.status_code == 502
+    assert _items(base, "history")["tmdb:949"] == MOVIE
+    assert TrackerStore(base).change_log()[0] == 0
+
+
+@pytest.mark.parametrize("endpoint", ["replace", "edit-title"])
+def test_tmdb_show_match_keeps_external_ids_at_show_level(client, base, cfg, monkeypatch, endpoint):
+    cfg["tmdb"] = {"api_key": "test"}
+    calls = []
+
+    def get_response(url, **kwargs):
+        calls.append(url)
+        return SimpleNamespace(data={"id": 95396, "imdb_id": "tt11280740", "tvdb_id": 371980})
+
+    monkeypatch.setattr(trackerAPI, "_tmdb_provider", lambda: SimpleNamespace(get_response=get_response))
+    response = client.post(f"/api/tracker/{endpoint}", json={
+        "feature": "history", "key": "tmdb:95396#s01e02", "item": EPISODE,
+    })
+    assert response.status_code == 200, response.text
+    assert calls == ["https://api.themoviedb.org/3/tv/95396/external_ids"]
+    saved = _items(base, "history")["tmdb:95396#s01e02"]
+    assert saved["show_ids"] == {"tmdb": "95396", "imdb": "tt11280740", "tvdb": "371980"}
+    assert not saved.get("ids")
+    assert (saved["season"], saved["episode"]) == (1, 2)
 
 
 def test_change_log_filters_by_kind_and_searches_titles(client, base):

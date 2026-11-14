@@ -88,7 +88,16 @@ def test_drop_restore_preserve_snapshot_and_exact_write_payload(server):
                              ("DELETE", "/api/external/dropped/1/tv", {"max_retries": 1})]
 
 
-@pytest.mark.parametrize("case", ["planned", "completed", "repeat", "playback", "missing_metadata", "future", "today", "missing_date", "invalid_coordinates", "caught_up"])
+def test_repeated_plays_do_not_block_a_status_write(server):
+    server.rows["watched"].append({**history(1), "id": "repeat", "watched_at": "later"})
+    server.rows["dropped"] = [{"tmdb_id": 1, "media_type": "tv"}]
+    row = server.adapter.read()["show:1"]
+    assert row.observation.rewatching is False
+    server.adapter.write(row, Status.WATCHING)
+    assert server.writes
+
+
+@pytest.mark.parametrize("case", ["planned", "completed", "playback", "missing_metadata", "future", "today", "missing_date", "invalid_coordinates", "caught_up"])
 def test_unsafe_transitions_are_preserved(server, case):
     if case == "planned":
         server.rows["lists/watch/items"] = [{"tmdb_id": 1, "media_type": "tv"}]
@@ -97,8 +106,6 @@ def test_unsafe_transitions_are_preserved(server, case):
         server.details[1]["seasons"][0]["episode_count"] = 1
         server.details[1]["number_of_episodes"] = 1
         server.details[1]["status"] = "Ended" if case == "completed" else "Returning Series"
-    elif case == "repeat":
-        server.rows["watched"].append({**history(1), "id": "repeat", "watched_at": "later"})
     elif case == "playback":
         server.rows["resume"] = [{"id": "resume", "tmdb_id": 1, "media_type": "tv", "position_ms": 2000}]
     elif case == "missing_metadata":
@@ -114,12 +121,10 @@ def test_unsafe_transitions_are_preserved(server, case):
     assert not server.writes
 
 
-@pytest.mark.parametrize("case", ["missing_paging", "bad_row", "empty_middle", "changed_total", "repeated_page", "wrong_page", "history_duplicate", "aggregate", "snapshot_changed"])
+@pytest.mark.parametrize("case", ["missing_paging", "bad_row", "empty_middle", "changed_total", "repeated_page", "wrong_page", "history_duplicate", "snapshot_changed"])
 def test_failed_reads_do_not_publish_partial_snapshots(server, case):
     if case == "history_duplicate":
         server.rows["watched"].append(deepcopy(server.rows["watched"][0]))
-    elif case == "aggregate":
-        server.rows["watched/shows"][0]["watched_episodes"] = 2
     else:
         def hook(name, page, data):
             if name == "watched":
@@ -266,3 +271,16 @@ def test_shared_runtime_verifies_reads_and_does_not_retry_uncertain_writes(serve
         assert run_status_mappings(ctx, [pair], cfg, {}, store=store)["updated"] == 1
         assert tracker.note("show:tmdb:1")["status"] == "watching"
         assert len(server.writes) == 1
+
+
+def _skipped(rows):
+    return {key: row.raw["_cw_skipped"] for key, row in rows.items() if isinstance(row.raw, dict) and row.raw.get("_cw_skipped")}
+
+
+def test_inconsistent_show_progress_skips_only_that_show(server):
+    server.rows["watched/shows"][0]["watched_episodes"] = 2
+    rows = server.adapter.read()
+    skipped = _skipped(rows)
+    assert list(skipped.values()) == ["publicmetadb_status_inconsistent_progress"]
+    assert len(rows) == 3
+    assert not server.writes

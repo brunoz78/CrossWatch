@@ -3,11 +3,11 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Mapping
 
 from cw_platform.status_mapping import Capabilities, Observation, ReadState, Status
-from providers.sync._status_mapping import NativeStatusAdapter, Record, digest, observation
+from providers.sync._status_mapping import NativeStatusAdapter, Record, digest, observation, skipped
 from ._common import api_patch, item_from_row, paged, watchlist_name
 
 
@@ -46,6 +46,7 @@ def read_rows(adapter, path, **kwargs):
 
 
 class StatusAdapter(NativeStatusAdapter):
+    notice = "Floppy cannot report what changed, so every status sync reads your whole Floppy library. With a large library this can take a while."
     capabilities = {media: Capabilities(frozenset(Status), frozenset({Status.WATCHING, Status.ON_HOLD, Status.DROPPED}))
                     for media in ("movies", "shows")}
     effects = {
@@ -70,28 +71,31 @@ class StatusAdapter(NativeStatusAdapter):
             raise RuntimeError("floppy_status_invalid_lists")
         watchlists = {str(row["id"]) for row in list_rows if row["name"].casefold() == watchlist_name(adapter).casefold()}
         before = self.titles(adapter)
-        groups = defaultdict(list)
+        groups, bad = defaultdict(list), {}
         for row in before:
-            key = identity(row)
+            key = self.identify(row)
             if key:
-                consumption_id(row)
+                if not self.consumption(row):
+                    bad[key] = "floppy_status_missing_consumption"
                 groups[key].append(row)
         children = defaultdict(lambda: defaultdict(list))
         for kind in ("season", "episode"):
             seen = set()
             for row in read_rows(adapter, f"media/{kind}"):
-                key = identity(row)
+                key = self.identify(row)
                 if key:
-                    ident = (str(row.get("item_id")), consumption_id(row))
-                    if ident in seen:
-                        raise RuntimeError("floppy_status_duplicate_child")
+                    ident = (str(row.get("item_id")), self.consumption(row))
+                    if not ident[1] or ident in seen:
+                        bad[key] = "floppy_status_duplicate_child" if ident[1] else "floppy_status_missing_consumption"
+                        continue
                     seen.add(ident)
                     children[key][kind].append(row)
         playback = defaultdict(list)
         for row in read_rows(adapter, "playback/progress", params={"media_type": "movie,episode", "completed": "false"}):
             kind = row.get("media_type")
             if kind not in {"movie", "episode"}:
-                raise RuntimeError("floppy_status_invalid_playback")
+                self.skip_unidentified("floppy_status_invalid_playback")
+                continue
             ids = row.get("ids") or {}
             ident = ids.get("tmdb") or (row.get("media_id") if row.get("source") == "tmdb" else None)
             if ident:
@@ -101,29 +105,33 @@ class StatusAdapter(NativeStatusAdapter):
             row = entries[0]
             item = item_from_row(row)
             if item is None:
-                raise RuntimeError("floppy_status_missing_identity")
+                self.skip_unidentified("floppy_status_missing_identity")
+                continue
             media = "movies" if item["type"] == "movie" else "shows"
+            if key in bad:
+                result[key] = skipped(key, media, item, bad[key])
+                continue
             history = read_rows(adapter, f"media/{key}/history")
-            ids = [consumption_id(entry) for entry in history]
-            if len(set(ids)) != len(ids):
-                raise RuntimeError("floppy_status_duplicate_consumption")
+            ids = [self.consumption(entry) for entry in history]
+            if not all(ids) or len(set(ids)) != len(ids):
+                result[key] = skipped(key, media, item, "floppy_status_duplicate_consumption" if all(ids) else "floppy_status_missing_consumption")
+                continue
             single = len(entries) == len(history) == 1 and ids[0] == consumption_id(row)
             fields = ("status", "progress", "score", "start_date", "end_date", "notes")
             agrees = single and all(field in row and field in history[0] and row[field] == history[0][field] for field in fields)
             lists = row.get("lists")
             if not isinstance(lists, list) or any(not isinstance(entry, Mapping) or not entry.get("list_id") for entry in lists):
-                raise RuntimeError("floppy_status_incomplete_lists")
+                result[key] = skipped(key, media, item, "floppy_status_incomplete_lists")
+                continue
             seasons = children[key]["season"]
-            episodes = children[key]["episode"]
             native = str(row.get("status"))
             protected = {
                 "entry": personal(row, omit_status=True),
                 "history": sorted(digest(personal(entry, omit_status=single)) for entry in history),
-                "children": {kind: sorted(digest(personal(entry)) for entry in entries) for kind, entries in children[key].items()},
+                "children": {kind: sorted(digest(personal(entry)) for entry in children[key][kind]) for kind in ("season", "episode")},
                 "playback": sorted(digest(entry) for entry in playback[key]),
             }
-            repeat = any(rewatching(entry) for entry in [row, *history, *seasons]) or any(
-                count > 1 for count in Counter(str(entry.get("item_id")) for entry in episodes).values())
+            repeat = any(rewatching(entry) for entry in [row, *history, *seasons])
             listed = native == "0" or any(str(entry["list_id"]) in watchlists for entry in lists)
             obs = (observation(native, self.statuses, protected, watchlisted=listed, rewatching=repeat)
                    if agrees else Observation(ReadState.UNKNOWN))
@@ -137,6 +145,23 @@ class StatusAdapter(NativeStatusAdapter):
         if sorted(digest(personal(row)) for row in before) != sorted(digest(personal(row)) for row in after):
             raise RuntimeError("floppy_status_snapshot_changed")
         return result
+
+    def identify(self, row):
+        try:
+            return identity(row)
+        except RuntimeError as exc:
+            if str(exc) != "floppy_status_invalid_item":
+                raise
+            self.skip_unidentified(str(exc))
+            return None
+
+    def consumption(self, row):
+        try:
+            return consumption_id(row)
+        except RuntimeError as exc:
+            if str(exc) != "floppy_status_missing_consumption":
+                raise
+            return ""
 
     def blockers(self, record, desired):
         if record.observation.state != ReadState.PRESENT:

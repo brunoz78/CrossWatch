@@ -683,6 +683,8 @@
     const tips = [];
     const instanceTip = instancesTooltip(info);
     if (instanceTip) tips.push(instanceTip);
+    if (providerKey === "MDBLIST") tips.push(...(META.mdblistAccountDetails?.(info) || []));
+    if (providerKey === "SIMKL") tips.push(...(META.dailyQuotaDetails?.(info) || []));
     if (providerKey === "WETRAKR" && info && typeof info === "object") {
       if (info.username) tips.push(`Account: ${info.username}`);
       if (info.vip || info.plan === "vip") tips.push("Plan: VIP");
@@ -1004,6 +1006,8 @@
     writeRouteHash(tab);
 
     if (state.currentTab === tab && !(tab === "editor" && byId("page-editor")?.querySelector("[data-editor-load-error]"))) {
+      if (tab === "tracker" && window.location.hash.startsWith("#tracker?")) await window.TrackerPage?.mount?.(byId("page-tracker"));
+      else if (tab === "tracker") await window.TrackerPage?.resume?.();
       if (tab === "interactive_sync") window.InteractiveSync?.refresh?.();
       if (tab === "maintenance") await window.MaintenancePage?.mount?.(byId("page-maintenance"));
       if (tab === "capture_compare") await window.CaptureComparePage?.mount?.(byId("page-capture_compare"));

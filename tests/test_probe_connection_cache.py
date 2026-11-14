@@ -83,6 +83,56 @@ def test_verified_providers_check_once_after_restart_then_stop_polling(provider,
     assert len(calls) == 4
 
 
+@pytest.mark.parametrize("provider", ["wetrakr", "simkl"])
+def test_quota_recovery_invalidates_cached_status_without_provider_requests(monkeypatch, provider):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from providers.auth import _auth_WETRAKR as wetrakr
+    from providers.sync.simkl import _common as simkl
+
+    quota = wetrakr if provider == "wetrakr" else simkl
+    clock = [time.time()]
+    monkeypatch.setattr(quota, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(quota, "_QUOTA_SEEN", {})
+    monkeypatch.setattr(simkl, "_QUOTA_BLOCKS", {})
+    monkeypatch.setattr(probes, "_simkl_local_verdict", lambda block: (True, ""))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Quota status must not make a provider request")
+
+    monkeypatch.setattr(probes.requests.sessions.Session, "request", unexpected)
+    monkeypatch.setattr(probes, "_http_get", unexpected)
+    block = {"access_token": "quota-token", "client_id": "client", "expires_at": clock[0] + 172800}
+    cfg = {provider: block, "pairs": []}
+    connections.update(provider, cfg, connected=True, checked_at=time.time(), userinfo={"plan": "free"})
+
+    def record(headers):
+        if provider == "wetrakr":
+            quota.record_quota(block, headers, started_at=clock[0])
+        else:
+            quota.record_quota(simkl.quota_account_key(block), headers)
+
+    prefix = "X-Quota" if provider == "wetrakr" else "X-RateLimit"
+    headers = {f"{prefix}-Remaining": "42", f"{prefix}-Limit": "1000", f"{prefix}-Reset": "60"}
+    record(headers)
+    clock[0] += 86400
+    app = FastAPI()
+    probes.register_probes(app, lambda: cfg)
+    client = TestClient(app)
+    expired = client.get("/api/status").json()["providers"][provider.upper()]
+    assert expired["daily_quota_expired"] is True
+    assert probes.STATUS_CACHE["data"]["providers"][provider.upper()]["daily_quota_expired"] is True
+    record(headers)
+    fresh = client.get("/api/status").json()["providers"][provider.upper()]
+    assert fresh["daily_remaining"] == 42
+    assert not fresh.get("daily_quota_expired")
+    assert fresh["connected"] is True
+    cached = probes.STATUS_CACHE["data"]
+    record(headers)
+    record({})
+    assert probes.STATUS_CACHE["data"] is cached
+
+
 def test_trakt_refresh_shares_settings_and_does_not_fetch_counts(monkeypatch):
     calls = []
     cfg = {"trakt": {"client_id": "client", "access_token": "token"}}
@@ -102,20 +152,57 @@ def test_trakt_refresh_shares_settings_and_does_not_fetch_counts(monkeypatch):
     assert len(calls) == 1
 
 
-def test_mdblist_refresh_shares_user_response(monkeypatch):
+@pytest.mark.parametrize("auth", [{"api_key": "secret"}, {"auth_method": "device_code", "access_token": "token"}])
+def test_mdblist_refresh_shares_user_response(monkeypatch, auth):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
     from providers.auth import runtime
 
     calls = []
-    cfg = {"mdblist": {"api_key": "secret"}}
+    cfg = {"mdblist": auth, "pairs": []}
+    reset = int(time.time()) + 3600
 
     def request(*args, **kwargs):
         calls.append(args)
-        return SimpleNamespace(status_code=200, text=json.dumps({"user_id": 12, "username": "Test"}))
+        return SimpleNamespace(status_code=200, text=json.dumps({
+            "user_id": 12, "username": "Test", "plan": "free", "is_supporter": False,
+            "api_requests": 1000, "api_requests_count": 119,
+            "rate_limit": 1000, "rate_limit_remaining": 881, "rate_limit_reset": reset,
+        }))
 
     monkeypatch.setattr(runtime, "request_with_auth", request)
-    assert probes._probe_mdblist_detail(cfg, max_age_sec=0) == (True, "")
+    app = FastAPI()
+    probes.register_probes(app, lambda: cfg)
+    client = TestClient(app)
+    response = client.get("/api/status?fresh=1")
+    assert response.status_code == 200
+    info = response.json()["providers"]["MDBLIST"]
+    assert info["connected"] is True
+    assert info["username"] == "Test"
+    assert info["plan"] == "free"
+    assert info["vip"] is False
+    assert info["daily_limit"] == 1000
+    assert info["daily_remaining"] == 881
+    assert info["daily_resets_at"] == reset
+    assert info["daily_seen_at"] > 0
+    assert info["limits"] == {"api_requests": 1000, "api_requests_count": 119}
     assert probes.mdblist_user_info(cfg)["user_id"] == 12
+    assert client.get("/api/status").json()["providers"]["MDBLIST"]["daily_remaining"] == 881
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("quota, expected", [(None, None), ("invalid", None), (-1, None), (True, None), (0, 0), ("42", 42)])
+def test_mdblist_quota_preserves_unknown_and_zero(monkeypatch, quota, expected):
+    cfg = {"mdblist": {"api_key": "secret"}}
+    monkeypatch.setattr(probes, "_authenticated_account", lambda *a: (200, json.dumps({
+        "user_id": 12, "is_supporter": True, "plan": "supporter",
+        "rate_limit": quota, "rate_limit_remaining": quota, "rate_limit_reset": quota,
+    })))
+    info = probes.mdblist_user_info(cfg, max_age_sec=0)
+    assert info["vip"] is True
+    assert info["plan"] == "supporter"
+    for key in ("daily_limit", "daily_remaining", "daily_resets_at"):
+        assert info[key] == expected
 
 
 def test_anilist_refresh_shares_viewer_response(monkeypatch):

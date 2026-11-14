@@ -5,11 +5,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import vm from "node:vm";
-import {mappingAppliesToRow, candidateConflict, correctedItem, correctedEpisode, mappingGroups, sameSeason, seriesTitle} from "../assets/js/interactive-sync-mapping.js";
+import {mappingAppliesToRow, candidateConflict, changeSummary, correctedItem, correctedEpisode, movieDraft, mappingGroups, sameSeason, seriesTitle} from "../assets/js/interactive-sync-mapping.js";
 
 test("status conflicts show actual labels and default to leaving both sides unchanged", () => {
   const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
-  const render = source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
+  const render = source.slice(source.indexOf("  function closeButtonHTML()"), source.indexOf("  function reportHTML()")) + source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
   const value = source.slice(source.indexOf("  function value("), source.indexOf("  const duration ="));
   const row = {id:"status-1",result:"conflict",feature:"history",key:"private-scope-json",source:"AniList",target:"SIMKL",winner:"",
     left:{title:"Example",watch_status:"on_hold",_cw_status_mapping:true},right:{title:"Example",watch_status:"dropped",_cw_status_mapping:true}};
@@ -21,7 +21,7 @@ test("status conflicts show actual labels and default to leaving both sides unch
     pageData:{total:2,items:[row,update]},page:0,PAGE_SIZE:100,pageLoading:false,downloadOpen:false,downloading:false,
     query:"",feature:"",result:"",labels:{update:"Update"},pending:()=>false,origin:()=>["main","Main"],aiButton:()=>"",
     esc:value=>String(value ?? ""),endpoint:p=>p,progressHTML:()=>"",number:value=>Number(value || 0),title:item=>item.title,
-    reasonDetailsHTML:()=>""};
+    reasonDetailsHTML:()=>"",noticesHTML:()=>""};
   vm.createContext(context);
   vm.runInContext(value + render + "render();", context);
   assert.match(context.host.innerHTML,/AniList: On hold/);
@@ -98,12 +98,42 @@ test("episode suggestions keep enriched IDs for the same show and discard IDs fo
 
 
 const workspaceSource=readFileSync(new URL("../assets/js/interactive-sync-mapping.js",import.meta.url),"utf8");
+
+test("movie conversion discards episode identity while keeping the original watch and source unchanged", () => {
+  const original = {type:"episode",title:"S01E01",series_title:"Miss 267970",series_year:2016,
+    ids:{tvdb:"999"},show_ids:{tmdb:"267970"},season:1,episode:1,watched_at:"2017-02-08T23:33:27Z"};
+  const draft = movieDraft(original);
+  assert.equal(draft.type,"movie");
+  assert.equal(draft.title,"Miss 267970");
+  assert.equal(draft.watched_at,original.watched_at);
+  assert.deepEqual(draft.ids,{});
+  for (const key of ["show_ids","season","episode","series_title"]) assert.equal(draft[key],undefined);
+  assert.equal(original.type,"episode");
+  assert.equal(original.episode,1);
+  assert.deepEqual(original.ids,{tvdb:"999"});
+});
+
+test("type conversion is unavailable to other mapping workspaces and requires a movie ID before saving", () => {
+  const code = workspaceSource.slice(workspaceSource.indexOf("  const canConvert ="), workspaceSource.indexOf("  const cache ="));
+  const row = {source:"CROSSWATCH",feature:"history",item:{type:"episode",ids:{},show_ids:{tmdb:"267970"},season:1,episode:1}};
+  const evaluate = extra => vm.runInNewContext(code + "({allowed:canConvert,ready:saveable(drafts[0])})", {
+    allowMovieConversion:true,direct:true,standalone:true,recovery:false,rows:[row],
+    drafts:[{row,item:movieDraft(row.item),dirty:true}], ...extra,
+  });
+  assert.equal(evaluate({}).allowed,true);
+  assert.equal(evaluate({}).ready,false);
+  const ready = {row,item:{...movieDraft(row.item),ids:{tmdb:"267970"}},dirty:true};
+  assert.equal(evaluate({drafts:[ready]}).ready,true);
+  for (const extra of [{allowMovieConversion:false},{direct:false},{recovery:true},{rows:[row,row]},
+    {rows:[{...row,source:"PLEX"}]},{rows:[{...row,feature:"ratings"}]}]) assert.equal(evaluate(extra).allowed,false);
+});
+
 function recoveryWorkspaceFixture() {
   const nodes=new Map(),calls=[],saved=[];
   const $=id=>{if(!nodes.has(id))nodes.set(id,{value:"recovery",querySelectorAll:()=>[]});return nodes.get(id);};
   const make=(id,title)=>({row:{id,item:{type:"show",title,ids:{}}},item:{type:"show",title,ids:{}},checked:true,dirty:false});
   const drafts=[make("1","Known"),make("2","Ambiguous"),make("3","Unavailable")];
-  const sandbox=vm.createContext({$,drafts,recovery:true,correctedItem,seriesTitle,AbortController,
+  const sandbox=vm.createContext({$,drafts,recovery:true,converting:()=>false,correctedItem,seriesTitle,AbortController,
     searchController:null,searching:false,saving:false,closed:false,backgroundRun:null,metadataLanguage:()=>"nl-NL",updateLanguage(){},refreshSearchSelects(){},lock(){},status(text){sandbox.statusText=text;},
     paint(d){d.dirty=true;},draftStatus(){},showSearch(){},matchEpisodes:async()=>0,
     search:async(row)=>{
@@ -114,8 +144,54 @@ function recoveryWorkspaceFixture() {
   vm.runInContext(workspaceSource.slice(workspaceSource.indexOf("  const saveable ="),workspaceSource.indexOf("  const cache =")),sandbox);
   vm.runInContext(workspaceSource.slice(workspaceSource.indexOf('  $("[data-suggest]").onclick'),workspaceSource.indexOf('  $("[data-bulk]").onclick')),sandbox);
   vm.runInContext(workspaceSource.slice(workspaceSource.indexOf('  $("[data-save]").onclick'),workspaceSource.indexOf('  return {close, destroy()')),sandbox);
-  return {sandbox,drafts,calls,saved,auto:()=>$("[data-suggest]").onclick(),save:()=>$("[data-save]").onclick()};
+  return {sandbox,drafts,calls,saved,$,auto:()=>$("[data-suggest]").onclick(),save:()=>$("[data-save]").onclick()};
 }
+
+test("bulk recovery switches a selected series to movie search and saves the verified match", async () => {
+  const f = recoveryWorkspaceFixture(), handlers = {}, candidates = [], searches = [];
+  const draft = f.drafts[0];
+  f.drafts.forEach((d, i) => { d.checked = i === 0; });
+  Object.assign(f.sandbox, {canConvert:false, movieDraft, structuredClone, candidateConflict,
+    esc:String, endpoint:()=>"PLEX", routeKey:()=>"PLEX", applyParts(){}, window:{},
+    document:{createElement:()=>({setAttribute(){}, querySelector:()=>null})},
+    search:async(row, query)=>{
+      searches.push({type:row.item.type, query});
+      return {catalog:"TMDb",results:[{type:"movie",title:"Miss Hokusai",year:2015,ids:{tmdb:"267970"}}]};
+    }});
+  f.sandbox.dialog.addEventListener = (name, fn) => { handlers[name] = fn; };
+  Object.assign(f.$(".is-map-candidates"), {replaceChildren(){candidates.length=0;},append(button){candidates.push(button);}});
+  f.$("[data-change-match]").focus = () => {};
+  f.$("[data-catalog]").value = "tmdb";
+  vm.runInContext(workspaceSource.slice(workspaceSource.indexOf('  dialog.addEventListener("change"'),
+    workspaceSource.indexOf('  dialog.addEventListener("click"')), f.sandbox);
+  vm.runInContext(workspaceSource.slice(workspaceSource.indexOf("  async function find(row)"),
+    workspaceSource.indexOf('  dialog.addEventListener("input"')), f.sandbox);
+  const changeType = value => handlers.change({target:{value,hasAttribute:name=>name === "data-media-type"}});
+  changeType("movie");
+  assert.equal(draft.item.type,"movie");
+  assert.equal(draft.row.item.type,"show");
+  await f.save();
+  assert.equal(f.saved.length,0);
+  f.$("[data-search-query]").value = "Miss Hokusai";
+  await f.sandbox.find(draft.row);
+  assert.deepEqual(searches,[{type:"movie",query:"Miss Hokusai"}]);
+  assert.equal(candidates.length,1);
+  await candidates[0].onclick();
+  assert.equal(draft.item.ids.tmdb,"267970");
+  assert.equal(draft.item.year,2015);
+  await f.save();
+  assert.equal(f.saved.length,1);
+  assert.equal(f.saved[0].length,1);
+  assert.equal(f.saved[0][0].item.type,"movie");
+  assert.deepEqual(JSON.parse(JSON.stringify(f.saved[0][0].matchSearch)),
+    {catalog:"tmdb",match_query:"Miss Hokusai",language:"nl-NL"});
+  changeType("show");
+  assert.deepEqual(draft.item,draft.row.item);
+  assert.equal(draft.matchSearch,undefined);
+  f.drafts[1].checked = true;
+  changeType("movie");
+  assert.equal(draft.item.type,"show");
+});
 
 test("recovery auto match stages only unambiguous suggestions and retry preserves staged matches",async()=>{
   const f=recoveryWorkspaceFixture();
@@ -345,14 +421,14 @@ test("failed plans identify partial progress proposals and expose failure detail
   const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
   const fn = source.slice(source.indexOf("  const noticeSubject"), source.indexOf("  function aiQuestion()"))
     + source.slice(source.indexOf("  function statusMappingHTML("), source.indexOf("  const duration ="))
-    + source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
+    + source.slice(source.indexOf("  function closeButtonHTML()"), source.indexOf("  function reportHTML()")) + source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
   const rows = [1,2].map(id => ({id:String(id), key:`movie:${id}`, item:{type:"movie",title:`Movie ${id}`},
     feature:"progress", operation:"add", result:"add", provider:"FLOPPY", instance:"default", selectable:true}));
   const context = {host:{contains:()=>false,innerHTML:""},document:{activeElement:null},window:{},
     session:{status:"error",pair:{source:"WETRAKR",target:"FLOPPY"},counts:{changes:2,selected:0,attention:0,conflicts:0},
       features:["progress"],notices:[{event:"feature:error",feature:"history",provider:"WETRAKR",side:"source",route:"WETRAKR to FLOPPY",reason:"feature:error",
         detail:"Provider <diagnostic>",error:"History <failure>"}]},
-    pageData:{total:2,items:rows},page:0,PAGE_SIZE:100,pageLoading:false,downloadOpen:false,downloading:false,
+    pageData:{total:2,items:rows},page:0,PAGE_SIZE:100,pageLoading:false,downloadOpen:false,downloading:false,noticesExpanded:null,
     query:"",feature:"",result:"",labels:{add:"Add"},pending:()=>false,origin:()=>["main","Main"],aiButton:()=>"",
     esc:value=>String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"),
     endpoint:(p,i)=>p,progressHTML:()=>"",number:value=>Number(value || 0),title:item=>item.title,
@@ -364,7 +440,7 @@ test("failed plans identify partial progress proposals and expose failure detail
   assert.match(html, /<strong>2<\/strong><span>Partial proposals/);
   assert.match(html, /Unknown<\/strong><span>Item checks incomplete/);
   assert.doesNotMatch(html, /Need attention/);
-  assert.match(html, /<details class="is-notices" open>/);
+  assert.match(html, /<section id="is-notices" class="is-notices" aria-label="Failure notices and sync protections"><strong>Failure notices and sync protections \(1\)<\/strong><p>/);
   assert.match(html, /history \/ WETRAKR \(source\)/);
   assert.doesNotMatch(html, /history \/ FLOPPY/);
   assert.match(html, /Planning failed for history from WETRAKR \(source\)\. Those features have no proposals in this plan/);
@@ -402,7 +478,8 @@ test("failed plans identify partial progress proposals and expose failure detail
   context.session.status = "review";
   context.session.notices = [{reason:"Existing notice"}];
   vm.runInContext("render();", context);
-  assert.doesNotMatch(context.host.innerHTML, /Partial plan:|Item checks incomplete|class="is-notices" open/);
+  assert.doesNotMatch(context.host.innerHTML, /Partial plan:|Item checks incomplete|toggle-notices/);
+  assert.match(context.host.innerHTML, /Sync protections and provider notices \(1\)<\/strong><p><strong><\/strong> Existing notice<\/p>/);
   assert.match(context.host.innerHTML, /<strong>0<\/strong><span>Need attention/);
   context.session.status = "error";
   context.session.report = {outcome:"failed"};
@@ -411,15 +488,37 @@ test("failed plans identify partial progress proposals and expose failure detail
   assert.doesNotMatch(context.host.innerHTML, /Partial plan:/);
 });
 
+test("notices stay visible and the status mapping count links to them", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  const noticeSubject"), source.indexOf("  function aiQuestion()"))
+    + source.slice(source.indexOf("  function statusMappingHTML("), source.indexOf("  const duration ="));
+  const notices = Array.from({length: 8}, (_, i) => ({feature:"history", provider:"SCROB", reason:`Notice ${i + 1}`}));
+  const context = {session:{notices}, noticesExpanded:null, number:value=>Number(value || 0).toLocaleString("en-US"),
+    esc:value=>String(value ?? ""), endpoint:p=>p};
+  vm.createContext(context);
+  vm.runInContext(fn + "globalThis.collapsed = noticesHTML(false, false); globalThis.summary = statusMappingHTML([{src:'WETRAKR',dst:'SCROB',matched:4,unresolved:2,state:'attention'}]);", context);
+  assert.equal((context.collapsed.match(/<p>/g) || []).length, 3);
+  assert.match(context.collapsed, /data-action="toggle-notices" aria-expanded="false">Show all 8 notices<\/button>/);
+  assert.match(context.summary, /<button class="is-link" data-action="show-notices">2 review notices<\/button>/);
+  vm.runInContext("noticesExpanded = true; globalThis.expanded = noticesHTML(false, false); session.notices = session.notices.slice(0, 5); noticesExpanded = null; globalThis.few = noticesHTML(false, false);", context);
+  assert.equal((context.expanded.match(/<p>/g) || []).length, 8);
+  assert.match(context.expanded, /aria-expanded="true">Show fewer<\/button>/);
+  assert.equal((context.few.match(/<p>/g) || []).length, 5);
+  vm.runInContext("session.notices = []; globalThis.none = noticesHTML(false, false); globalThis.plain = statusMappingHTML([{src:'A',dst:'B',matched:1,unresolved:2}]);", context);
+  assert.equal(context.none, "");
+  assert.match(context.plain, /2 review notices/);
+  assert.doesNotMatch(context.plain, /show-notices/);
+});
+
 test("completion report distinguishes cloud outcomes and escapes titles", () => {
   const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
   const fn = source.slice(source.indexOf("  function statusMappingHTML("), source.indexOf("  const duration ="))
-    + source.slice(source.indexOf("  function reportHTML()"), source.indexOf("  function render()"));
+    + source.slice(source.indexOf("  function closeButtonHTML()"), source.indexOf("  function render()"));
   const report = {outcome:"success", totals:{added:1,updated:0,removed:0}, features:[], cloud_results:
     ["dated","present","cached","plex_discover_date_pending"].map(outcome => ({title:"<Example>",key:"movie:1",provider:"PLEX",instance:"own",outcome}))};
   const context = {session:{report}, esc:value=>String(value ?? "").replaceAll("<","&lt;").replaceAll(">","&gt;"),
     number:value=>Number(value || 0), duration:()=>"", requestBreakdown:()=>"", endpoint:(p,i)=>`${p} (${i})`,
-    reportIssuesHTML:()=>"", origin:()=>["main","Main"]};
+    reportIssuesHTML:()=>"", pending:()=>false, origin:()=>["main","Main"]};
   vm.createContext(context);
   vm.runInContext(fn + "globalThis.html = reportHTML();", context);
   assert.match(context.html, /watched and original date restored/);
@@ -447,4 +546,97 @@ test("completion report distinguishes cloud outcomes and escapes titles", () => 
   assert.match(context.html, /Not run/);
   assert.match(context.html, /History is disabled. &lt;not markup&gt;/);
   assert.doesNotMatch(context.html, /0 matched/);
+});
+
+
+test("Tracker import reviews use the shared selection controls without permanent mapping edits", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  function closeButtonHTML()"), source.indexOf("  function reportHTML()")) + source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
+  const context = {host:{contains:()=>false,innerHTML:""},document:{activeElement:null},window:{},
+    session:{tracker_import:true,status:"review",pair:{source:"TRAKT",target:"CROSSWATCH"},counts:{changes:1,selected:1},features:["history"]},
+    pageData:{total:1,items:[{id:"one",key:"tmdb:949",item:{type:"movie",title:"Heat"},feature:"history",operation:"add",result:"add",provider:"CROSSWATCH",selectable:true,selected:true}]},
+    page:0,PAGE_SIZE:75,pageLoading:false,downloadOpen:false,query:"",feature:"",result:"",labels:{add:"Add"},pending:()=>false,
+    origin:()=>["tracker","Tracker"],aiButton:()=>"",esc:value=>String(value??""),endpoint:value=>value,progressHTML:()=>"",statusMappingHTML:()=>"",noticesHTML:()=>"",
+    number:value=>Number(value||0),title:item=>item.title,value:()=>"",reasonDetailsHTML:()=>""};
+  vm.createContext(context);
+  vm.runInContext(fn+"render();",context);
+  assert.match(context.host.innerHTML,/Review your import/);
+  assert.match(context.host.innerHTML,/href="#tracker"/);
+  assert.match(context.host.innerHTML,/data-select="one"/);
+  assert.match(context.host.innerHTML,/Apply selected \(1\)/);
+  assert.match(context.host.innerHTML,/Nothing is written back to the source/);
+  assert.doesNotMatch(context.host.innerHTML,/data-map=|data-action="map-selected"|Mappings are saved permanently/);
+  context.session.tracker_import=false;
+  vm.runInContext("render();",context);
+  assert.match(context.host.innerHTML,/data-map="one"/);
+  assert.match(context.host.innerHTML,/data-action="map-selected"/);
+});
+
+test("Review footer explains the one-time dry run confirmation", () => {
+  const source = readFileSync(new URL("../assets/js/interactive-sync.js", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("  function closeButtonHTML()"), source.indexOf("  function reportHTML()")) + source.slice(source.indexOf("  function render()"), source.indexOf("  async function action("));
+  const context = {host:{contains:()=>false,innerHTML:""},document:{activeElement:null},window:{},
+    session:{dry_run:true,status:"review",pair:{source:"WETRAKR",target:"FLOPPY"},counts:{changes:1,selected:1},features:["history"]},
+    pageData:{total:1,items:[{id:"one",key:"tmdb:949",item:{type:"movie",title:"Heat"},feature:"history",operation:"add",result:"add",provider:"FLOPPY",selectable:true,selected:true}]},
+    page:0,PAGE_SIZE:75,pageLoading:false,downloadOpen:false,query:"",feature:"",result:"",labels:{add:"Add"},pending:()=>false,
+    origin:()=>["sync","Synchronization"],aiButton:()=>"",esc:value=>String(value??""),endpoint:value=>value,progressHTML:()=>"",statusMappingHTML:()=>"",noticesHTML:()=>"",
+    number:value=>Number(value||0),title:item=>item.title,value:()=>"",reasonDetailsHTML:()=>""};
+  vm.createContext(context);
+  vm.runInContext(fn+"render();",context);
+  assert.match(context.host.innerHTML,/Dry run is on/);
+  assert.match(context.host.innerHTML,/ask for confirmation/);
+  assert.match(context.host.innerHTML,/Global dry run stays on/);
+  assert.doesNotMatch(context.host.innerHTML,/data-action="apply" disabled/);
+  context.session.counts.selected=0;
+  vm.runInContext("render();",context);
+  assert.match(context.host.innerHTML,/data-action="apply" disabled/);
+  context.session.counts.selected=1;
+  context.session.dry_run=false;
+  vm.runInContext("render();",context);
+  assert.match(context.host.innerHTML,/1 changes selected/);
+  assert.doesNotMatch(context.host.innerHTML,/data-action="apply" disabled/);
+});
+
+test("Apply requires confirmation for dry run and never reuses it", async () => {
+  const source=readFileSync(new URL("../assets/js/interactive-sync.js",import.meta.url),"utf8");
+  const fn=source.slice(source.indexOf("  async function action("),source.indexOf("  async function mapping("));
+  const requests=[],prompts=[];
+  let confirmed=false;
+  const context={session:{id:"review-1",dry_run:true,revision:3,selection_version:4,counts:{selected:2}},
+    generation:1,pageLoading:false,busy:false,pageData:{items:[]},API:"/api/interactive-sync",
+    pending:()=>false,invalidatePage:()=>{},render:()=>{},accept:()=>{},showError:assert.fail,poll:assert.fail,
+    window:{confirm:message=>{prompts.push(message);return confirmed;}},
+    post:async (url,body)=>{requests.push({url,body});return {};}};
+  vm.createContext(context);
+  vm.runInContext(fn,context);
+  await vm.runInContext('action("apply")',context);
+  assert.equal(requests.length,0);
+  assert.match(prompts[0],/Apply 2 selected changes/);
+  assert.match(prompts[0],/Global dry run will stay enabled/);
+  confirmed=true;
+  await vm.runInContext('action("apply")',context);
+  assert.equal(requests.length,1);
+  assert.equal(requests[0].url,"/api/interactive-sync/review-1/apply");
+  assert.equal(requests[0].body.confirm_dry_run,true);
+  assert.equal(requests[0].body.revision,3);
+  assert.equal(requests[0].body.selection_version,4);
+  assert.equal(context.session.dry_run,true);
+  confirmed=false;
+  await vm.runInContext('action("apply")',context);
+  assert.equal(requests.length,1);
+  context.session.dry_run=false;
+  await vm.runInContext('action("apply")',context);
+  assert.equal(requests.length,2);
+  assert.equal(requests[1].body.confirm_dry_run,undefined);
+  assert.equal(prompts.length,3);
+});
+
+test("change summary reports a filled year", () => {
+  const original = {type:"movie", title:"Ant-Man", ids:{tmdb:"102899"}};
+  assert.equal(changeSummary(original, {...original, year:2015}), "year");
+  assert.equal(changeSummary({...original, year:2015}, {...original, year:2015}), "");
+  assert.equal(changeSummary({type:"episode", series_title:"Show", season:1, episode:1, show_ids:{tmdb:"1"}}, {type:"episode", series_title:"Show", series_year:2020, season:1, episode:1, show_ids:{tmdb:"1"}}), "year");
+  assert.equal(changeSummary({type:"episode", series_title:"Show", year:2020, season:1, episode:1, show_ids:{tmdb:"1"}}, {type:"episode", series_title:"Show", year:2020, series_year:2020, season:1, episode:1, show_ids:{tmdb:"1"}}), "year");
+  assert.equal(changeSummary(original, {...original, year:"2015"}), "year");
+  assert.equal(changeSummary({...original, year:2015}, {...original, year:"2015"}), "");
 });

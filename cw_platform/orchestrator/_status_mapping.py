@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, replace
 from uuid import uuid4
 
@@ -10,11 +11,47 @@ from cw_platform.interactive_reads import read_once, use_review_reads
 from cw_platform.provider_instances import build_provider_config_view, normalize_instance_id
 from cw_platform.run_control import raise_if_cancelled
 from cw_platform.status_mapping import (
-    ConflictPolicy, Decision, Direction, Endpoint, ExecutionScope, ItemScope, PairScope, Status, TransitionCheck,
-    StatusMappingValidationError, parse_mapping, plan_status, verified_baseline, verify_status_write,
+    ConflictPolicy, Decision, Direction, Endpoint, ExecutionScope, ItemScope, PairScope, ReadState, Status, TransitionCheck,
+    StatusMappingValidationError, UNTRACKED_STATES, parse_mapping, plan_status, verified_baseline, verify_status_write,
 )
 from cw_platform.status_mapping_store import StatusStore, decode_item, decode_observation, encode_observation
-from providers.sync._status_mapping import adapter_class
+from providers.sync._status_mapping import NativeStatusAdapter, adapter_class
+
+
+def _read_status(adapter):
+    for attempt in range(2):
+        adapter.unidentified = []
+        try:
+            return adapter.read(), list(adapter.unidentified)
+        except RuntimeError as exc:
+            if attempt or not str(exc).endswith("_snapshot_changed"):
+                raise
+
+
+def _skipped_code(record):
+    return record.raw.get("_cw_skipped") if isinstance(record.raw, dict) else None
+
+
+class _FreshReads:
+    def __init__(self, adapters):
+        self.adapters = adapters
+        self.snapshots = {}
+
+    def record(self, endpoint, reference):
+        adapter = self.adapters[endpoint]
+        with use_review_reads(None):
+            if getattr(getattr(adapter, "read_record", None), "__func__", None) is not NativeStatusAdapter.read_record:
+                return adapter.read_record(reference)
+            if endpoint not in self.snapshots:
+                try:
+                    self.snapshots[endpoint] = _read_status(adapter)
+                except Exception as exc:
+                    self.snapshots[endpoint] = exc
+                    raise
+            if isinstance(self.snapshots[endpoint], Exception):
+                raise self.snapshots[endpoint]
+            snapshot, unidentified = self.snapshots[endpoint]
+            return snapshot.get(reference.native_id) or (None if unidentified else adapter.missing_record(reference, snapshot))
 
 
 def pair_scope(pair):
@@ -117,7 +154,9 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
     dry_run = bool(getattr(ctx, "dry_run", False) or (cfg.get("sync") or {}).get("dry_run") or (cfg.get("sync") or {}).get("enable_add") is False)
     totals = {"updated": 0, "unresolved": 0, "errors": 0, "skipped": 0}
     adapters, snapshots, proposals, claims = {}, {}, [], {}
+    unidentified = {}
     summaries = {}
+    planning_reads = _FreshReads(adapters)
 
     def report(pair, reason, *, item=None, error=False):
         totals["errors" if error else "unresolved"] += 1
@@ -169,12 +208,13 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                     if instances:
                         view[endpoint.provider] = {**view[endpoint.provider], "instances": instances}
                     adapter = (adapter_overrides or {}).get(endpoint) or cls(view)
-                    snapshots[endpoint] = read_once(["status_mapping", asdict(endpoint)], adapter.read, scoped=False)
+                    read = read_once(["status_mapping", asdict(endpoint)], lambda adapter=adapter: _read_status(adapter), scoped=False)
+                    snapshots[endpoint], unidentified[endpoint] = read if isinstance(read, tuple) else (read, [])
                     adapters[endpoint] = adapter
             left, right = dict(snapshots[scope.a]), dict(snapshots[scope.b])
             allow_mapping = bool((pair.get("features") or {}).get("history", {}).get("use_anime_mapping", (cfg.get("anime_mapping") or {}).get("enabled", False)))
             for sources, destinations, endpoint in ((left, right, scope.b), (right, left, scope.a)):
-                if not adapters[endpoint].creates_missing or endpoint == scope.a and not scope.two_way:
+                if not adapters[endpoint].creates_missing or unidentified.get(endpoint) or endpoint == scope.a and not scope.two_way:
                     continue
                 covered = {token for target in destinations.values() for token in _tokens(target, allow_mapping)}
                 for source in list(sources.values()):
@@ -184,13 +224,25 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                     if candidate:
                         destinations[candidate.native_id] = candidate
                         covered.update(_tokens(candidate, allow_mapping))
+            for endpoint in dict.fromkeys((scope.a, scope.b)):
+                if unidentified.get(endpoint):
+                    report(pair, f"{len(unidentified[endpoint])} {endpoint.provider.upper()} status entries without a usable ID were skipped ({unidentified[endpoint][0]}).")
             matched = list(matched_records(left, right, allow_mapping=allow_mapping))
-            missing = len(left) - len(matched) + (len(right) - len(matched) if scope.two_way else 0)
+            paired = {id(record) for match in matched for record in match}
+            missing = sum(1 for side in ((left, right) if scope.two_way else (left,)) for record in side.values()
+                          if id(record) not in paired and record.observation.state != ReadState.ABSENT and not _skipped_code(record)
+                          and not (record.observation.state == ReadState.UNKNOWN and record.observation.native_status in UNTRACKED_STATES))
             summary.update(source_count=len(snapshots[scope.a]), destination_count=len(snapshots[scope.b]), matched=len(matched), unmatched=missing)
             publish_status(ctx, pair, "read", **summary)
             if missing:
                 report(pair, f"{missing} status entries have no unique matching title on the other side. No status was written for those entries.")
+            noted = {id(record): record for record in [*(r for side in ((left, right) if scope.two_way else (left,)) for r in side.values()),
+                                                       *(r for match in matched for r in match)] if _skipped_code(record)}
+            for record in noted.values():
+                report(pair, f"Skipped ({_skipped_code(record)})", item=record.item)
             for a, b in matched:
+                if id(a) in noted or id(b) in noted:
+                    continue
                 item = ItemScope(scope, a.media, a.native_id, b.native_id)
                 state = read_once(["status_baseline", store.key(item)], lambda item=item: store.get(item), scoped=False)
                 if state.get("pending_conflict"):
@@ -199,13 +251,16 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                 baseline = store.baseline(item, state)
                 pending = state.get("pending") or {}
                 if pending.get("a") and pending.get("b") and not preview and not dry_run:
-                    with use_review_reads(None):
-                        current_a = adapters[scope.a].read_record(a)
-                        raise_if_cancelled()
-                        current_b = adapters[scope.b].read_record(b)
-                        raise_if_cancelled()
+                    current_a = planning_reads.record(scope.a, a)
+                    raise_if_cancelled()
+                    current_b = planning_reads.record(scope.b, b)
+                    raise_if_cancelled()
                     if current_a is None or current_b is None:
                         report(pair, "The pending status write could not be read back. Refresh before retrying.", item=a.item)
+                        continue
+                    code = _skipped_code(current_a) or _skipped_code(current_b)
+                    if code:
+                        report(pair, f"Skipped ({code})", item=a.item)
                         continue
                     a, b = current_a, current_b
                 execution = {direction: ExecutionScope(True, True, frozenset(Status) - {Status.PLANNED}) for direction in Direction}
@@ -259,15 +314,25 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                             report(pair, "Status state changed since planning. The newer operation was preserved; refresh before continuing.", item=a.item)
                     continue
                 if decision.outcome != "write":
-                    if decision.reason not in {"excluded", "source_absent", "watchlist_managed"}:
+                    if pending and decision.reason == "caught_up":
+                        report(pair, "A previous status write could not be verified. Review the provider before retrying.", item=a.item)
+                    elif decision.reason == "rewatch_state_preserved":
+                        rewatching = scope.a if decision.direction == Direction.REVERSE else scope.b
+                        report(pair, f"Skipped, being rewatched on {rewatching.provider.upper()}, status left unchanged", item=a.item)
+                    elif decision.reason not in {"excluded", "source_absent", "watchlist_managed", "caught_up"}:
                         report(pair, decision.reason.replace("_", " "), item=a.item)
                     else:
                         summary["excluded"] += 1
                     continue
                 proposals.append((pair, config, item, a, b, decision, state))
         except Exception as exc:
-            report(pair, f"Status read or planning failed ({type(exc).__name__}). Refresh before retrying.", error=True)
+            code = str(exc)
+            reason = code if re.fullmatch(r"[a-z]{2,20}_status(?:_[a-z]{2,20}){1,5}(?:_http_\d{3})?", code) else type(exc).__name__
+            report(pair, f"Status read or planning failed ({reason}). Refresh before retrying.", error=True)
 
+    before_reads = _FreshReads(adapters)
+    written = []
+    touched_records = set()
     for pair, config, item, a, b, decision, state in proposals:
         raise_if_cancelled()
         source, target = (a, b) if decision.direction == Direction.FORWARD else (b, a)
@@ -302,12 +367,15 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
             if pending and not preview and not dry_run and not selected:
                 report(pair, "The previous status write is still pending. Refresh Interactive sync to review its retry.", item=target.item)
             continue
+        records = {(item.pair.a, item.media, a.native_id), (item.pair.b, item.media, b.native_id)}
+        if records & touched_records:
+            report(pair, "Another status update for this title is still being verified in this run. It will be applied on the next run.", item=target.item)
+            continue
         try:
-            with use_review_reads(None):
-                current_a = adapters[item.pair.a].read_record(a)
-                raise_if_cancelled()
-                current_b = adapters[item.pair.b].read_record(b)
-                raise_if_cancelled()
+            current_a = before_reads.record(item.pair.a, a)
+            raise_if_cancelled()
+            current_b = before_reads.record(item.pair.b, b)
+            raise_if_cancelled()
             if current_a is None or current_b is None or (current_a.observation, current_b.observation) != (a.observation, b.observation):
                 report(pair, "The title changed since planning. Refresh before applying its status.", item=target.item)
                 continue
@@ -319,9 +387,16 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                 continue
             with use_review_reads(None):
                 raise_if_cancelled()
+                touched_records.update(records)
                 adapters[target_ep].write(target, decision.desired)
-                after_a = adapters[item.pair.a].read_record(a)
-                after_b = adapters[item.pair.b].read_record(b)
+            written.append((pair, config, item, a, b, decision, source_ep, target, target_ep, operation, reserved_state))
+        except Exception as exc:
+            report(pair, f"Status update could not be verified ({type(exc).__name__}). Review before retrying.", item=target.item, error=True)
+    after_reads = _FreshReads(adapters)
+    for pair, config, item, a, b, decision, source_ep, target, target_ep, operation, reserved_state in written:
+        try:
+            after_a = after_reads.record(item.pair.a, a)
+            after_b = after_reads.record(item.pair.b, b)
             if after_a is None or after_b is None:
                 raise RuntimeError("status_readback_missing")
             write_item = decode_item(operation["item"])

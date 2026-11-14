@@ -71,6 +71,58 @@ def test_admin_still_sees_every_tracker(cfg):
     assert api.get("/api/tracker/import/sources").json()["can_create"] is True
 
 
+@pytest.mark.parametrize("path,payload", [
+    ("/api/tracker/titles/remove", {"keys": ["movie:tmdb:949"], "scope": "all"}),
+    ("/api/tracker/automatic-status", {"action": "enable-title", "key": "movie:tmdb:949"}),
+    ("/api/tracker/automatic-status", {"action": "review-start"}),
+    ("/api/tracker/automatic-status", {"action": "apply", "items": [{"key": "movie:tmdb:949", "before": None, "after": "completed"}]}),
+    ("/api/tracker/automatic-status", {"action": "review-cancel"}),
+])
+def test_automation_and_title_removal_enforce_scope_and_write_permission(cfg, path, payload):
+    assert _client(ANN).post(path, json={**payload, "provider_instance": "CW-P02"}).status_code == 403
+    assert not crosswatch._non_admin_permission_allowed({**ANN, "permissions": {"write": False}}, path, "POST")
+    assert _client(ANN).post(path, json={**payload, "provider_instance": "CW-P01"}).status_code == 200
+
+
+def test_automatic_review_status_is_scoped_to_assigned_tracker(cfg):
+    api = _client({**ANN, "permissions": {"write": False}})
+    assert api.get("/api/tracker/automatic-status/review?provider_instance=CW-P01").status_code == 200
+    assert api.get("/api/tracker/automatic-status/review?provider_instance=CW-P02").status_code == 403
+
+
+def test_month_review_uses_only_the_managed_users_assigned_tracker(cfg, monkeypatch):
+    roots = []
+
+    def report(store, config, month):
+        roots.append(store.root)
+        return {"ok": True, "month": month}
+
+    monkeypatch.setattr(trackerAPI, "month_report", report)
+    api = _client({**ANN, "permissions": {"write": False}})
+    assert api.get("/api/tracker/overview/month?provider_instance=CW-P01&month=2026-10").status_code == 200
+    assert roots == [trackerAPI.tracker_context(cfg, trackerAPI.CONFIG, "CW-P01")[1]]
+    for instance in ("CW-P02", "default"):
+        assert api.get(f"/api/tracker/overview/month?provider_instance={instance}&month=2026-10").status_code == 403
+    assert len(roots) == 1
+
+
+def test_bulk_title_changes_enforce_instance_access_and_write_permission(cfg):
+    own = TrackerStore(trackerAPI.tracker_context(cfg, trackerAPI.CONFIG, "CW-P01")[1])
+    other = TrackerStore(trackerAPI.tracker_context(cfg, trackerAPI.CONFIG, "CW-P02")[1])
+    key = "movie:tmdb:949"
+    for store in (own, other):
+        store.save_note(key, {"type": "movie", "title": "Heat", "status": "watching"})
+    payload = {"keys": [key], "action": "remove", "provider_instance": "CW-P02"}
+    assert _client(ANN).post("/api/tracker/notes/bulk", json=payload).status_code == 403
+    assert other.note(key) is not None
+    payload["provider_instance"] = "CW-P01"
+    readonly = {**ANN, "permissions": {"write": False}}
+    assert not crosswatch._non_admin_permission_allowed(readonly, "/api/tracker/notes/bulk", "POST")
+    assert own.note(key) is not None
+    assert _client(ANN).post("/api/tracker/notes/bulk", json=payload).status_code == 200
+    assert own.note(key) is None and other.note(key) is not None
+
+
 def test_admin_viewing_as_a_profile_gets_that_scope(cfg, monkeypatch):
     from cw_platform import config_base
 
@@ -107,7 +159,7 @@ def test_bell_and_import_only_show_the_users_own_instances(cfg, monkeypatch):
 @pytest.mark.parametrize(("permissions", "allowed"), [({"write": True}, True), ({"write": False}, False), ({"monitor": True}, False)])
 def test_tracker_api_is_open_to_managed_users_with_write_access(permissions, allowed):
     user = {"is_admin": False, "permissions": permissions}
-    for method, path in (("GET", "/api/tracker/summary"), ("POST", "/api/tracker/edit")):
+    for method, path in (("GET", "/api/tracker/summary"), ("POST", "/api/tracker/edit"), ("POST", "/api/tracker/notes/bulk")):
         assert appAuthAPI.non_admin_api_allowed(path, method)
         assert crosswatch._non_admin_permission_allowed(user, path, method) is allowed
 
@@ -122,17 +174,29 @@ def test_managed_shell_has_the_tracker_tab_only_with_an_assigned_instance(monkey
     assert 'data-cw-perm-tracker="on"' in with_tracker
     assert "tracker-notifications.js" in with_tracker and "month-bar.js" in with_tracker
     assert with_tracker.index('id="tab-playlists"') < with_tracker.index('id="tab-tracker"') < with_tracker.index('id="tab-editor"')
+    assert 'data-cw-profile-menu-action="tracker"' in with_tracker
+    profile = ui_frontend.get_profile_html(ANN)
+    assert 'data-cw-profile-menu-action="tracker"' in profile
+    for route in ("main", "snapshots", "playlists", "tracker", "editor"):
+        assert profile.count(f'id="tab-{route}"') == 1
+    assert "location.href='/?main=1#tracker'" in profile
 
-    for user in ({**ANN, "profile_id": "bob"}, {**ANN, "permissions": {"write": False}}):
+    for user in ({**ANN, "profile_id": "bob"}, {**ANN, "permissions": {"write": False}}, None):
         html = ui_frontend.get_index_html(include_admin=False, user=user)
         assert 'id="tab-tracker"' not in html and 'id="page-tracker"' not in html
         assert 'data-cw-perm-tracker="off"' in html
         assert "tracker-notifications.js" not in html
+        assert 'data-cw-profile-menu-action="tracker"' not in html
+        assert 'data-cw-profile-menu-action="tracker"' not in ui_frontend.get_profile_html(user)
+        assert 'id="tab-tracker"' not in ui_frontend.get_profile_html(user)
 
 
 def test_profile_header_loads_authorized_assistant_and_tracker_feeds(monkeypatch):
     monkeypatch.setattr(ui_frontend, "_managed_tracker_allowed", lambda user: user.get("profile_id") == "allowed")
     admin = ui_frontend.get_profile_html({"is_admin": True, "username": "admin"})
+    for route in ("main", "snapshots", "playlists", "tracker", "editor"):
+        assert admin.count(f'id="tab-{route}"') == 1
+    assert "location.href='/#tracker'" in admin
     assert "assistant-settings.js" in admin
     assert "ai-settings.css" in admin
     assert "tracker-notifications.js" in admin
@@ -140,3 +204,33 @@ def test_profile_header_loads_authorized_assistant_and_tracker_feeds(monkeypatch
         html = ui_frontend.get_profile_html({"is_admin": False, "username": "user", "profile_id": profile})
         assert ("tracker-notifications.js" in html) is allowed
         assert "assistant-settings.js" not in html
+
+
+def test_history_bulk_status_respects_tracker_access_and_write_permission(cfg):
+    payload = {"keys": ["tmdb:949"], "status": "completed", "provider_instance": "CW-P02"}
+    assert _client(ANN).post("/api/tracker/titles/status", json=payload).status_code == 403
+    readonly = {**ANN, "permissions": {"write": False}}
+    assert not crosswatch._non_admin_permission_allowed(readonly, "/api/tracker/titles/status", "POST")
+    payload["provider_instance"] = "CW-P01"
+    assert _client(ANN).post("/api/tracker/titles/status", json=payload).status_code == 200
+    note = TrackerStore(trackerAPI.tracker_context(cfg, trackerAPI.CONFIG, "CW-P01")[1]).note("movie:tmdb:949")
+    assert note is not None
+    assert note["status"] == "completed"
+    assert TrackerStore(trackerAPI.tracker_context(cfg, trackerAPI.CONFIG, "CW-P02")[1]).note("movie:tmdb:949") is None
+
+
+def test_managed_users_cannot_create_trackers_through_import_preview(cfg):
+    before = dict(cfg["crosswatch"]["instances"])
+    response = _client(ANN).post("/api/tracker/import/preview", json={"provider_instance": "new", "source": "TRAKT", "source_instance": "TRAKT-P01", "features": ["history"]})
+    assert response.status_code == 403
+    assert cfg["crosswatch"]["instances"] == before
+
+
+def test_episode_watch_editor_respects_tracker_scope_and_write_permission(cfg):
+    api = _client(ANN)
+    assert api.get("/api/tracker/watch-editor?provider_instance=CW-P02&tmdb=123").status_code == 403
+    assert api.post("/api/tracker/history/bulk", json={"provider_instance": "CW-P02"}).status_code == 403
+    readonly = {**ANN, "permissions": {"write": False}}
+    for method, path in (("GET", "/api/tracker/watch-editor"), ("POST", "/api/tracker/history/bulk")):
+        assert appAuthAPI.non_admin_api_allowed(path, method)
+        assert not crosswatch._non_admin_permission_allowed(readonly, path, method)

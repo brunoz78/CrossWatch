@@ -133,6 +133,8 @@ def compute_effective_add(
     verify_after_write,
     provider_skipped,
     deferred_keys=(),
+    uncertain_keys=(),
+    cancelled=False,
 ) -> dict[str, Any]:
     unres = set(still_unresolved or set())
     deferred = set(deferred_keys or ())
@@ -151,7 +153,9 @@ def compute_effective_add(
     success_keys = conf if (verify_after_write or have_exact_keys) else conf[:eff]
     success_keys = list(dict.fromkeys(list(success_keys) + skipped_success))
     sset = set(success_keys)
-    failed_keys = [k for k in (attempted_keys or []) if k not in sset and k not in skset]
+    uncertain = set(uncertain_keys or ())
+    failed_keys = [] if cancelled else [k for k in (attempted_keys or []) if k not in sset and k not in skset and k not in uncertain
+                                        and (not strict_pessimist or k in unres)]
     return {
         "effective": int(eff),
         "prov_confirmed": int(pc),
@@ -309,6 +313,8 @@ from ._history_rewatches import (
     history_rewatches_requested,
 )
 from ._history_copies import config_with_history_copies, copy_gap_adds, history_copies_requested, take_copy_gaps
+from ._history_resets import apply_reset_unwatches, load_reset_plan, preview_reset_unwatches
+from ._pair_skips import record_pair_skips
 
 # Blackbox imports
 from ._blackbox import load_blackbox_keys, record_attempts, record_success
@@ -1315,6 +1321,14 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
     if reads_dropped(dst_ops) and _provider_ignore_dropped_enabled(dst_cfg, dst, feature):
         dst_dropped_tokens = _load_provider_dropped_tokens(dst_ops, dst_cfg)
 
+    reset_plan = load_reset_plan(feature, fcfg, [(src, src_ops, src_cfg), (dst, dst_ops, dst_cfg)],
+                                 event_mode=history_event_mode, one_way=True, emit=emit)
+    if reset_plan:
+        (prev_src, src_cur, eff_src), (prev_dst, dst_cur, eff_dst) = reset_plan.view(
+            (prev_src, src_cur, eff_src), (prev_dst, dst_cur, eff_dst), emit=emit,
+            aliases=_build_history_coordinate_aliases(cfg, feature, (eff_src, eff_dst)))
+        manual_adds = reset_plan.trakt_manual(manual_adds)
+
     dst_sem = _index_semantics(dst_ops, feature, cfg=dst_cfg, provider=dst)
     src_sem = _index_semantics(src_ops, feature, cfg=src_cfg, provider=src)
 
@@ -1872,6 +1886,10 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                     target=planned_target, down=dst_down,
                     target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
                 )
+            if reset_plan and not (src_down or src_suspect or dst_suspect):
+                reset_plan.unwatch = reset_plan.settle(planned_adds, alias=_alias_index, find=_find_in_idx,
+                                                       unblocked=lambda items: _filter_manual_block(items, manual_blocks))
+                preview_reset_unwatches(reset_plan, review=review, feature=feature, dst_inst=dst_inst, src_inst=src_inst, down=dst_down)
             return {"blocked": blocked_total, "manual_excluded": int(manual_blocked),
                     "library_skipped": len(library_skipped), "cancelled": cancelled}
 
@@ -2061,6 +2079,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             if verify_after_write and _apply_verify_after_write_supported(dst_ops):
                 try:
                     unresolved_again = set(load_unresolved_keys(dst, feature, cross_features=_cross_feature_unresolved(feature), instance=dst_cfg.get("_cw_provider_instance")) or [])
+                    if have_exact_keys:
+                        unresolved_again -= unresolved_before
                     confirmed_keys = [k for k in confirmed_keys if k not in unresolved_again]
                 except Exception:
                     pass
@@ -2091,6 +2111,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 verify_after_write=verify_after_write,
                 provider_skipped=bool(res_add.get("skipped")),
                 deferred_keys=(add_res or {}).get("deferred_keys", []),
+                uncertain_keys=(add_res or {}).get("uncertain_keys", []),
+                cancelled=bool((add_res or {}).get("cancelled")),
             )
             prov_confirmed = _decision["prov_confirmed"]
             added_effective = _decision["effective"]
@@ -2332,6 +2354,16 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             target_tokens=lambda: dst_dropped_tokens or _load_provider_dropped_tokens(dst_ops, dst_cfg),
             dry_run=dry_run_flag, emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst,
         )
+
+    if reset_plan and not (cancelled or src_down or dst_down or src_suspect or dst_suspect):
+        reset_plan.unwatch = reset_plan.settle(adds, alias=_alias_index, find=_find_in_idx,
+                                               unblocked=lambda items: _filter_manual_block(items, manual_blocks))
+        apply_reset_unwatches(reset_plan, dst_ops=dst_ops, dst_cfg=dst_cfg, feature=feature, dry_run=dry_run_flag,
+                              emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst)
+    if not (cancelled or dry_run_flag) and getattr(ctx, "write_state_json", True):
+        record_pair_skips(ctx.state_store, feature, ((src, src_inst), (dst, dst_inst)),
+                          dropped=(set() if src_tags_dropped else set(src_dropped_tokens)) | set(dst_dropped_tokens),
+                          reset_plan=reset_plan, emit=emit)
 
     if (not cancelled) and getattr(ctx, "write_state_json", True):
         try:

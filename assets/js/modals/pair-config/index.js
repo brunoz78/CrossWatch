@@ -110,6 +110,16 @@ function applyPairRemoveMode(features, mode){
 }
 function isTwoWayMode(state){return !!ID("cx-mode-two")?.checked||String(state?.mode||"").toLowerCase().startsWith("two")}
 function allCopiesAllowed(state){return same(state?.dst,"jellyfin")||(isTwoWayMode(state)&&same(state?.src,"jellyfin"))}
+const TRAKT_RESET_SERVERS=["plex","jellyfin","emby","kodi","tofa"];
+function traktResetsAllowed(state){
+  const server=p=>TRAKT_RESET_SERVERS.some(name=>same(p,name));
+  return (same(state?.src,"trakt")&&server(state?.dst))||(isTwoWayMode(state)&&same(state?.dst,"trakt")&&server(state?.src));
+}
+function traktResetsNeedVip(state){
+  const trakt=(window.__CW_PROVIDER_STATUS__?.providers||window._statusCache?.providers||{}).TRAKT;
+  if(!trakt||trakt.vip!==false) return false;
+  return pairInstanceForKind(state,"trakt")===String(trakt.rep_instance||"default");
+}
 const DROPPED_PROVIDERS=["trakt","mdblist","simkl","wetrakr","flicklist","crosswatch"];
 function droppedProviders(state){return [...new Set([state?.src,state?.dst].map(p=>String(p||"").trim().toLowerCase()))].filter(p=>DROPPED_PROVIDERS.includes(p))}
 function droppedTagAllowed(state,key){
@@ -121,10 +131,12 @@ function droppedTagAllowed(state,key){
 function droppedMode(state,key){
   const blk=(state?.pairProviders?.[key])||{};
   const mode=String(blk.history_dropped_mode||"").trim().toLowerCase();
-  if(mode==="tag") return droppedTagAllowed(state,key)?"tag":"sync";
+  if(mode==="tag") return droppedTagAllowed(state,key)&&!statusMappingActive(state)?"tag":"sync";
   if(mode==="ignore"||mode==="sync") return mode;
   return blk.history_ignore_dropped_shows?"ignore":"sync";
 }
+function statusMappingActive(state){return !!statusMappingPayload({...state,twoWay:isTwoWayMode(state)})}
+function droppedTagSaved(state){return droppedProviders(state).some(key=>String(state?.pairProviders?.[key]?.history_dropped_mode||"").trim().toLowerCase()==="tag")}
 function droppedPairMode(state){
   const modes=droppedProviders(state).map(key=>droppedMode(state,key));
   return modes.includes("tag")?"tag":modes.includes("ignore")?"ignore":"sync";
@@ -1084,7 +1096,7 @@ function applySubDisable(feature){
       "#cx-rt-add","#cx-rt-remove","#cx-rt-library-only","#cx-rt-anime-map","#cx-rt-anime-only","#cx-rt-type-all","#cx-rt-type-movies","#cx-rt-type-shows","#cx-rt-type-seasons","#cx-rt-type-episodes","#cx-rt-mode","#cx-rt-from-date","#cx-rt-specials",
       "#st-rt-liked-min","#st-rt-loved-min"
     ],
-    history: ["#plx-marked-watched", "#plx-cloud-read", "#plx-discover-fallback", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-undated-today", "#cx-hs-all-copies", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped"],
+    history: ["#plx-marked-watched", "#plx-cloud-read", "#plx-discover-fallback", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-undated-today", "#cx-hs-all-copies", "#cx-hs-trakt-resets", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
     progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance","#cx-pr-specials","#cx-pr-library-only","#cx-pr-anime-map"],
     collection:["#cx-co-add","#cx-co-remove","#cx-co-type-all","#cx-co-type-movies","#cx-co-type-shows","#cx-co-type-seasons","#cx-co-type-episodes","#cx-co-media","#cx-co-media-upd"]
@@ -1821,14 +1833,23 @@ function renderFeaturePanel(state){
       : "";
     const droppedKeys = droppedProviders(state);
     const droppedPair = droppedPairMode(state);
-    const droppedOpt = (value, label) => `<option value="${value}" ${droppedPair === value ? "selected" : ""}>${label}</option>`;
+    const mappingActive = statusMappingActive(state);
+    const droppedOpt = (value, label, off = false) => `<option value="${value}" ${droppedPair === value ? "selected" : ""}${off ? " disabled" : ""}>${label}</option>`;
+    const droppedTag = droppedKeys.some(key => droppedTagAllowed(state, key))
+      ? droppedOpt("tag", mappingActive ? "Sync + tag dropped (off with status mapping)" : "Sync + tag dropped", mappingActive)
+      : "";
+    const droppedNote = mappingActive && droppedTagSaved(state)
+      ? `<div class="opt-row muted" style="grid-column:1/-1">Status mapping now handles dropped shows for this pair, so tagging is off.</div>`
+      : mappingActive && hs.use_source_status
+        ? `<div class="opt-row muted" style="grid-column:1/-1">Status mapping handles the dropped status for this pair. This setting only controls the plays of dropped shows.</div>`
+        : "";
     const droppedBlock = droppedKeys.length
       ? `<div class="grid2 compact"><div class="opt-row" style="grid-column:1/-1">
           <label for="cx-hs-dropped" data-tip-id="cx-hs-dropped">Dropped shows</label>
           <select id="cx-hs-dropped" class="input small">
-            ${droppedOpt("sync", "Sync normally")}${droppedOpt("ignore", "Ignore dropped")}${droppedKeys.some(key => droppedTagAllowed(state, key)) ? droppedOpt("tag", "Sync + tag dropped") : ""}
+            ${droppedOpt("sync", "Sync normally")}${droppedOpt("ignore", "Ignore dropped")}${droppedTag}
           </select>
-        </div></div>`
+        </div>${droppedNote}</div>`
       : "";
     const hsCumulative = hasCumulativeAnimeHistory(state);
     const hsRemoveAllowed = historyRemoveAllowed(state);
@@ -1847,13 +1868,6 @@ function renderFeaturePanel(state){
         </label>
       </div>
       ${animeNote ? `<div class="muted">${animeNote}</div>` : ""}
-      ${hsSourceStatus ? `<div class="opt-row">
-        <label for="cx-hs-source-status">Use source watch status</label>
-        <label class="switch">
-          <input id="cx-hs-source-status" type="checkbox" ${hs.use_source_status ? "checked" : ""}>
-          <span class="slider"></span>
-        </label>
-      </div>` : ""}
       ${hsCumulative ? `<div class="opt-row muted" title="This provider only holds anime, so this is always on for history.">
         <label for="cx-hs-anime-only">Anime-only sync</label>
         <label class="switch">
@@ -1930,8 +1944,22 @@ left.innerHTML = `
             <span class="slider"></span>
           </label>
         </div>` : ""}
+        ${traktResetsAllowed(state) ? `<div class="opt-row" style="grid-column:1/-1">
+          <label for="cx-hs-trakt-resets" data-tip-id="cx-hs-trakt-resets">Follow Trakt rewatch resets${traktResetsNeedVip(state) ? ' <span class="muted">(needs Trakt VIP)</span>' : ""}</label>
+          <label class="switch">
+            <input id="cx-hs-trakt-resets" type="checkbox" ${hs.trakt_rewatch_resets && !traktResetsNeedVip(state) ? "checked" : ""} ${traktResetsNeedVip(state) ? 'disabled data-locked="1"' : ""}>
+            <span class="slider"></span>
+          </label>
+        </div>` : ""}
       </div>
       ${droppedBlock}
+      ${hsSourceStatus ? `<div class="opt-row">
+        <label for="cx-hs-source-status">Status mapping</label>
+        <label class="switch">
+          <input id="cx-hs-source-status" type="checkbox" ${hs.use_source_status ? "checked" : ""}>
+          <span class="slider"></span>
+        </label>
+      </div>` : ""}
       ${animeRow}`];
 
     if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex</div><div class="opt-row"><label for="plx-marked-watched">Marked Watched</label><label class="switch"><input id="plx-marked-watched" type="checkbox" ${getPairMarkedWatchedValue(state)?"checked":""}><span class="slider"></span></label></div><div class="muted">Include watched items from your Plex library, even when no playback-history entry is available. Applies only to this pair.</div>`);
@@ -2207,7 +2235,7 @@ function bindChangeHandlers(state,root){
       state.pairProviders=state.pairProviders||{};
       droppedProviders(state).forEach(key=>{
         const blk=Object.assign({},state.pairProviders[key]||{});
-        const tag=mode==="tag"&&droppedTagAllowed(state,key);
+        const tag=mode==="tag"&&droppedTagAllowed(state,key)&&!statusMappingActive(state);
         blk.history_ignore_dropped_shows=mode==="ignore";
         if(tag) blk.history_dropped_mode="tag";
         else delete blk.history_dropped_mode;
@@ -2425,6 +2453,12 @@ function bindChangeHandlers(state,root){
         update_all_copies: !!ID("cx-hs-all-copies")?.checked && allCopiesAllowed(state),
       });
       state.visited.add("history");
+    }
+
+    if (id === "cx-hs-trakt-resets") {
+      state.options.history = Object.assign({}, state.options.history || {}, {
+        trakt_rewatch_resets: !!ID("cx-hs-trakt-resets")?.checked && traktResetsAllowed(state),
+      });
     }
 
     if(id.startsWith("cx-pl-")){
@@ -2759,7 +2793,7 @@ function buildPayload(state,wrap){
   const features=sanitizeFeaturesForPair({src,dst,twoWay:modeTwo},{watchlist,ratings,history,progress,playlists:get("playlists"),collection});
   if(state.pair_remove_mode_touched) applyPairRemoveMode(features,state.pair_remove_mode);
   const payload={source:src,target:dst,source_instance:String(srcInst||"default"),target_instance:String(dstInst??"default"),enabled,mode:modeTwo?"two-way":"one-way",features};
-  payload.status_mapping=statusMappingPayload({...state,src,dst,src_instance:srcInst,dst_instance:dstInst,mode:payload.mode,twoWay:modeTwo});
+  payload.status_mapping=statusMappingPayload({...state,src,dst,src_instance:srcInst,dst_instance:dstInst,mode:payload.mode,twoWay:modeTwo,statusEnabled:!!features.history?.use_source_status});
   payload.path_matching=supportsPathMatching({src,dst})&&!!state.path_matching;
   payload.match_users=supportsMatchUsers({src,dst})&&!!state.match_users;
   payload.user_matches=payload.match_users?{...(state.user_matches||{})}:{};

@@ -2002,11 +2002,12 @@ def mdblist_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> d
     if code == 200:
         j = _json_loads(body) or {}
 
-        def _to_int(v: Any) -> int:
+        def _to_int(v: Any, default: int | None = 0) -> int | None:
             try:
-                return int(v)
+                value = int(v)
+                return value if value >= 0 and not isinstance(v, bool) else default
             except Exception:
-                return 0
+                return default
 
         limits = {"api_requests": _to_int(j.get("api_requests")), "api_requests_count": _to_int(j.get("api_requests_count"))}
         patron_status = j.get("patron_status") or None
@@ -2019,6 +2020,11 @@ def mdblist_user_info(cfg: dict[str, Any], max_age_sec: int = USERINFO_TTL) -> d
             "patron_status": patron_status,
             "username": j.get("username"),
             "user_id": j.get("user_id"),
+            "plan": str(j.get("plan") or ("supporter" if vip else "free")).strip(),
+            "daily_limit": _to_int(j.get("rate_limit"), None),
+            "daily_remaining": _to_int(j.get("rate_limit_remaining"), None),
+            "daily_resets_at": _to_int(j.get("rate_limit_reset"), None),
+            "daily_seen_at": now,
             "limits": limits,
         }
 
@@ -3203,23 +3209,17 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     "rep_instance": inst_sum.get("rep"),
                 }
             if "MDBLIST" in active_providers:
+                from providers.sync.mdblist import _auth as mdblist_auth
+
                 inst_map, inst_sum = _instances_payload("MDBLIST")
+                quota_mdbl = mdblist_auth.latest_quota((cfg_mdbl or {}).get("mdblist") or {})
+                if info_mdbl.get("daily_remaining") is not None and quota_mdbl.get("daily_seen_at", 0) < (info_mdbl.get("daily_seen_at") or 0):
+                    quota_mdbl = {}
                 providers_out["MDBLIST"] = {
                     "connected": mdbl_ok,
                     **({} if mdbl_ok else {"reason": mdbl_reason}),
-                    **(
-                        {}
-                        if not info_mdbl
-                        else {
-                            "vip": bool(info_mdbl.get("vip")),
-                            "vip_type": info_mdbl.get("vip_type"),
-                            "patron_status": info_mdbl.get("patron_status"),
-                            "limits": {
-                                "api_requests": int(((info_mdbl.get("limits") or {}).get("api_requests") or 0)),
-                                "api_requests_count": int(((info_mdbl.get("limits") or {}).get("api_requests_count") or 0)),
-                            },
-                        }
-                    ),
+                    **info_mdbl,
+                    **quota_mdbl,
                     "instances": inst_map,
                     "instances_summary": inst_sum,
                     "rep_instance": inst_sum.get("rep"),
@@ -3344,6 +3344,7 @@ def register_probes(app: FastAPI, load_config_fn: Callable[[], dict[str, Any]]) 
                     "connected": wetrakr_ok,
                     **({} if wetrakr_ok else {"reason": wetrakr_reason}),
                     **userinfo.get("WETRAKR", {}),
+                    "daily_quota_expired": False,
                     "daily_remaining": None,
                     "daily_limit": None,
                     "daily_resets_at": None,

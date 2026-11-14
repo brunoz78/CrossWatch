@@ -88,12 +88,25 @@ def test_clamped_cursor_pagination_and_native_states(server):
     assert rows["show:1"].observation.status == Status.WATCHING
     assert rows["show:2"].observation.status == Status.COMPLETED
     assert rows["show:3"].observation.state == ReadState.UNKNOWN
+    assert rows["show:3"].observation.native_status == "caught_up"
     assert any(kw.get("params", {}).get("cursor") == "2" for _, kw in server.calls)
     server.rows["/sync/dropped"] = [("shows", {"show": show(1)})]
     assert server.adapter.read()["show:1"].observation.status == Status.DROPPED
     server.rows["/watchlist/items"] = [("shows", show(1))]
     server.native[1]["watchlist"] = True
     assert server.adapter.read()["show:1"].observation.status == Status.PLANNED
+
+
+@pytest.mark.parametrize("watched,flags,native", [
+    (10, {"inprogress": True, "completed": None, "has_unwatched_aired": None}, "caught_up"),
+    (12, {"inprogress": True, "completed": None, "has_unwatched_aired": None}, "caught_up"),
+    (5, {"inprogress": True, "completed": None, "has_unwatched_aired": None}, "unknown"),
+    (5, {"inprogress": True, "completed": None, "has_unwatched_aired": True}, "watching"),
+    (10, {"inprogress": None, "completed": True, "has_unwatched_aired": None}, "completed"),
+])
+def test_null_progress_flags_read_as_not_set(server, watched, flags, native):
+    server.native[3].update(watched_episode_count=watched, **flags)
+    assert server.adapter.read()["show:3"].observation.native_status == native
 
 
 def test_drop_restore_preserves_history_dates_ratings_collection_and_progress(server):
@@ -108,7 +121,16 @@ def test_drop_restore_preserves_history_dates_ratings_collection_and_progress(se
                              ("/sync/dropped/remove", {"json": {"shows": [{"ids": {"tmdb": 1}}]}, "max_retries": 0})]
 
 
-@pytest.mark.parametrize("case", ["null_progress", "zero_history", "completed", "planned", "season", "repeat", "playback", "caught_up"])
+def test_repeated_plays_do_not_block_a_status_write(server):
+    server.rows["plays"].append(("episodes", {**server.rows["plays"][0][1], "play_id": 99}))
+    server.rows["/sync/dropped"] = [("shows", {"show": show(1)})]
+    record = server.adapter.read()["show:1"]
+    assert record.observation.rewatching is False
+    server.adapter.write(record, Status.WATCHING)
+    assert server.writes
+
+
+@pytest.mark.parametrize("case", ["null_progress", "zero_history", "completed", "planned", "season", "playback", "caught_up"])
 def test_protected_transitions_never_write(server, case):
     if case == "null_progress":
         server.native[1]["watched_episode_count"] = None
@@ -121,8 +143,6 @@ def test_protected_transitions_never_write(server, case):
         server.rows["/watchlist/items"] = [("shows", show(1))]
     elif case == "season":
         server.rows["/sync/seasons/dropped"] = [("seasons", {"show": show(1), "season": {"number": 2}, "dropped_at": "old"})]
-    elif case == "repeat":
-        server.rows["plays"].append(("episodes", {**server.rows["plays"][0][1], "play_id": 99}))
     elif case == "playback":
         server.playback = [{"type": "episode", "show": show(1), "progress": 30}]
     else:
@@ -134,13 +154,11 @@ def test_protected_transitions_never_write(server, case):
     assert not server.writes
 
 
-@pytest.mark.parametrize("case", ["missing_pagination", "empty_middle", "repeated_cursor", "repeated_page", "changed_total", "bad_row", "http", "activity", "missing_state", "duplicate_state", "watchlist_changed", "duplicate_play"])
+@pytest.mark.parametrize("case", ["missing_pagination", "empty_middle", "repeated_cursor", "repeated_page", "changed_total", "bad_row", "http", "activity", "missing_state", "duplicate_state", "duplicate_play"])
 def test_incomplete_or_inconsistent_reads_fail(server, case):
     if case in {"missing_state", "duplicate_state"}:
         server.client.post = lambda *a, **k: response({"type": "show", "provider": "tmdb", "not_found": [],
              "items": [] if case == "missing_state" else [server.native[1], server.native[1], server.native[3]]})
-    elif case == "watchlist_changed":
-        server.native[1]["watchlist"] = True
     elif case == "duplicate_play":
         server.rows["plays"].append(deepcopy(server.rows["plays"][0]))
     else:
@@ -195,8 +213,9 @@ def test_state_batches_are_complete_without_a_total_title_cap(server):
 @pytest.mark.parametrize("field,value", [("completed", "false"), ("inprogress", 1), ("watched_episode_count", -1)])
 def test_invalid_progress_is_not_coerced(server, field, value):
     server.native[1][field] = value
-    with pytest.raises(RuntimeError, match="invalid_progress"):
-        server.adapter.read()
+    rows = server.adapter.read()
+    assert _skipped(rows) == {"show:1": "mdblist_status_invalid_progress"}
+    assert rows["show:1"].observation.status is None
 
 
 def test_movie_completion_is_read_only_and_planned_stays_frozen(server):
@@ -262,3 +281,15 @@ def test_runtime_verifies_readback_and_keeps_uncertain_writes_pending(server, co
         assert run_status_mappings(ctx, [pair], cfg, {}, store=store)["updated"] == 1
         assert tracker.note("show:tmdb:1")["status"] == "watching"
         assert len(server.writes) == 1
+
+
+def _skipped(rows):
+    return {key: row.raw["_cw_skipped"] for key, row in rows.items() if isinstance(row.raw, dict) and row.raw.get("_cw_skipped")}
+
+
+def test_watchlist_change_during_read_skips_only_that_title(server):
+    server.native[1]["watchlist"] = True
+    rows = server.adapter.read()
+    assert _skipped(rows) == {"show:1": "mdblist_status_watchlist_changed"}
+    assert len(rows) > 1
+    assert not server.writes

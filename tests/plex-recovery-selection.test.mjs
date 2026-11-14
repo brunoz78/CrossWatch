@@ -8,6 +8,70 @@ import {readFileSync} from "node:fs";
 import vm from "node:vm";
 
 const source=readFileSync(new URL("../assets/js/import-export/plex-recovery.js",import.meta.url),"utf8");
+
+function matchFixture() {
+  const nodes=new Map(),handlers=new Map(),calls=[];
+  const $=id=>{
+    if(!nodes.has(id))nodes.set(id,{value:"",innerHTML:"",textContent:"",disabled:false,open:false,
+      showModal(){this.open=true;},close(){this.open=false;}});
+    return nodes.get(id);
+  };
+  const elements=Object.fromEntries(["title","tmdb","tvdb","imdb","season","episode","media_type","catalog"].map(key=>{
+    const label={hidden:false},node={value:"",required:false,closest:()=>label,dispatchEvent(){}};
+    return [key,node];
+  }));
+  $("#pr-match form").elements=elements;
+  const sandbox=vm.createContext({$,URLSearchParams,Event,editing:null,matchSequence:0,matchQuery:"",matchResults:[],
+    job:{id:"scan",revision:0},all:true,chosen:new Set(["0"]),excluded:new Set(),offset:0,
+    option:(value,label)=>`${value}:${label}`,esc:String,page:async()=>{},
+    FormData:class {constructor(form){this.form=form;}*[Symbol.iterator](){for(const [key,node] of Object.entries(this.form.elements))yield [key,node.value];}},
+    on(node,event,fn){if(!handlers.has(node))handlers.set(node,{});handlers.get(node)[event]=fn;},
+    async request(path,body){calls.push({path,body});if(path.includes("match-groups"))return {catalogs:[{id:"tmdb",label:"TMDb"}]};
+      if(path.includes("match-search"))return {results:[{title:"Miss Hokusai",type:"movie",year:2015,ids:{tmdb:"123"}}]};return {id:"scan",revision:1};}});
+  vm.runInContext(source.slice(source.indexOf("  function matchTypeChanged("),source.indexOf('  on(host,"click"')),sandbox);
+  return {sandbox,$,elements,calls,fire:(node,event,data={})=>handlers.get(node)[event](data)};
+}
+
+test("individual recovery matching selects movie IDs and submits conversion without importing",async()=>{
+  const f=matchFixture(),{sandbox:s,$,elements:e,calls}=f;
+  await s.edit({id:"0",media_type:"episode",original_title:"Sarusuberi: Miss Hokusai",season:1,episode:1,show_ids:{tmdb:"old"}});
+  assert.equal(e.season.required,true);
+  e.catalog.value="tmdb";e.media_type.value="movie";
+  f.fire(e.media_type,"change");
+  assert.equal(e.tmdb.value,"");
+  assert.equal(e.season.closest().hidden,true);
+  assert.equal(e.season.required,false);
+  await f.fire($("#pr-match-search"),"click");
+  const query=new URLSearchParams(calls[1].path.split("?")[1]);
+  assert.equal(query.get("media_type"),"movie");assert.equal(query.get("row_id"),"0");
+  f.fire($("#pr-match-results"),"click",{target:{closest:()=>({dataset:{matchResult:"0"}})}});
+  assert.equal(e.tmdb.value,"123");assert.equal(e.title.value,"Miss Hokusai");
+  await f.fire($("#pr-match form"),"submit",{submitter:{value:"save"},currentTarget:$("#pr-match form"),preventDefault(){}});
+  assert.equal(calls[2].path,"/scan/match");
+  assert.equal(calls[2].body.media_type,"movie");
+  assert.equal(calls[2].body.match_query,"Sarusuberi: Miss Hokusai");
+  assert.equal(calls[2].body.season,null);assert.equal(calls[2].body.episode,null);
+  assert.equal(s.job.revision,1);assert.equal(s.chosen.size,0);
+  assert(!calls.some(call=>call.path.includes("commit")));
+});
+
+test("changing type or closing the dialog discards in-flight recovery search results",async()=>{
+  const f=matchFixture(),{sandbox:s,$,elements:e}=f;
+  await s.edit({id:"0",media_type:"episode",original_title:"Series",season:1,episode:1});
+  e.catalog.value="tmdb";
+  let finish;
+  s.request=()=>new Promise(resolve=>{finish=resolve;});
+  const pending=f.fire($("#pr-match-search"),"click");
+  e.media_type.value="movie";f.fire(e.media_type,"change");
+  finish({results:[{title:"Old show",type:"show",ids:{tmdb:"99"}}]});await pending;
+  assert.equal($("#pr-match-results").innerHTML,"");assert.equal(s.matchQuery,"");
+  assert.equal($("#pr-match-search").disabled,false);
+  const closing=f.fire($("#pr-match-search"),"click");
+  f.fire($("#pr-match"),"close");
+  finish({results:[{title:"Old movie",type:"movie",ids:{tmdb:"99"}}]});await closing;
+  assert.equal($("#pr-match-results").innerHTML,"");assert.equal(s.matchQuery,"");
+});
+
 function fixture() {
   const nodes=new Map(),handlers={};
   const $=selector=>{
@@ -45,6 +109,31 @@ test("Select all skips title guesses; checking a guess adds only that explicit s
   assert.equal(sandbox.count(),0);
   check("2",true);
   assert.equal(sandbox.count(),0);
+});
+
+test("bulk recovery sends the chosen media type and search evidence to the recovery API",async()=>{
+  const calls=[], context={revision:4,rows:[{id:"group",item:{type:"show",title:"Miss Hokusai"}}],total:1};
+  const sandbox=vm.createContext({busy:false,controls(){},message(){},filters:()=>({q:""}),
+    job:{id:"scan",revision:4},window:{},document:{querySelector:()=>true},
+    lifetime:{signal:{aborted:false}},URLSearchParams,matchingWorkspace:null,
+    request:async(path,body)=>{calls.push({path,body});return context;},
+    mappingModule:{openMappingWorkspace(options){sandbox.workspace=options;return {};}}});
+  const code=source.slice(source.indexOf("  async function bulkMatch()"),source.indexOf("  function matchTypeChanged("))
+    .replace(/await import\(`[^`]+`\)/,"mappingModule");
+  vm.runInContext(code,sandbox);
+  await sandbox.bulkMatch();
+  assert.equal(sandbox.workspace.recovery,true);
+  await sandbox.workspace.mappingApi.search({id:"group",item:{type:"movie"}},"Miss Hokusai","tmdb",{language:"ja-JP"});
+  const query=new URLSearchParams(calls.at(-1).path.split("?")[1]);
+  assert.equal(query.get("media_type"),"movie");
+  assert.equal(query.get("group_id"),"group");
+  assert.equal(query.get("language"),"ja-JP");
+  await sandbox.workspace.mappingApi.save([{row_id:"group",item:{type:"movie",title:"Miss Hokusai",ids:{tmdb:267970}},
+    matchSearch:{catalog:"tmdb",match_query:"Miss Hokusai",language:"ja-JP"}}]);
+  assert.equal(calls.at(-1).path,"/scan/match-groups");
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.at(-1).body)),{revision:4,edits:[{group_id:"group",title:"Miss Hokusai",
+    ids:{tmdb:"267970"},media_type:"movie",catalog:"tmdb",match_query:"Miss Hokusai",language:"ja-JP"}]});
+  assert.equal(calls.some(call=>call.path.endsWith("/commit")),false);
 });
 
 test("bulk selection resets individual guesses and review-only bulk selection stays empty",async()=>{

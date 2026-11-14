@@ -85,6 +85,11 @@ def test_complete_history_and_status_precedence(server):
     assert any(path == "history" and kw["params"]["page"] == 3 for _, path, kw in server.calls)
 
 
+def test_long_show_with_rounded_zero_percent_reads_as_watching(server):
+    server.shows[1].update(watch_pct=0, season_states={"10": {"watch_pct": 4}})
+    assert server.adapter.read()["show:1"].observation.status == Status.WATCHING
+
+
 def test_native_show_ids_and_preservation_round_trip(server):
     before = server.adapter.read()["show:1"]
     server.adapter.write(before, Status.DROPPED)
@@ -113,12 +118,20 @@ def test_cancellation_during_forwarding_preflight_prevents_mutation(server):
         clear_cancel()
 
 
-@pytest.mark.parametrize("case", ["rewatch", "repeat", "forwarding", "unknown_forwarding", "playback", "playing", "planned", "completed", "numbering", "zero_history"])
+def test_repeated_plays_do_not_block_a_status_write(server):
+    server.data["history"].append({**server.data["history"][0], "id": 99})
+    server.shows[1]["dropped"] = True
+    server.data["history/dropped"]["shows"] = [{"id": 101, "tmdb_id": 1}]
+    row = server.adapter.read()["show:1"]
+    assert row.observation.rewatching is False
+    server.adapter.write(row, Status.WATCHING)
+    assert server.writes
+
+
+@pytest.mark.parametrize("case", ["rewatch", "forwarding", "unknown_forwarding", "playback", "playing", "planned", "completed", "numbering", "zero_history"])
 def test_guarded_transitions_never_write(server, case):
     if case == "rewatch":
         server.shows[1]["rewatch"] = {"started_at": "now", "watched": 0}
-    elif case == "repeat":
-        server.data["history"].append({**server.data["history"][0], "id": 99})
     elif case == "forwarding":
         server.data["auth/settings"]["trakt_push_dropped"] = True
     elif case == "unknown_forwarding":
@@ -173,16 +186,12 @@ def test_existing_unwatched_movie_can_be_dropped_without_creation(server):
         server.adapter.write(after, Status.WATCHING)
 
 
-@pytest.mark.parametrize("case", ["missing_paging", "bad_row", "empty_page", "total", "page_count", "duplicate", "list_count", "show_id", "flag", "snapshot"])
+@pytest.mark.parametrize("case", ["missing_paging", "bad_row", "empty_page", "total", "page_count", "duplicate", "list_count", "snapshot"])
 def test_incomplete_or_inconsistent_reads_fail(server, case):
     if case == "duplicate":
         server.data["history"].append(deepcopy(server.data["history"][0]))
     elif case == "list_count":
         server.data["lists/7"]["item_count"] = 1
-    elif case == "show_id":
-        server.shows[1]["tmdb_id"] = 7
-    elif case == "flag":
-        server.shows[1]["dropped"] = True
     else:
         def hook(method, path, kwargs):
             if path == "shows/1" and case == "snapshot":
@@ -242,6 +251,18 @@ def test_ratings_continuation_is_not_silently_ignored(server):
         server.adapter.read()
 
 
+def test_native_watchlist_wins_over_a_same_named_list(server):
+    server.data["lists"]["lists"] = [{"id": 4, "name": "Watchlist", "item_count": 1, "is_watchlist": False},
+                                     {"id": 7, "name": "Watchlist", "item_count": 0, "is_watchlist": True}]
+    server.data["lists/4"] = {"id": 4, "name": "Watchlist", "item_count": 1, "privacy_level": "private",
+                              "items": [{"id": 8, "media": {"id": 501, "type": "series", "tmdb_id": 1}}]}
+    assert server.adapter.read()["show:1"].observation.status == Status.WATCHING
+    for row in server.data["lists"]["lists"]:
+        row.pop("is_watchlist")
+    with pytest.raises(RuntimeError, match="ambiguous_watchlist"):
+        server.adapter.read()
+
+
 def test_empty_watchlist_is_not_created(server):
     server.data["lists"]["lists"] = []
     assert len(server.adapter.read()) == 3
@@ -287,3 +308,20 @@ def test_runtime_readback_and_pending_writes(server, config_base, tmp_path, mode
         server.data["history/dropped"]["shows"] = []
         assert run_status_mappings(ctx, [pair], cfg, {}, store=store)["updated"] == 1
         assert tracker.note("show:tmdb:1")["status"] == "watching"
+
+
+def _skipped(rows):
+    return {key: row.raw["_cw_skipped"] for key, row in rows.items() if isinstance(row.raw, dict) and row.raw.get("_cw_skipped")}
+
+
+@pytest.mark.parametrize("case,code", [("show_id", "scrob_status_invalid_show_state"), ("flag", "scrob_status_changed_show_identity")])
+def test_inconsistent_show_state_skips_only_that_show(server, case, code):
+    if case == "show_id":
+        server.shows[1]["tmdb_id"] = 7
+    else:
+        server.shows[1]["dropped"] = True
+    rows = server.adapter.read()
+    skipped = _skipped(rows)
+    assert list(skipped.values()) == [code]
+    assert len(rows) > len(skipped)
+    assert not server.writes

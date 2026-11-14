@@ -11,6 +11,8 @@ const caps = {labels:{watching:"Watching",on_hold:"On hold",dropped:"Dropped",co
 const initialPair = {id:"pair-1",source:"ANILIST",target:"MYANIMELIST",source_instance:"default",target_instance:"default",mode:"two-way",enabled:true,
   features:{watchlist:{enable:true,add:true,remove:false},history:{enable:false,add:false,remove:false,use_source_status:false}}};
 
+const labels = {ANILIST:"AniList",MYANIMELIST:"MyAnimeList",TRAKT:"Trakt",SIMKL:"SIMKL"};
+
 async function setSwitch(input, checked) {
   if (await input.isChecked() === checked) return;
   await input.focus();
@@ -33,8 +35,8 @@ async function fixture(t, theme="original", width=1280, pair=initialPair, expand
       try{return route.fulfill({body:await readFile(new URL(".."+path,import.meta.url)),contentType:path.endsWith(".css")?"text/css":path.endsWith(".svg")?"image/svg+xml":path.endsWith(".woff2")?"font/woff2":"text/javascript"});}
       catch{return route.fulfill({status:404,body:""});}
     }
-    if(path==="/api/sync/providers") return route.fulfill({json:["ANILIST","MYANIMELIST"].map(name=>({name,label:name==="ANILIST"?"AniList":"MyAnimeList",features:{history:true,watchlist:true,ratings:true},capabilities:{bidirectional:true,status_mapping:providerCaps},configured:true}))});
-    if(path==="/api/provider-instances") return route.fulfill({json:{ANILIST:[{id:"default",label:"Alice",configured:true}],MYANIMELIST:[{id:"default",label:"Bob",configured:true}]}});
+    if(path==="/api/sync/providers") return route.fulfill({json:[pair.source,pair.target].map(name=>({name,label:labels[name]||name,features:{history:true,watchlist:true,ratings:true},capabilities:{bidirectional:true,status_mapping:providerCaps},configured:true}))});
+    if(path==="/api/provider-instances") return route.fulfill({json:{[pair.source]:[{id:"default",label:"Alice",configured:true}],[pair.target]:[{id:"default",label:"Bob",configured:true}]}});
     if(path==="/api/user-profiles") return route.fulfill({json:[]});
     if(path==="/api/config") return route.fulfill({json:{anime_mapping:{enabled:true},sync:{},pairs:[pair]}});
     if(path.startsWith("/api/pairs")&&route.request().method()==="PUT") {saves.push(route.request().postDataJSON());return route.fulfill({json:{ok:true}});}
@@ -59,14 +61,15 @@ test("disabled mapping stays compact and can be configured without enabling",asy
   await page.keyboard.press("Enter");
   assert.equal(await page.locator("[data-status-direction]").isVisible(),true);
   assert.equal(await page.locator("[data-status-optin]").isChecked(),false);
-  await page.locator('[data-status-include="completed"]').check();
-  assert.equal(await page.locator('[data-status-target="completed"]').isDisabled(),false);
-  await page.locator('[data-status-target="completed"]').selectOption("dropped");
+  assert.equal(await page.locator('[data-status-include="completed"]').count(),0);
+  await page.locator('[data-status-include="watching"]').check();
+  assert.equal(await page.locator('[data-status-target="watching"]').isDisabled(),false);
+  await page.locator('[data-status-target="watching"]').selectOption("dropped");
   await setSwitch(page.locator("[data-status-optin]"),true);
   await setSwitch(page.locator("[data-status-optin]"),false);
   assert.equal(await page.locator("[data-status-direction]").isVisible(),false);
   await page.locator(".cw-status-editor>summary").click();
-  assert.equal(await page.locator('[data-status-target="completed"]').inputValue(),"dropped");
+  assert.equal(await page.locator('[data-status-target="watching"]').inputValue(),"dropped");
 });
 
 test("mobile History shortcut navigates without enabling History",async t=>{
@@ -77,7 +80,7 @@ test("mobile History shortcut navigates without enabling History",async t=>{
   assert.equal(await page.locator("#cx-hs-enable").evaluate(el=>el===document.activeElement),true);
 });
 
-test("help and overflow actions preserve existing mapping behavior",async t=>{
+test("help explains the rules and no legacy option remains",async t=>{
   const effectsCaps=structuredClone(caps);
   effectsCaps.media.shows.effects.on_hold="Provider-specific hold behavior.";
   const {page}=await fixture(t,"flat-dark",1280,initialPair,true,effectsCaps);
@@ -86,11 +89,50 @@ test("help and overflow actions preserve existing mapping behavior",async t=>{
   assert.match(await page.locator(".cw-status-info p").innerText(),/Provider-specific/);
   await page.locator(".cw-status-help>summary").click();
   assert.match(await page.locator(".cw-status-help").innerText(),/Planned stays managed by Watchlist/);
+  assert.match(await page.locator(".cw-status-help").innerText(),/Rules apply to this pair only/);
   await page.locator('[data-status-target="dropped"]').selectOption("on_hold");
-  await page.locator(".cw-status-menu>summary").click();
-  await page.getByRole("button",{name:"Use existing behavior"}).click();
+  assert.equal(await page.locator(".cw-status-menu").count(),0);
+  assert.equal(await page.getByRole("button",{name:"Use existing behavior"}).count(),0);
+});
+
+test("switching on and saving without edits stores the rules shown",async t=>{
+  const {page,saves}=await fixture(t);
+  await setSwitch(page.getByRole("checkbox",{name:"Enable status syncing"}),true);
+  await page.locator("#cx-inline-save").click();
+  await page.waitForFunction(()=>!document.querySelector("#host"));
+  const saved=saves[0].status_mapping;
+  assert.equal(saves[0].features.history.use_source_status,true);
+  assert.deepEqual(saved.a,{provider:"anilist",instance:"default"});
+  assert.deepEqual(saved.b,{provider:"myanimelist",instance:"default"});
+  assert.equal(saved.conflict,"leave_unchanged");
+  for(const dir of ["a_to_b","b_to_a"]) for(const media of ["shows","movies"]) {
+    assert.deepEqual(saved.directions[dir][media].on_hold,{include:true,target:"on_hold"});
+    assert.deepEqual(saved.directions[dir][media].dropped,{include:true,target:"dropped"});
+    assert.equal(saved.directions[dir][media].watching.include,false);
+    assert.equal(saved.directions[dir][media].completed,undefined);
+  }
+});
+
+test("a saved Completed rule is dropped when the destination cannot write Completed",async t=>{
+  const pair=structuredClone(initialPair);
+  pair.features.history.use_source_status=true;
+  pair.status_mapping={version:1,a:{provider:"anilist",instance:"default"},b:{provider:"myanimelist",instance:"default"},conflict:"leave_unchanged",
+    directions:{a_to_b:{shows:{completed:{include:true,target:"watching"},dropped:{include:true,target:"dropped"}}},b_to_a:{shows:{dropped:{include:true,target:"dropped"}}}}};
+  const {page,saves}=await fixture(t,"original",1280,pair);
+  assert.equal(await page.locator('[data-status-include="completed"]').count(),0);
+  await page.locator("#cx-inline-save").click();
+  await page.waitForFunction(()=>!document.querySelector("#host"));
+  assert.equal(saves[0].status_mapping.directions.a_to_b.shows.completed,undefined);
+  assert.deepEqual(saves[0].status_mapping.directions.a_to_b.shows.dropped,{include:true,target:"dropped"});
+});
+
+test("existing pairs switched on without rules keep their behavior until saved",async t=>{
+  const pair=structuredClone(initialPair);
+  pair.features.history.use_source_status=true;
+  const {page,saves}=await fixture(t,"original",1280,pair);
   assert.equal(await page.evaluate(()=>document.querySelector("#cx-modal").__state.statusMapping),null);
-  assert.equal(await page.locator("[data-status-optin]").isChecked(),false);
+  await page.getByRole("button",{name:"Cancel",exact:true}).click();
+  assert.equal(saves.length,0);
 });
 
 test("fixture passes script-like pair data without executing it",async t=>{
@@ -217,3 +259,22 @@ for(const theme of ["original","flat-dark","flat-light"]) {
     await page.locator(".cw-status-mapping").screenshot({path:new URL(`../.pytest_tmp_status_visual/${theme}-empty.png`,import.meta.url).pathname.replace(/^\/(\w:)/,"$1")});
   });
 }
+
+test("status mapping turns off dropped tagging and saves without the tag",async t=>{
+  const pair={id:"pair-2",source:"TRAKT",target:"SIMKL",source_instance:"default",target_instance:"default",mode:"one-way",enabled:true,
+    providers:{trakt:{history_dropped_mode:"tag"}},
+    features:{history:{enable:true,add:true,remove:false,use_source_status:true}},
+    status_mapping:{version:1,a:{provider:"trakt",instance:"default"},b:{provider:"simkl",instance:"default"},conflict:"leave_unchanged",
+      directions:{a_to_b:{shows:{dropped:{include:true,target:"dropped"}}}}}};
+  const {page,saves}=await fixture(t,"original",1280,pair,false);
+  await page.locator("#cx-tab-history").click();
+  const tag=page.locator('#cx-hs-dropped option[value="tag"]');
+  assert.equal(await tag.isDisabled(),true);
+  assert.equal(await page.locator("#cx-hs-dropped").inputValue(),"sync");
+  assert.match(await page.locator("#cx-main, .cx-main").first().textContent(),/Status mapping now handles dropped shows/);
+  await page.locator("#cx-inline-save").click();
+  await page.waitForFunction(()=>!document.querySelector("#host"));
+  assert.equal(saves.length,1);
+  assert.equal(saves[0].providers?.trakt?.history_dropped_mode,undefined);
+  assert.equal(saves[0].status_mapping.directions.a_to_b.shows.dropped.include,true);
+});

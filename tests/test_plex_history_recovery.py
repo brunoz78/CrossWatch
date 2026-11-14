@@ -78,6 +78,20 @@ def test_only_removed_history_and_rewatches_without_persistent_memo(plex, monkey
     assert plex.calls == [{"accountID":17}]
 
 
+def test_live_recovery_remembers_the_source_watch_without_using_its_title(plex):
+    entry = raw("42")
+    plex.rows = [entry]
+    original = scan(plex)[0]["recovery_source"]
+    assert original
+    entry.title = "Renamed title"
+    assert scan(plex)[0]["recovery_source"] == original
+    entry.viewedAt += 1
+    assert scan(plex)[0]["recovery_source"] != original
+    assert not recovery.source_event(17, "movie", "", None, None, entry.viewedAt)
+    assert not recovery.source_event(None, "movie", "plex://movie/42", None, None, entry.viewedAt)
+    assert not recovery.source_event("", "movie", "plex://movie/42", None, None, entry.viewedAt)
+
+
 def test_readded_identity_and_other_user_are_excluded(plex):
     plex.library = [{"type":"movie", "ratingKey":"new", "Guid":[{"id":"tmdb://2"}]}]
     wrong = raw("3"); wrong.accountID=18
@@ -298,6 +312,157 @@ def test_saving_a_match_makes_a_guess_eligible_for_bulk_import(api):
     assert not api.job.raw[1]["recovery_requires_review"]
     result=api.client.post(url+"/commit",json=dict(import_id=api.job.id,revision=1,mode="ready"))
     assert result.json()["applied"]==3
+
+
+@pytest.mark.parametrize("case", ["valid", "no_search", "wrong_type", "changed_id", "changed_catalog", "settings_changed", "stale_revision", "missing_episode"])
+def test_recovery_type_change_requires_a_current_typed_match(api, monkeypatch, case):
+    from services import interactive_sync_mapping, importer
+
+    api.cfg["tmdb"] = {"api_key": "test"}
+    url = f"/api/import/plex-recovery/{api.job.id}"
+    result_type = "movie" if case == "wrong_type" else "show"
+    monkeypatch.setattr(interactive_sync_mapping, "search_candidates", lambda *a, **kw: {
+        "results": [dict(type=result_type, title="Series", year=2015, ids={"tmdb": "99"})]})
+    if case != "no_search":
+        response = api.client.get(url + "/match-search", params=dict(revision=0, row_id="0", catalog="tmdb", q="Series", media_type="episode"))
+        assert response.status_code == 200, response.text
+    payload = dict(revision=0, row_id="0", title="Series", tmdb="99", media_type="episode", season=1, episode=2,
+                   catalog="tmdb", match_query="Series")
+    if case == "changed_id":
+        payload["tmdb"] = "100"
+    if case == "changed_catalog":
+        payload["catalog"] = "missing"
+    if case == "settings_changed":
+        api.cfg["tmdb"]["api_key"] = "changed"
+    if case == "stale_revision":
+        payload["revision"] = 1
+    if case == "missing_episode":
+        payload.pop("episode")
+    before = deepcopy(api.job.raw)
+    response = api.client.post(url + "/match", json=payload)
+    assert response.status_code == (200 if case == "valid" else 409 if case == "stale_revision" else 400), response.text
+    assert not importer._existing_keys(api.cfg, "default")["history"]
+    if case == "valid":
+        item = api.job.raw[0]["item"]
+        assert item["type"] == "episode" and item["show_ids"] == {"tmdb": "99"} and not item["ids"]
+        assert (item["season"], item["episode"]) == (1, 2)
+        assert item["watched_at"] == before[0]["item"]["watched_at"]
+        assert item["_cw_history_type_origins"]
+        assert api.job.raw[1:] == before[1:]
+    else:
+        assert api.job.raw == before and api.job.revision == 0
+
+
+@pytest.mark.parametrize("case", ["valid", "no_search", "wrong_type", "unavailable", "changed_id", "settings_changed", "stale_revision"])
+def test_group_movie_conversion_requires_a_typed_match_and_preserves_history(api, monkeypatch, case):
+    from services import importer, interactive_sync_mapping
+
+    api.cfg["tmdb"] = {"api_key": "test"}
+    for raw in api.job.raw[:2]:
+        raw.update(original_title="Miss Hokusai", recovery_requires_review=True)
+        raw["item"].update(type="episode", series_title="Miss Hokusai", show_ids={"tmdb": "267970"},
+                           ids={}, season=1, episode=1, watched=True)
+    service._shape(api.job, api.cfg)
+    url = f"/api/import/plex-recovery/{api.job.id}"
+    group = api.client.get(url + "/match-groups", params={"revision": 0}).json()["rows"][0]
+    before = deepcopy(api.job.raw)
+    calls = []
+
+    def search(cfg, route, query, **kwargs):
+        calls.append((route["item"]["type"], route["metadata_language"]))
+        return {"results": [dict(type="show" if case == "wrong_type" else route["item"]["type"],
+                                  title="Miss Hokusai", year=2015, ids={"tmdb": "267970"},
+                                  mapping_unavailable="Unavailable" if case == "unavailable" else "")]}
+
+    monkeypatch.setattr(interactive_sync_mapping, "search_candidates", search)
+    if case != "no_search":
+        for kind in ("episode", "movie", "movie"):
+            response = api.client.get(url + "/match-search", params=dict(revision=0, group_id=group["id"],
+                catalog="tmdb", q="Miss Hokusai", media_type=kind, language="ja-JP"))
+            assert response.status_code == 200, response.text
+        assert calls == [("show", "ja-JP"), ("movie", "ja-JP")]
+    edit = dict(group_id=group["id"], title="Miss Hokusai", ids={"tmdb": "267970"}, media_type="movie",
+                catalog="tmdb", match_query="Miss Hokusai", language="ja-JP")
+    if case == "changed_id":
+        edit["ids"] = {"tmdb": "99"}
+    if case == "settings_changed":
+        api.cfg["tmdb"]["api_key"] = "changed"
+    result = api.client.post(url + "/match-groups", json=dict(revision=1 if case == "stale_revision" else 0, edits=[edit]))
+    assert result.status_code == (200 if case == "valid" else 409 if case == "stale_revision" else 400), result.text
+    assert not importer._existing_keys(api.cfg, "default")["history"]
+    if case != "valid":
+        assert api.job.raw == before and api.job.revision == 0
+        return
+    for original, converted in zip(before[:2], api.job.raw[:2]):
+        item = converted["item"]
+        assert item["type"] == "movie" and item["ids"] == {"tmdb": "267970"}
+        assert item["year"] == 2015 and item["watched"] is True
+        assert item["watched_at"] == original["item"]["watched_at"]
+        assert item[service.TYPE_ORIGINS]
+        assert not {"season", "episode", "show_ids", "series_title"}.intersection(item)
+    assert api.job.raw[2:] == before[2:]
+    row = next(row for row in api.job.rows if row["item"]["ids"].get("tmdb") == "267970")
+    result = api.client.post(url + "/commit", json=dict(import_id=api.job.id, revision=1, mode="selected", row_ids=[row["id"]]))
+    assert result.status_code == 200 and result.json()["applied"] == 1, result.text
+    stored = list(importer._existing_keys(api.cfg, "default")["history"].values())
+    assert len(stored) == 1 and stored[0]["type"] == "movie"
+    assert stored[0]["watched_at"] == before[1]["item"]["watched_at"]
+    api.job.raw = before
+    service._shape(api.job, api.cfg)
+    assert next(row for row in api.job.rows if row["media_type"] == "episode")["status"] == "exists"
+
+
+@pytest.mark.parametrize("newer", ["converted_group", "matched_movie", "suggested_movie"])
+def test_collapsed_movie_keeps_all_conversion_origins_on_import_and_rescan(api, monkeypatch, newer):
+    from services import importer, interactive_sync_mapping
+
+    api.cfg["tmdb"] = {"api_key": "test"}
+    for index, raw in enumerate(api.job.raw[:2]):
+        if index == 0 or newer == "converted_group":
+            raw.update(original_title=f"Original series {index}", recovery_requires_review=True)
+            raw["item"].update(type="episode", series_title=raw["original_title"],
+                               show_ids={"tmdb": str(100 + index)}, ids={}, season=1, episode=1)
+        else:
+            raw["item"].update(title="Movie", ids={"tmdb": "267970"})
+            raw["recovery_requires_review"] = newer == "suggested_movie"
+        raw["recovery_source"] = recovery.source_event(17, raw["item"]["type"], f"plex://item/{index}", 1, 1, 1577880000 + index)
+    before = deepcopy(api.job.raw)
+    expected_origins = set().union(*(service.event_identities(raw["item"]) for raw in before[:2]
+                                    if raw["item"]["type"] == "episode"))
+    service._shape(api.job, api.cfg)
+    expected_sources = service.plex_origins({str(i): raw["item"] for i, raw in enumerate(api.job.raw[:2])})
+    url = f"/api/import/plex-recovery/{api.job.id}"
+    groups = api.client.get(url + "/match-groups", params={"revision": 0}).json()["rows"]
+    monkeypatch.setattr(interactive_sync_mapping, "search_candidates", lambda *a, **kw: {
+        "results": [dict(type="movie", title="Movie", year=2015, ids={"tmdb": "267970"})]})
+    edits = []
+    for group in groups:
+        if group["item"]["type"] != "show":
+            continue
+        result = api.client.get(url + "/match-search", params=dict(revision=0, group_id=group["id"],
+            catalog="tmdb", q="Movie", media_type="movie"))
+        assert result.status_code == 200, result.text
+        edits.append(dict(group_id=group["id"], title="Movie", ids={"tmdb": "267970"},
+                          media_type="movie", catalog="tmdb", match_query="Movie"))
+    result = api.client.post(url + "/match-groups", json=dict(revision=0, edits=edits))
+    assert result.status_code == 200, result.text
+    selected = [row for row in api.job.rows if row["item"].get("ids", {}).get("tmdb") == "267970"]
+    if newer != "suggested_movie":
+        assert len(selected) == 1
+        assert set(selected[0]["item"][service.TYPE_ORIGINS]) == expected_origins
+        assert selected[0]["item"]["watched_at"] == before[1]["item"]["watched_at"]
+    result = api.client.post(url + "/commit", json=dict(import_id=api.job.id, revision=1,
+        mode="selected", row_ids=[row["id"] for row in selected]))
+    assert result.status_code == 200 and result.json()["applied"] == 1, result.text
+    stored = list(importer._existing_keys(api.cfg, "default")["history"].values())
+    assert len(stored) == 1
+    assert set(stored[0][service.TYPE_ORIGINS]) == expected_origins
+    assert set(stored[0][service.PLEX_ORIGINS]) == expected_sources
+    assert stored[0]["watched_at"] == before[1]["item"]["watched_at"]
+    assert api.job.raw[2] == before[2]
+    api.job.raw = before
+    service._shape(api.job, api.cfg)
+    assert [row["status"] for row in api.job.rows] == ["exists", "exists", "ready"]
 
 
 def test_accept_title_matches_across_pages_without_importing(api):
@@ -704,6 +869,63 @@ def test_title_already_in_tracker_is_not_recovered_again_with_another_date(api):
     stored=importer._existing_keys(api.cfg,"default")["history"]
     assert len(stored)==1
     assert next(iter(stored.values()))["watched_at"]=="2020-01-01T12:00:00Z"
+
+
+@pytest.mark.parametrize("endpoint", ["replace", "edit-title"])
+def test_imdb_database_import_is_recognized_after_tmdb_match(api, monkeypatch, endpoint):
+    from api import trackerAPI
+    from services import importer
+
+    api.client.app.include_router(trackerAPI.router)
+    monkeypatch.setattr(trackerAPI, "load_config", lambda: api.cfg)
+    monkeypatch.setattr(trackerAPI, "_sync_running", lambda: False)
+    monkeypatch.setattr(trackerAPI, "_tmdb_provider", lambda: NS(
+        get_response=lambda *a, **kw: NS(data={"id": 949, "imdb_id": "tt0113277"})))
+    api.cfg["tmdb"] = {"api_key": "test"}
+    api.job.raw = [api.job.raw[0]]
+    api.job.raw[0]["item"].update(title="Heat", ids={"imdb": "tt0113277"})
+    service._shape(api.job, api.cfg)
+    url = f"/api/import/plex-recovery/{api.job.id}"
+    result = api.client.post(url + "/commit", json=dict(import_id=api.job.id, revision=0, mode="ready"))
+    assert result.status_code == 200, result.text
+    assert result.json()["applied"] == 1
+    stored = importer._existing_keys(api.cfg, "default")["history"]
+    response = api.client.post(f"/api/tracker/{endpoint}", json={
+        "feature": "history", "key": next(iter(stored)),
+        "item": {"type": "movie", "title": "Heat", "year": 1995, "ids": {"tmdb": "949"}},
+    })
+    assert response.status_code == 200, response.text
+    api.job.raw[0]["item"]["watched_at"] = "2025-01-01T00:00:00Z"
+    service._shape(api.job, api.cfg)
+    preview = api.client.get(url + "/rows").json()
+    assert preview["rows"][0]["status"] == "exists"
+    result = api.client.post(url + "/commit", json=dict(import_id=api.job.id, revision=1, mode="selected", row_ids=["0"]))
+    assert result.status_code == 200, result.text
+    assert result.json()["applied"] == 0
+    stored = importer._existing_keys(api.cfg, "default")["history"]
+    assert len(stored) == 1
+    assert next(iter(stored.values()))["ids"] == {"tmdb": "949", "imdb": "tt0113277"}
+
+
+@pytest.mark.parametrize("kind,episode,part,expected", [
+    ("movie", None, None, "exists"), ("movie", None, 2, "ready"),
+    ("episode", 2, None, "exists"), ("episode", 3, None, "ready"),
+    ("show", None, None, "ready"),
+])
+def test_recovery_external_id_aliases_respect_type_episode_and_part(api, monkeypatch, kind, episode, part, expected):
+    from services import importer
+
+    item = {"type": kind, "title": "Title", "ids": {"tmdb": "1", "imdb": "tt1234567"}}
+    incoming = {"type": "movie", "title": "Title", "ids": {"imdb": "tt1234567"}, "watched_at": "2020-01-01T12:00:00Z"}
+    if kind == "episode":
+        item.update(ids={}, show_ids={"tmdb": "1", "tvdb": "2"}, season=1, episode=2)
+        incoming.update(type="episode", ids={}, show_ids={"tvdb": "2"}, season=1, episode=episode)
+    if part:
+        incoming["part"] = part
+    monkeypatch.setattr(importer, "_existing_keys", lambda *a: {"history": {"stored": item}})
+    api.job.raw = [{**api.job.raw[0], "item": incoming}]
+    service._shape(api.job, api.cfg)
+    assert api.job.rows[0]["status"] == expected
 
 
 def test_explicit_guesses_for_same_title_import_only_latest_selected_date(api):

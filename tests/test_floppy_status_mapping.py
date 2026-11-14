@@ -126,28 +126,32 @@ def test_show_transitions_cannot_cascade_or_create_seasons(server, seasons, desi
     assert server.rows["media/season"] == before
 
 
-@pytest.mark.parametrize("protection", ["planned", "completed", "rewatching", "playback", "repeat_episode"])
+def test_repeated_episode_plays_do_not_block_a_status_write(server):
+    server.rows["media/episode"].append({**server.rows["media/episode"][0], "consumption_id": 23})
+    row = server.adapter.read()["tv/tmdb/2"]
+    assert row.observation.rewatching is False
+    server.adapter.write(row, Status.ON_HOLD)
+    assert server.writes
+
+
+@pytest.mark.parametrize("protection", ["planned", "completed", "rewatching", "playback"])
 def test_protected_entries_never_write(server, protection):
     if protection in {"planned", "completed"}:
         server.change(20, status=0 if protection == "planned" else 3)
     elif protection == "rewatching":
         server.rows["media/season"][0]["rewatch_started_at"] = "now"
-    elif protection == "playback":
-        server.rows["playback/progress"] = [{"media_type": "episode", "ids": {"tmdb": 2}, "position_seconds": 100}]
     else:
-        server.rows["media/episode"].append({**server.rows["media/episode"][0], "consumption_id": 23})
+        server.rows["playback/progress"] = [{"media_type": "episode", "ids": {"tmdb": 2}, "position_seconds": 100}]
     row = server.adapter.read()["tv/tmdb/2"]
     with pytest.raises(RuntimeError, match="transition_blocked"):
         server.adapter.write(row, Status.ON_HOLD)
     assert not server.writes
 
 
-@pytest.mark.parametrize("problem", ["missing_total", "empty_page", "duplicate_child", "missing_lists", "changed"])
+@pytest.mark.parametrize("problem", ["missing_total", "empty_page", "duplicate_child", "changed"])
 def test_failed_snapshots_do_not_become_empty_successes(server, problem):
     if problem == "duplicate_child":
         server.rows["media/episode"] *= 2
-    elif problem == "missing_lists":
-        server.rows["media/movie"][0].pop("lists")
     else:
         def hook(method, path, kwargs):
             if path == "media/movie" and problem == "missing_total":
@@ -229,3 +233,16 @@ def test_pair_sync_verifies_writes_and_respects_direction(server, config_base, t
     run_status_mappings(ctx, [pair], cfg, {}, store=baselines)
     assert tracker.note("movie:tmdb:1")["status"] == ("dropped" if mode == "two-way" else "on_hold")
     assert len(server.writes) == (1 if mode == "two-way" else 2)
+
+
+def _skipped(rows):
+    return {key: row.raw["_cw_skipped"] for key, row in rows.items() if isinstance(row.raw, dict) and row.raw.get("_cw_skipped")}
+
+
+def test_one_bad_title_is_skipped_and_the_rest_is_read(server):
+    server.rows["media/movie"][0].pop("lists")
+    rows = server.adapter.read()
+    skipped = _skipped(rows)
+    assert list(skipped.values()) == ["floppy_status_incomplete_lists"]
+    assert any(row.observation.state.value == "present" for key, row in rows.items() if key not in skipped)
+    assert not server.writes

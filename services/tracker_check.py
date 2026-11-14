@@ -15,7 +15,12 @@ from typing import Any, NamedTuple
 
 import requests
 
+from cw_platform.anime_mapping.history_coords import coordinate_tokens, tmdb_coordinate
+from cw_platform.anime_mapping.storage import query_edges
 from cw_platform.tracker_store import ATTENTION_CODES, TrackerStore
+
+AliasContext = tuple[str, Any]
+NO_ALIASES: AliasContext = ("", None)
 
 _LOG = logging.getLogger("crosswatch.tracker_check")
 _LOCK = threading.RLock()
@@ -197,7 +202,30 @@ def _external_tmdb(item: Mapping[str, Any], kind: str, ids: Mapping[str, Any], l
     return ""
 
 
-def classify(item: Mapping[str, Any], lookups: Lookups) -> tuple[str, dict[str, Any]] | None:
+def _anime_episode(item: Mapping[str, Any], ids: Mapping[str, Any], aliases: AliasContext) -> bool:
+    namespaces = ("mal", "anilist", "anidb", "kitsu")
+    if any(item.get(field) not in (None, "", {}, []) for field in _ANIME_FIELDS) or any(ids.get(ns) for ns in namespaces):
+        return True
+    saved_shows = {token.partition("#")[0] for token in coordinate_tokens(item)}
+    if any(f"{provider}:{str(ids.get(provider) or '').strip().lower()}" in saved_shows for provider in ("tvdb", "tmdb")):
+        return True
+    tag, cache = aliases
+    if not tag or cache is None:
+        return False
+    for provider in ("tvdb", "tmdb"):
+        ident = str(ids.get(provider) or "").strip()
+        if not ident:
+            continue
+        key = ("tracker_anime_show", provider, ident)
+        if key not in cache:
+            cache[key] = any(row.get("source_kind") == "show" and row.get("target_provider") in namespaces
+                             for row in query_edges(tag, provider, ident))
+        if cache[key]:
+            return True
+    return False
+
+
+def classify(item: Mapping[str, Any], lookups: Lookups, aliases: AliasContext = NO_ALIASES) -> tuple[str, dict[str, Any]] | None:
     typ = str(item.get("type") or "").lower()
     child = typ in ("season", "episode")
     ids = item.get("show_ids" if child else "ids")
@@ -209,6 +237,10 @@ def classify(item: Mapping[str, Any], lookups: Lookups) -> tuple[str, dict[str, 
     else:
         return "skipped", {}
     tmdb = str(ids.get("tmdb") or "").strip()
+    coordinate = tmdb_coordinate(item, aliases) if typ == "episode" else None
+    if coordinate and tmdb and tmdb != coordinate[0]:
+        coordinate = None
+    tmdb = tmdb or (coordinate[0] if coordinate else "")
     if not tmdb:
         tmdb = _external_tmdb(item, kind, ids, lookups)
         if tmdb is _FAILED:
@@ -242,9 +274,12 @@ def classify(item: Mapping[str, Any], lookups: Lookups) -> tuple[str, dict[str, 
         and stored_year is not None and detail["year"] is not None and abs(stored_year - detail["year"]) > 1
     ):
         return "mismatch", detail
-    if child and not any(item.get(field) not in (None, "", {}, []) for field in _ANIME_FIELDS):
-        season = _int(item.get("season"))
-        episode = _int(item.get("episode"))
+    order = str(item.get("_cw_episode_order") or "").strip().lower()
+    if typ == "episode" and not coordinate and order != "tmdb" and _anime_episode(item, ids, aliases):
+        return "episode_unverified", {**detail, "season": _int(item.get("season")), "episode": _int(item.get("episode"))}
+    if child:
+        season = coordinate[1] if coordinate else _int(item.get("season"))
+        episode = coordinate[2] if coordinate else _int(item.get("episode"))
         if season is not None and season >= 0:
             found_season = lookups.get(kind, tmdb, season)
             if found_season is _FAILED:
@@ -281,7 +316,8 @@ def cancel(store: TrackerStore) -> bool:
         return True
 
 
-def start(store: TrackerStore, provider: Any, *, instance: str, background: bool = True) -> dict[str, Any]:
+def start(store: TrackerStore, provider: Any, *, instance: str, background: bool = True,
+          aliases: AliasContext = NO_ALIASES) -> dict[str, Any]:
     key = str(store.db_path)
     with _LOCK:
         if key in _ACTIVE:
@@ -297,17 +333,17 @@ def start(store: TrackerStore, provider: Any, *, instance: str, background: bool
     try:
         store.save_job(JOB, job)
         if background:
-            threading.Thread(target=run, args=(store, provider, job), name="tracker-metadata-check", daemon=True).start()
+            threading.Thread(target=run, args=(store, provider, job, aliases), name="tracker-metadata-check", daemon=True).start()
     except BaseException:
         with _LOCK:
             _ACTIVE.pop(key, None)
         raise
     if not background:
-        run(store, provider, job)
+        run(store, provider, job, aliases)
     return dict(job)
 
 
-def run(store: TrackerStore, provider: Any, job: dict[str, Any]) -> None:
+def run(store: TrackerStore, provider: Any, job: dict[str, Any], aliases: AliasContext = NO_ALIASES) -> None:
     key = str(store.db_path)
     lookups = Lookups(provider)
     pending: list[tuple[str, str, str, dict[str, Any], str]] = []
@@ -322,7 +358,7 @@ def run(store: TrackerStore, provider: Any, job: dict[str, Any]) -> None:
             if key in _CANCEL:
                 state = "cancelled"
                 break
-            result = classify(data if isinstance(data, Mapping) else {}, lookups)
+            result = classify(data if isinstance(data, Mapping) else {}, lookups, aliases)
             with _LOCK:
                 if result is None:
                     job["failed"] += 1

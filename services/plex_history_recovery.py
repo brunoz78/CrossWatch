@@ -28,7 +28,8 @@ from cw_platform.access_policy import request_user, user_can_access_instance
 from cw_platform.config_base import load_config
 from cw_platform.history_events import history_epoch_from_value
 from cw_platform.id_map import canonical_key, minimal as id_minimal
-from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id
+from cw_platform.tracker_history_identity import PLEX_ORIGINS, TYPE_ORIGINS, event_identities, plex_origins, type_origins
+from cw_platform.provider_instances import build_provider_config_view, list_instance_ids, normalize_instance_id, provider_instance_uid_for
 from . import importer
 
 router = APIRouter(prefix="/api/import/plex-recovery", tags=["import"])
@@ -69,6 +70,9 @@ class Match(BaseModel):
     imdb: str = Field(default="", max_length=20)
     season: int | None = Field(default=None, ge=0, le=10000)
     episode: int | None = Field(default=None, ge=0, le=100000)
+    media_type: Literal["movie", "episode"] | None = None
+    catalog: str = Field(default="", max_length=256)
+    match_query: str = Field(default="", max_length=200)
 
 
 class AcceptTitleMatches(BaseModel):
@@ -82,6 +86,10 @@ class GroupEdit(BaseModel):
     group_id: str = Field(min_length=1, max_length=64)
     title: str = Field(min_length=1, max_length=512)
     ids: dict[str, str] = Field(max_length=12)
+    media_type: Literal["movie", "episode"] | None = None
+    catalog: str = Field(default="", max_length=256)
+    match_query: str = Field(default="", max_length=200)
+    language: str = Field(default="en-US", pattern=r"^[a-z]{2}-[A-Z]{2}$")
 
 
 class GroupMatches(BaseModel):
@@ -265,10 +273,30 @@ def _job(sid, request, cfg):
     return job
 
 
+def _history_identities(item):
+    item = id_minimal(item)
+    typ = item.get("type")
+    field = "show_ids" if typ in ("episode", "season") else "ids"
+    identities = {(typ, canonical_key(item))}
+    for namespace, value in (item.get(field) or {}).items():
+        if namespace in {"tmdb", "imdb", "tvdb"}:
+            alias = {**item, "ids": {}, field: {namespace: value}}
+            identities.add((typ, canonical_key(alias)))
+    return {identity for identity in identities if identity[1] != "unknown:"}
+
+
 def _shape(job, cfg):
+    saved = importer._existing_keys(cfg, job.target)["history"]
+    remembered = plex_origins(saved)
+    block = build_provider_config_view(cfg, "PLEX", job.source).get("plex") or {}
+    source_scope = [provider_instance_uid_for(cfg, "PLEX", job.source) or job.source,
+                    block.get("machine_id") or block.get("server_url") or block.get("baseurl") or ""]
     grouped: dict[str, list[int]] = {}
     for index, raw in enumerate(job.raw):
         item = raw["item"]
+        if raw.get("recovery_source") and not job.tautulli and not job.tracearr:
+            origin = hashlib.sha256(json.dumps([source_scope, raw["recovery_source"]]).encode()).hexdigest()
+            item[PLEX_ORIGINS] = [origin]
         if raw["recovery_valid"] and not raw.get("recovery_requires_review"):
             identity = canonical_key(id_minimal(item))
         else:
@@ -276,13 +304,27 @@ def _shape(job, cfg):
             identity = json.dumps([item.get("type"), source, raw.get("original_year"), item.get("season"), item.get("episode")])
         if item.get("type") == "episode" and (item.get("season") is None or item.get("episode") is None):
             identity = f"unresolved:{index}"
+        if not plex_origins({"item": item}).isdisjoint(remembered):
+            identity = f"remembered:{identity}"
         grouped.setdefault(identity, []).append(index)
     selected = [(max(indices, key=lambda i: history_epoch_from_value(job.raw[i]["item"].get("watched_at")) or 0), indices)
                 for indices in grouped.values()]
     rows = importer._shape_rows([job.raw[index] for index, _ in selected], cfg, job.target, "plex_recovery")
-    existing = {canonical_key(id_minimal(item)) for item in importer._existing_keys(cfg, job.target)["history"].values()}
+    corrected = type_origins(saved)
+    existing_events: dict[str, set[str]] = {}
+    for key, item in saved.items():
+        for identity in event_identities(item):
+            existing_events.setdefault(identity, set()).add(key)
+    existing = {identity for item in saved.values()
+                for identity in _history_identities(item)}
     for row, (index, indices) in zip(rows, selected):
         raw = job.raw[index]
+        origins = type_origins({str(i): job.raw[i]["item"] for i in indices})
+        if origins:
+            row["item"][TYPE_ORIGINS] = sorted(origins)
+        sources = plex_origins({str(i): job.raw[i]["item"] for i in indices})
+        if sources:
+            row["item"][PLEX_ORIGINS] = sorted(sources)
         row["id"] = str(index)
         row["recovery_row_ids"] = [str(i) for i in indices]
         row.update(recovery_match=raw["recovery_match"], original_title=raw["original_title"])
@@ -290,8 +332,21 @@ def _shape(job, cfg):
             row.update(status="missing_identity", reason="missing_identity", importable=False, default_included=False)
         elif row["status"] == "ready" and raw.get("recovery_requires_review", False):
             row.update(status="needs_review", reason="title_guess", default_included=False)
-        if raw["recovery_valid"] and canonical_key(id_minimal(raw["item"])) in existing:
+        present = not event_identities(raw["item"]).isdisjoint(existing_events) if sources else not _history_identities(raw["item"]).isdisjoint(existing)
+        if (sources and sources <= remembered) or (raw["recovery_valid"] and
+                (present or (corrected and not event_identities(raw["item"]).isdisjoint(corrected)))):
             row.update(status="exists", reason="already_exists", importable=False, default_included=False)
+        if sources - remembered and raw["recovery_valid"] and any(job.raw[i].get("recovery_manual_match") for i in indices):
+            matches = {key for identity in event_identities(raw["item"]) for key in existing_events.get(identity, ())}
+            if len(matches) == 1:
+                key = next(iter(matches))
+                origins = plex_origins({"saved": saved[key]}) | sources
+                row.update(status="ready", reason="remember_match", importable=True, default_included=True, key=key,
+                           item={**saved[key], PLEX_ORIGINS: sorted(origins)},
+                           recovery_match="Match confirmed — import to remember it on the existing watch")
+                types = type_origins({"saved": saved[key], **{str(i): job.raw[i]["item"] for i in indices}})
+                if types:
+                    row["item"][TYPE_ORIGINS] = sorted(types)
     job.rows = rows
 
 
@@ -853,13 +908,21 @@ def match_groups(sid: str, revision: int, request: Request, q: str = Query("", m
 
 
 @router.get("/{sid}/match-search")
-def match_search(sid: str, revision: int, group_id: str, catalog: str, request: Request,
-                 q: str = Query(min_length=1, max_length=200), language: str = Query("en-US", pattern=r"^[a-z]{2}-[A-Z]{2}$")):
+def match_search(sid: str, revision: int, catalog: str, request: Request, group_id: str = "",
+                 q: str = Query(min_length=1, max_length=200), language: str = Query("en-US", pattern=r"^[a-z]{2}-[A-Z]{2}$"),
+                 row_id: str = Query("", max_length=80), media_type: Literal["movie", "episode"] | None = None):
     from .interactive_sync_mapping import search_candidates
     cfg = load_config() or {}
     with LOCK:
         job = _matching_job(sid, revision, request, cfg)
-        group = next((g for g in _match_groups(job) if g["id"] == group_id), None)
+        if row_id:
+            row = next((r for r in job.rows if r["id"] == row_id), None)
+            kind = media_type or (row or {}).get("media_type")
+            group = {"item": {"type": "movie" if kind == "movie" else "show"}} if row else None
+        else:
+            group = next((g for g in _match_groups(job) if g["id"] == group_id), None)
+            if group is not None and media_type is not None:
+                group["item"]["type"] = "movie" if media_type == "movie" else "show"
         if group is None:
             raise HTTPException(404, "Unresolved movie or series not found")
         choice = _match_catalogs(cfg, request).get(catalog)
@@ -901,9 +964,35 @@ def save_group_matches(sid: str, payload: GroupMatches, request: Request):
             ids = {key: value.strip() for key, value in edit.ids.items() if key in {"tmdb", "tvdb", "imdb"} and value.strip()}
             if not edit.title.strip() or not ids or any(not re.fullmatch(r"tt\d+" if key == "imdb" else r"[1-9]\d*", value) for key, value in ids.items()):
                 raise HTTPException(400, "Enter a title and valid TMDb, TVDB or IMDb IDs.")
+            group = groups[edit.group_id]
+            kind = edit.media_type or ("episode" if group["item"]["type"] == "show" else "movie")
+            conversion = (kind == "movie") != (group["item"]["type"] == "movie")
+            selected = None
+            if conversion:
+                if kind != "movie":
+                    raise HTTPException(400, "Set season and episode numbers on an individual recovered item.")
+                choice = _match_catalogs(cfg, request).get(edit.catalog)
+                if choice is None:
+                    raise HTTPException(400, "Search and select a movie match before saving.")
+                cache_key = json.dumps([_search_fingerprint(cfg, job, choice), edit.catalog, "movie",
+                                        edit.match_query.strip().casefold(), _search_language(choice, edit.language)])
+                selected = next((candidate for candidate in job.match_cache.get(cache_key, {}).get("results", [])
+                                 if candidate.get("type") == "movie" and not candidate.get("mapping_unavailable")
+                                 and {k: str(v) for k, v in candidate.get("ids", {}).items() if k in {"tmdb", "tvdb", "imdb"}} == ids), None)
+                if selected is None:
+                    raise HTTPException(400, "Search again and select a movie match before saving.")
+            origins = sorted({origin for row_id in group["row_ids"]
+                              for origin in set(updated[int(row_id)]["item"].get(TYPE_ORIGINS) or [])
+                              | event_identities(updated[int(row_id)]["item"])}) if conversion else []
             for row_id in groups[edit.group_id]["row_ids"]:
                 raw = updated[int(row_id)]
                 item = raw["item"]
+                if selected is not None:
+                    item = {key: item[key] for key in ("watched_at", "watched") if key in item}
+                    item.update(type="movie", year=selected.get("year"))
+                    if origins:
+                        item[TYPE_ORIGINS] = origins
+                    raw["item"] = item
                 valid = True
                 if item["type"] == "episode":
                     item.update(ids={}, show_ids=dict(ids), series_title=edit.title.strip())
@@ -911,7 +1000,7 @@ def save_group_matches(sid: str, payload: GroupMatches, request: Request):
                 else:
                     item["ids"] = dict(ids)
                 item["title"] = edit.title.strip()
-                raw.update(recovery_valid=valid, recovery_requires_review=False, recovery_match="Confirmed bulk match")
+                raw.update(recovery_valid=valid, recovery_requires_review=False, recovery_manual_match=True, recovery_match="Confirmed bulk match")
             changed += groups[edit.group_id]["recovery_count"]
         candidate = replace(job, raw=updated, rows=[])
         _shape(candidate, cfg)
@@ -936,18 +1025,43 @@ def match(sid: str, payload: Match, request: Request):
         ids = {k: getattr(payload, k).strip() for k in ("tmdb", "tvdb", "imdb") if getattr(payload, k).strip()}
         if not ids or any(not re.fullmatch(r"tt\d+" if k == "imdb" else r"[1-9]\d*", value) for k, value in ids.items()):
             raise HTTPException(400, "Enter a valid TMDb, TVDB or IMDb ID.")
-        if row["media_type"] == "episode" and (payload.season is None or payload.episode is None):
+        kind = payload.media_type or row["media_type"]
+        conversion = kind != row["media_type"]
+        selected = None
+        if conversion:
+            choice = _match_catalogs(cfg, request).get(payload.catalog)
+            if choice is None:
+                raise HTTPException(400, "Search and select a match for the new media type.")
+            entity = "movie" if kind == "movie" else "show"
+            cache_key = json.dumps([_search_fingerprint(cfg, job, choice), payload.catalog, entity,
+                                    payload.match_query.strip().casefold(), _search_language(choice, "en-US")])
+            selected = next((candidate for candidate in job.match_cache.get(cache_key, {}).get("results", [])
+                             if candidate.get("type") == entity and not candidate.get("mapping_unavailable")
+                             and {k: str(v) for k, v in candidate.get("ids", {}).items() if k in {"tmdb", "tvdb", "imdb"}} == ids), None)
+            if selected is None:
+                raise HTTPException(400, "Search again and select a match for the new media type before saving.")
+        if kind == "episode" and (payload.season is None or payload.episode is None):
             raise HTTPException(400, "Enter season and episode numbers.")
+        updated = deepcopy(job.raw)
         for row_id in row["recovery_row_ids"]:
-            raw = job.raw[int(row_id)]
+            raw = updated[int(row_id)]
             item = raw["item"]
-            if item["type"] == "episode":
+            if conversion:
+                origins = sorted(set(item.get(TYPE_ORIGINS) or []) | event_identities(item))
+                item = {key: item[key] for key in ("watched_at", "watched") if key in item}
+                item.update(type=kind, year=selected.get("year") if selected else None)
+                if origins:
+                    item[TYPE_ORIGINS] = origins
+                raw["item"] = item
+            if kind == "episode":
                 item.update(show_ids=dict(ids), ids={}, series_title=payload.title.strip(), season=payload.season, episode=payload.episode)
             else:
                 item["ids"] = dict(ids)
             item["title"] = payload.title.strip()
-            raw.update(recovery_valid=True, recovery_requires_review=False, recovery_match="Manually matched")
-        _shape(job, cfg)
+            raw.update(recovery_valid=True, recovery_requires_review=False, recovery_manual_match=True, recovery_match="Manually matched")
+        candidate = replace(job, raw=updated, rows=[])
+        _shape(candidate, cfg)
+        job.raw, job.rows = candidate.raw, candidate.rows
         job.revision += 1
         return job.public()
 
@@ -1004,9 +1118,19 @@ def commit(sid: str, payload: Commit, request: Request):
             previous = titles.get(identity)
             if previous is None or (history_epoch_from_value(row["item"].get("watched_at")) or 0) > (history_epoch_from_value(previous["item"].get("watched_at")) or 0):
                 titles[identity] = row
+            if previous is not None:
+                origins = type_origins({"previous": previous["item"], "current": row["item"]})
+                if origins:
+                    winner = titles[identity]
+                    titles[identity] = {**winner, "item": {**winner["item"], TYPE_ORIGINS: sorted(origins)}}
+                sources = plex_origins({"previous": previous["item"], "current": row["item"]})
+                if sources:
+                    winner = titles[identity]
+                    titles[identity] = {**winner, "item": {**winner["item"], PLEX_ORIGINS: sorted(sources)}}
         selected = list(titles.values())
         approved = [{**r, "status": "ready"} for r in selected]
-        importer._PREVIEWS[job.id] = dict(created_at=time.time(), target_instance=job.target, rows=approved)
+        importer._PREVIEWS[job.id] = dict(created_at=time.time(), target_instance=job.target, rows=approved,
+                                        local_history_type_origins=True, local_plex_history_origins=True)
         args.update(mode="ready", row_ids=[], excluded_row_ids=[], status="all", q="")
         try:
             result = importer.api_import_commit(importer.ImportCommitRequest(**args), request=request)
