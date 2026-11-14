@@ -380,5 +380,16 @@
  "TOFATV",
  "TrackerPage",
  "{0}&kind={1}",
- "}[char]));"
+ "}[char]));",
+ "&season={0}&episode={1}",
+ "/?main=1&ui=full",
+ "/art/tmdb/tv/{0}?fallback=2&size=w780&kind={1}",
+ "/art/tmdb/{0}/{1}?fallback=2&size=w500&kind={2}{3}",
+ "/art/tmdb/{0}/{1}?kind=logo&size=w500",
+ "/art/tmdb/{0}/{1}?{2}",
+ "CROSSWATCH WRAPPED",
+ "CrossWatch Wrapped",
+ "Pocket ID",
+ "tracker?instance={0}",
+ "WRAPPED"
 ]
