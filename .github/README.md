@@ -26,7 +26,7 @@ Weboberfläche und Kommandozeile.
   </a>
 </p>
 
-<img width="1672" height="941" alt="Übersicht der CrossWatch-Weboberfläche" src="https://github.com/user-attachments/assets/06355278-8cdc-4a13-95ae-89f924fd0975" />
+<img width="1660" height="805" alt="Startseite von CrossWatch mit deutscher Oberfläche" src="https://raw.githubusercontent.com/brunoz78/CrossWatch/main/.github/crosswatch-de.png" />
 
 ## Was dieser Fork anders macht
 
