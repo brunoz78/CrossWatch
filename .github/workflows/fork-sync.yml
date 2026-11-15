@@ -194,3 +194,15 @@ jobs:
           for OLDTAG in $OLD; do
             gh release delete "$OLDTAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           done
+          # Without an API key and without a stored translation the notes stay English:
+          # report it in the translation issue (assigned to the owner, so GitHub sends a mail).
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$(python tools/release_notes.py --missing "$UPTAG")" ]; then
+            NOTE="Die Release-Notizen von $UPTAG im Release $TAG sind noch englisch (gilt auch für die Glocke in CrossWatch). Erledigen: in einer Claude-Sitzung «CrossWatch übersetzen» sagen; die Übersetzung kommt nach \`release-notes/de/$UPTAG.md\` und ins Release."
+            OPEN=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "Übersetzung in:title" --json number -q '.[0].number')
+            if [ -n "$OPEN" ]; then
+              gh issue comment "$OPEN" --repo "$GITHUB_REPOSITORY" --body "$NOTE" || true
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "Übersetzung: Release-Notizen $UPTAG" \
+                --assignee "${{ github.repository_owner }}" --body "$NOTE" || true
+            fi
+          fi

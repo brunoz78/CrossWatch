@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Write German release notes for a fork release.
 
-Takes the release notes of the merged original release and the fork commits, and
-translates the original notes with the Claude API when ANTHROPIC_API_KEY is set.
-Without a key the original notes are kept in English. Used by the weekly sync workflow.
+Takes the release notes of the merged original release and the fork commits. The
+German part comes from release-notes/de/<version>.md when that file exists (hand
+translations, kept for rebuilds of the same version), otherwise from the Claude API
+when ANTHROPIC_API_KEY is set. Without either the original notes are kept in English.
+Used by the weekly sync workflow.
 
 Usage:
     python tools/release_notes.py v0.14.2 upstream.md fork.txt > notes.md
+    python tools/release_notes.py --missing v0.14.2   # prints "yes" without a German text
 """
 from __future__ import annotations
 
@@ -15,6 +18,13 @@ import sys
 from pathlib import Path
 
 MODEL = "claude-opus-5-5"
+STORE = Path(__file__).resolve().parents[1] / "release-notes" / "de"
+
+
+def stored(tag: str) -> str:
+    """Hand-made German notes for a version, starting with its own "## Neu in …" headings."""
+    p = STORE / f"{tag}.md"
+    return p.read_text(encoding="utf-8").strip() if p.exists() else ""
 
 SYSTEM = """You translate the release notes of CrossWatch, a self-hosted tool that syncs watch
 history, watchlists, ratings and playback progress between Plex, Jellyfin, Emby, Trakt and
@@ -53,15 +63,21 @@ def translate(text: str) -> str:
 
 
 def main() -> int:
-    tag, upstream_file, fork_file = sys.argv[1:4]
     sys.stdout.reconfigure(encoding="utf-8")
+    if sys.argv[1] == "--missing":
+        print("" if stored(sys.argv[2]) else "yes")
+        return 0
+    tag, upstream_file, fork_file = sys.argv[1:4]
     upstream = Path(upstream_file).read_text(encoding="utf-8").strip()
     if upstream.startswith("# "):  # the own "# CrossWatch vX" title, replaced by our heading
         upstream = upstream.partition("\n")[2].strip()
     fork = [line for line in Path(fork_file).read_text(encoding="utf-8").splitlines() if line.strip()]
 
     body, heading = upstream, f"## Neu in CrossWatch {tag} (englisch)"
-    if upstream and os.environ.get("ANTHROPIC_API_KEY"):
+    if stored(tag):
+        # the stored text carries its own headings, e.g. for 0.14.4 and 0.14.3
+        body, heading = stored(tag), ""
+    elif upstream and os.environ.get("ANTHROPIC_API_KEY"):
         try:
             body, heading = translate(upstream), f"## Neu in CrossWatch {tag}"
         except Exception as exc:  # keep the English notes rather than fail the release
@@ -73,8 +89,9 @@ def main() -> int:
     print("**Aktualisieren:** Glocke in CrossWatch → «Jetzt aktualisieren», oder `update` in der Konsole des Containers.")
     if body:
         print()
-        print(heading)
-        print()
+        if heading:
+            print(heading)
+            print()
         print(body)
     if fork:
         print()
