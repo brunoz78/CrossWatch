@@ -84,7 +84,11 @@ def test_playlists_modals_cover_create_edit_delete_flows():
     assert "can only use letters, numbers, spaces" in js
     assert "maxlength=\"${PLAYLIST_NAME_MAX}\"" in js
     assert 'id="pl-ep-type"' not in js
-    assert "await API.resourceCreate({ provider, instance, name: createName, media_type: mediaType })" in js
+    assert "await API.resourceCreate({ provider, instance, name: createName, media_type: mediaType, ...privacy })" in js
+    assert 'id="pl-ep-create-privacy"' in js and 'id="pl-wz-new-privacy"' in js
+    assert "function createPrivacyOptions(provider, endpointType)" in js
+    assert "resourceUpdate: (provider, instance, id, changes)" in js and "API.resourceUpdate(provider, instance, playlistId, changes)" in js
+    assert 'id="pl-ep-edit-privacy"' in js and "function editPanelChanges(root)" in js and "Keep current" in js
     assert "create: true, create_name: createName, media_type: createType" in js
     assert 'placeholder="Enter endpoint name"' in js
     assert 'placeholder="Enter mapping name"' in js
@@ -188,11 +192,12 @@ def test_playlists_initial_load_uses_page_shell_and_section_skeletons():
 def test_playlists_provider_banner():
     js = (REPO / "assets" / "js" / "playlists.js").read_text(encoding="utf-8")
     assert "PLAYLIST_COMPATIBLE_PROVIDERS" in js
-    assert '["PLEX", "TRAKT", "MDBLIST", "JELLYFIN", "EMBY", "PUBLICMETADB", "SIMKL", "TMDB", "FLICKLIST", "SILO", "CROSSWATCH"]' in js
+    assert '["PLEX", "TRAKT", "MDBLIST", "JELLYFIN", "EMBY", "PUBLICMETADB", "SIMKL", "TMDB", "FLICKLIST", "SILO", "TOFA", "CROSSWATCH"]' in js
     assert "Playlists need at least one compatible provider" in js
-    assert "Plex, Trakt, MDBList, Jellyfin, Emby, Silo, PublicMetaDB, SIMKL, TMDb, FlickList or CrossWatch" in js
+    assert "Plex, Trakt, MDBList, Jellyfin, Emby, Silo, PublicMetaDB, SIMKL, TMDb, FlickList, Tofa or CrossWatch" in js
     assert "Playlists are highly experimental and cause issues" not in js
-    assert "SIMKL custom lists are read only and need SIMKL PRO or VIP" in js
+    assert "SIMKL custom lists need SIMKL PRO or VIP" in js
+    assert "read only and need SIMKL PRO" not in js
     assert "pl-ep-simkl-warning" in js
     assert "pl-map-simkl-warning" in js
     assert "data-action=\"open-connections\"" in js

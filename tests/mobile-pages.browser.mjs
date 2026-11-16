@@ -227,14 +227,14 @@ for(const theme of ["original","flat-dark","flat-light"]) {
     await row.locator("[data-trk-pick]").check();
     await screenshot(page, `${theme}-tracker-selected`);
     for (const view of ["shows", "titles", "watchlist", "ratings", "progress", "collection"]) {
-      await page.locator("#trk-mobile-view").selectOption(view);
-      await page.waitForFunction(value => document.querySelector("#trk-mobile-view")?.value === value && document.querySelector('.trk-cover-grid,.trk-table'), view);
+      await page.locator(`.trk-tabs [data-trk-view="${view}"]`).click();
+      await page.waitForFunction(value => document.querySelector('.trk-tabs [aria-selected="true"]')?.dataset.trkView === value && document.querySelector('.trk-cover-grid,.trk-table'), view);
       if (!await page.locator(".trk-table").isVisible()) await page.locator('[data-trk-layout="list"]').click();
       await page.locator(".trk-list-art").first().waitFor();
       await noOverflow(page);
       await screenshot(page, `${theme}-tracker-${view}`);
     }
-    await page.locator("#trk-mobile-view").selectOption("history");
+    await page.locator('.trk-tabs [data-trk-view="history"]').click();
     await page.locator('[data-trk-action="by-day"]').click();
     await page.locator(".trk-timeline .trk-list-art").first().waitFor();
     await noOverflow(page);
@@ -278,17 +278,17 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           await page.locator('#cw-kind').selectOption('watchlist');
           await page.locator('#cw-empty').waitFor();
         } else if(kind==="tracker") {
-          assert.equal(await page.locator('#trk-mobile-view').isVisible(),true);
-          assert.equal(await page.locator('#trk-mobile-view option[value="overview"]').count(),1);
-          assert.equal(await page.locator('.trk-tabs').isVisible(),false);
+          assert.equal(await page.locator('.trk-navigation').isVisible(),true);
+          assert.equal(await page.locator('.trk-tabs [data-trk-view="overview"]').count(),1);
+          assert.equal(await page.locator('.trk-tabs').isVisible(),true);
           await page.locator('.trk-play .cw-merged-title').first().tap();
           await page.locator('.trk-sheet').waitFor();
           await page.locator('.trk-sheet .trk-detail').waitFor();
           await noOverflow(page);
           await screenshot(page,`${theme}-${kind}-${width}-dialog`);
           await page.locator('.trk-sheet [data-trk-sheet="close"]').first().tap();
-          await page.locator('#trk-mobile-view').selectOption('collection');
-          await page.waitForFunction(()=>document.querySelector('#trk-mobile-view')?.value==='collection'&&document.querySelector('.trk-list'));
+          await page.locator('.trk-tabs [data-trk-view="collection"]').click();
+          await page.waitForFunction(()=>document.querySelector('.trk-tabs [aria-selected="true"]')?.dataset.trkView==='collection'&&document.querySelector('.trk-list'));
           assert(requests.some(url=>url.startsWith('/api/tracker/items?')&&url.includes('feature=collection')));
           await page.locator('[data-trk-layout="grid"]').tap();
           await page.locator('.trk-cover-grid').waitFor();
@@ -298,10 +298,12 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           assert.equal(await page.locator('[data-trk-slot="selection-bar"]').isVisible(),true);
           await noOverflow(page);
           state.empty=true;
-          await page.locator('#trk-mobile-view').selectOption('watchlist');
+          await page.locator('.trk-tabs [data-trk-view="watchlist"]').click();
           await page.waitForFunction(()=>!document.querySelector('.trk-list tbody tr'));
-          assert.equal(await page.locator('#trk-mobile-view').inputValue(),'watchlist');
+          assert.equal(await page.locator('.trk-tabs [aria-selected="true"]').getAttribute('data-trk-view'),'watchlist');
         } else if(kind==="events") {
+          assert.equal(await page.locator('#ev-cat').isVisible(),false);
+          assert.equal(await page.locator('#ev-mode').isVisible(),false);
           const time=page.locator('.ev-row .ev-time').first();
           assert.equal(await time.isVisible(),true);
           assert.ok((await time.textContent()).trim().length>3);
@@ -311,11 +313,14 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           assert.equal(await page.locator('#ev-prev-top').isDisabled(),true);
           await page.locator('#ev-more').tap();
           assert.equal(await page.locator('#ev-morefilters').isVisible(),true);
+          assert.equal(await page.locator('#ev-cat').isVisible(),false);
+          assert.equal(await page.locator('#ev-mode').isVisible(),true);
           await noOverflow(page);
           await page.locator('#ev-more').tap();
           await page.locator('.ev-row .ev-line').nth(1).tap();
           await page.locator('#ev-detail-back').waitFor();
           assert.equal(await page.locator('.ev-col-list').isVisible(),false);
+          assert.equal(await page.locator('.ev-toolbar').isVisible(),false);
           await noOverflow(page);
           await screenshot(page,`${theme}-${kind}-${width}-detail`);
           await page.locator('#ev-detail-back').tap();
@@ -331,6 +336,12 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           await page.locator('#ev-refresh').tap();
           await page.waitForFunction(()=>!document.querySelector('.ev-row'));
         } else {
+          assert.equal(await page.locator('#an-feature').isVisible(),false);
+          await page.locator('#an-mobile-filters').tap();
+          assert.equal(await page.locator('#an-feature').isVisible(),true);
+          await page.locator('#an-feature').selectOption('history');
+          await page.locator('#an-mobile-filters').tap();
+          assert.equal(await page.locator('#an-feature').inputValue(),'history');
           assert.equal(await page.locator('#an-mobile-view').isVisible(),true);
           assert.equal(await page.locator('#an-detail').isVisible(),false);
           assert.equal(await page.locator('.an-tabs').isVisible(),false);
@@ -342,6 +353,7 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           await row.tap();
           await page.locator('#an-detail').waitFor();
           assert.equal(await page.locator('.an-list-column').isVisible(),false);
+          assert.equal(await page.locator('.an-toolbar').isVisible(),false);
           assert.equal(await page.locator('#an-close-detail').isVisible(),true);
           await noOverflow(page);
           await screenshot(page,`${theme}-${kind}-${width}-detail`);
@@ -376,9 +388,11 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           await page.locator('.trk-others summary').click();
           await page.locator('.trk-others [data-trk-view="collection"]').click();
         }
-        assert.equal(await page.locator('#trk-mobile-view').inputValue(),'collection');
+        assert.equal(await page.locator('.trk-tabs [aria-selected="true"]').getAttribute('data-trk-view'),'collection');
       }
       if(kind==='analyzer') {
+        assert.equal(await page.locator('#an-mobile-filters').isVisible(),false);
+        assert.equal(await page.locator('#an-feature').isVisible(),true);
         assert.equal(await page.locator('#an-mobile-view').isVisible(),false);
         assert.equal(await page.locator('.an-tabs').isVisible(),true);
         assert.equal(await page.locator('#an-detail').isVisible(),true);

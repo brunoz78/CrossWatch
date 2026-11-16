@@ -86,8 +86,9 @@
   const OVERVIEW_CACHE_TTL_MS = 10 * 60 * 1000;
   const profileCacheKey = (name) => {
     const shell = $(".cw-profile-shell");
-    const id = shell?.dataset?.profileId || shell?.dataset?.username || document.documentElement?.dataset?.cwProfileId || "self";
-    return `cw.profile.${id}${viewAsState.id ? `.as-${viewAsState.id}` : ""}.${name}.v1`;
+    const auth = window.CW?.AuthState?.read?.();
+    const scope = JSON.stringify([auth?.user?.id || auth?.user?.username || shell?.dataset?.username, auth?.role || document.documentElement.dataset.cwRole, auth?.permissions, auth?.profileId || shell?.dataset?.profileId, viewAsState.id, window.CW?.OverviewProfile?.filter]);
+    return `cw.profile.${scope}.${name}.v2`;
   };
   const readCache = (key, ttl = OVERVIEW_CACHE_TTL_MS) => {
     try {
@@ -100,14 +101,6 @@
   };
   const writeCache = (key, payload) => {
     try { localStorage.setItem(key, JSON.stringify({ t: Date.now(), payload })); } catch {}
-  };
-  const readAnyCache = (key) => {
-    try {
-      const entry = JSON.parse(localStorage.getItem(key) || "null");
-      return entry && entry.payload ? entry.payload : null;
-    } catch {
-      return null;
-    }
   };
   const profileRouteSegment = (value) => {
     try {
@@ -155,7 +148,7 @@
     const label = String(providerLabel(raw) || "").trim();
     return (!label || label === "?" || /^unknown$/i.test(label) || /^none$/i.test(label)) ? "" : label;
   };
-  const providerIconHtml = (provider) => {
+  const providerIconHtml = (provider, options = {}) => {
     const label = visibleProviderLabel(provider);
     if (!label) return "";
     const key = providerKey(provider).toLowerCase().replace(/[^a-z0-9-]+/g, "");
@@ -164,7 +157,7 @@
       ? `<img class="cw-profile-provider-logo" src="${esc(logo)}" alt="" loading="lazy" onerror="this.onerror=null;this.hidden=true;this.nextElementSibling.hidden=false">`
       : "";
     const fallbackHidden = logo ? " hidden" : "";
-    return `<span class="cw-profile-provider-badge cw-profile-provider-badge--icon" data-provider="${esc(key)}" title="${esc(label)}" aria-label="${esc(label)}">${icon}<span class="cw-profile-provider-fallback"${fallbackHidden}>${esc(label.slice(0, 2))}</span></span>`;
+    return `<span class="cw-profile-provider-badge cw-profile-provider-badge--icon" data-provider="${esc(key)}" title="${esc(options.title || label)}" aria-label="${esc(options.title || label)}">${icon}<span class="cw-profile-provider-fallback"${fallbackHidden}>${esc(label.slice(0, 2))}</span></span>`;
   };
   const providerName = (value) => {
     if (!value) return "";
@@ -264,11 +257,6 @@
     const locale = encodeURIComponent(window.__CW_LOCALE || navigator.language || "en-US");
     return `/art/tmdb/${kind}/${encodeURIComponent(String(id))}?fallback=2&kind=backdrop&size=${encodeURIComponent(size)}&locale=${locale}${watchlistArtEvidence(item)}`;
   };
-  const watchlistWidgetArt = (item, size = "w300") => {
-    const preview = window.CW?.WatchlistPreview;
-    const cover = preview?.artUrl?.(item, "w342") || "/assets/img/placeholder_poster.svg?v=2";
-    return preview?.gridArtUrl?.(item, size) || cover;
-  };
   const heroBackdrop = (item) => tmdbBackdrop(item) || backdrop(item);
   const relTime = (value) => {
     let ts = Number(value || 0);
@@ -321,9 +309,9 @@
   const skelLines = `<span class="cw-profile-skel-lines"><span class="cw-skel-line cw-skel-line--title"></span><span class="cw-skel-line cw-skel-line--meta"></span></span>`;
   const skelShapes = {
     progress: `<div class="cw-cw-card cw-dash-skeleton cw-dash-skeleton-row cw-profile-skel" aria-hidden="true"><span class="cw-cw-art cw-skel-block"></span>${skelLines}</div>`,
-    watchlist: `<div class="cw-profile-row cw-dash-skeleton cw-dash-skeleton-row cw-profile-skel" aria-hidden="true"><span class="cw-skel-block"></span>${skelLines}<span class="cw-profile-skel-pill cw-skel-dot"></span></div>`,
-    stats: `<div class="cw-profile-stat cw-dash-skeleton cw-dash-skeleton-row cw-profile-skel" aria-hidden="true"><span class="cw-profile-skel-icon cw-skel-block"></span>${skelLines}</div>`,
-    activity: `<div class="cw-profile-activity-row cw-dash-skeleton cw-dash-skeleton-row cw-profile-skel" aria-hidden="true"><span class="material-symbols-rounded cw-skel-block"></span>${skelLines}<small class="cw-skel-line cw-skel-line--meta"></small></div>`,
+    watchlist: `<div class="cw-hub-poster cw-dash-skeleton cw-profile-skel" aria-hidden="true"><span class="cw-hub-poster-art cw-skel-block"></span>${skelLines}</div>`,
+    stats: `<div class="cw-hub-stat cw-dash-skeleton cw-profile-skel" aria-hidden="true">${skelLines}</div>`,
+    activity: `<div class="cw-profile-activity-row cw-dash-skeleton cw-dash-skeleton-row cw-profile-skel" aria-hidden="true">${skelLines}<small class="cw-skel-line cw-skel-line--meta"></small></div>`,
     collection: `<div class="cw-collection-skel cw-dash-skeleton cw-profile-skel" aria-hidden="true"><span class="cw-collection-skel-art cw-skel-block"></span>${skelLines}</div>`,
     collectionRow: `<div class="cw-collection-skel cw-collection-skel--row cw-dash-skeleton cw-profile-skel" aria-hidden="true"><span class="cw-collection-skel-art cw-skel-block"></span>${skelLines}</div>`,
     historyCard: `<div class="cw-hist-skel cw-dash-skeleton cw-profile-skel" aria-hidden="true"><span class="cw-hist-skel-art cw-skel-block"></span>${skelLines}</div>`,
@@ -331,14 +319,14 @@
   const skeleton = (kind, count) => Array.from({ length: count }, () => skelShapes[kind]).join("");
 
   function paintOverviewSkeletons() {
-    const hosts = [["#profile-progress", "progress", 3], ["#profile-watchlist", "watchlist", 3], ["#profile-activity", "activity", 4], ["#profile-quick-stats", "stats", 6]];
+    const hosts = [["#profile-progress", "progress", mobilePaging.matches ? 3 : 4], ["#profile-watchlist", "watchlist", 4], ["#profile-activity", "activity", 4], ["#profile-quick-stats", "stats", 6]];
     for (const [sel, kind, count] of hosts) {
       const host = $(sel);
       if (host) host.innerHTML = skeleton(kind, count);
     }
   }
 
-  const ACTIVITY_LIMIT = 5;
+  const ACTIVITY_LIMIT = 4;
   const activityLabel = (row) => {
     const kind = String(row?.kind || "").toLowerCase();
     if (kind === "scheduler") return "Scheduler";
@@ -346,16 +334,6 @@
     if (kind === "watcher") return "Watcher";
     if (kind === "playlist") return "Playlist";
     return "Sync";
-  };
-  const activityIcon = (row) => {
-    const icon = String(row?.icon || "").trim();
-    if (icon) return icon;
-    const kind = String(row?.kind || "").toLowerCase();
-    if (kind === "scheduler") return "event_available";
-    if (kind === "webhook") return "rss_feed";
-    if (kind === "watcher") return "sensors";
-    if (kind === "playlist") return "playlist_play";
-    return "sync";
   };
   const activityTone = (row) => {
     const sev = String(row?.severity || "").toLowerCase();
@@ -379,6 +357,10 @@
       progress: String(row?.progress || match?.[4] || "").trim(),
     };
   };
+  const activityFeature = (row) => {
+    const feature = String(row?.feature || String(row?.summary || row?.meta || "").match(/\(([^)]+)\)\s*$/)?.[1] || "").trim();
+    return feature ? feature[0].toUpperCase() + feature.slice(1).toLowerCase() : "";
+  };
   const activityTitle = (row) => {
     const title = String(row?.title || row?.summary || "").trim();
     if (isScrobbleActivity(row)) {
@@ -386,11 +368,8 @@
       return parsed.title || title || `${activityLabel(row)} activity`;
     }
     if (String(row?.kind || "").toLowerCase() === "sync") {
-      const status = String(row?.status || "").toLowerCase();
-      if (status === "failed") return "Sync failed";
-      if (status === "warning") return "Sync completed with issues";
-      if (status === "running") return "Sync running";
-      if (/^sync run completed$/i.test(title)) return "Sync completed";
+      const feature = activityFeature(row);
+      return feature ? `${feature} sync` : "Sync";
     }
     return title || `${activityLabel(row)} activity`;
   };
@@ -409,9 +388,8 @@
     }).filter(Boolean);
   };
   const routeSegmentHtml = (segment) => {
-    const compact = segment.dests.length > 1;
     const arrow = `<span class="material-symbols-rounded cw-profile-activity-route-arrow" aria-hidden="true">${segment.both ? "sync_alt" : "chevron_right"}</span>`;
-    const dests = segment.dests.map((dest) => activityProviderChip(dest, compact) || esc(dest)).join("");
+    const dests = segment.dests.map((dest) => activityProviderChip(dest) || `<span>${esc(dest)}</span>`).join("");
     const more = segment.more ? `<span>+${segment.more}</span>` : "";
     return `${activityProviderChip(segment.src) || esc(segment.src)}${arrow}${dests}${more}`;
   };
@@ -421,13 +399,11 @@
     const summary = String(row?.summary || row?.meta || "").trim();
     const segments = summaryRouteSegments(summary);
     if (segments.length) {
-      const feature = summary.match(/\(([^)]+)\)\s*$/);
-      return [...segments.map((segment) => ({ html: routeSegmentHtml(segment) })), ...(feature?.[1] ? [feature[1]] : [])];
+      return segments.map((segment) => ({ html: routeSegmentHtml(segment) }));
     }
     const pairMatch = summary.match(/(\d+\s+pairs?)(?:\s*\(([^)]+)\))?/i);
     if (route) parts.push(route);
     if (pairMatch?.[1]) parts.push(pairMatch[1]);
-    if (pairMatch?.[2]) parts.push(pairMatch[2]);
     return parts;
   };
   const scrobbleActivityBits = (row) => {
@@ -443,13 +419,13 @@
     const key = providerKey(value);
     return key && window.CW?.ProviderMeta?.get?.(key) ? key : "";
   };
-  const activityProviderChip = (value, iconOnly = false) => {
+  const activityProviderChip = (value) => {
     const key = activityProviderKey(value);
     if (!key) return "";
     const label = visibleProviderLabel(key) || key;
     const logo = providerLogLogo(key);
     const src = logo ? `<img src="${esc(logo)}" alt="" loading="lazy" onerror="this.onerror=null;this.hidden=true">` : "";
-    const text = iconOnly && src ? "" : `<span>${esc(label)}</span>`;
+    const text = `<span>${esc(label)}</span>`;
     return `<span class="cw-profile-activity-provider" data-provider="${esc(key.toLowerCase())}" title="${esc(label)}">${src}${text}</span>`;
   };
   const activityRouteChip = (value) => {
@@ -459,12 +435,11 @@
     if (nodes.length < 2) return "";
     return nodes.map((node, index) => `${index ? `<span class="material-symbols-rounded cw-profile-activity-route-arrow" aria-hidden="true">chevron_right</span>` : ""}${node}`).join("");
   };
-  const activityChipHtml = (bit, index) => {
-    if (bit && typeof bit === "object") return `<span class="cw-profile-activity-chip${index === 0 ? " is-primary" : ""} has-route">${bit.html}</span>`;
+  const activityChipHtml = (bit) => {
+    if (bit && typeof bit === "object") return `<span class="cw-profile-activity-chip">${bit.html}</span>`;
     const route = activityRouteChip(bit);
     const provider = !route ? activityProviderChip(bit) : "";
-    const cls = `cw-profile-activity-chip${index === 0 ? " is-primary" : ""}${route ? " has-route" : ""}${provider ? " has-provider" : ""}`;
-    return `<span class="${cls}">${route || provider || esc(bit)}</span>`;
+    return `<span class="cw-profile-activity-chip">${route || provider || esc(bit)}</span>`;
   };
   const activityMetaBits = (row) => {
     if (String(row?.kind || "").toLowerCase() === "sync") return syncActivityBits(row);
@@ -487,54 +462,35 @@
     for (const [name, seconds] of units) if (delta >= seconds) return `in ${Math.floor(delta / seconds)}${name}`;
     return "in less than 1m";
   };
-  const schedulerActivityRow = (status) => {
+  const schedulerActivityHtml = (status) => {
     const eff = status?.effective || {};
     const enabled = !!eff.enabled || !!status?.running;
     if (!enabled) return null;
-    const mode = String(eff.mode || status?.effective_mode || "").replace(/_/g, " ").trim();
     const next = Number(status?.next_run_at || 0);
-    const last = Number(status?.last_run_at || 0);
-    const tick = Number(status?.last_tick || 0);
-    const bits = [];
-    if (mode && mode !== "disabled") bits.push(mode);
-    if (next > 0) bits.push(`next ${futureTime(next) || profileDateTime.format(new Date(next * 1000), { dateStyle: "short", timeStyle: "short" })}`);
-    return {
-      id: "scheduler-status",
-      kind: "scheduler",
-      icon: "event_available",
-      badge: "Scheduler",
-      title: status?.running ? "Scheduler running" : "Scheduler active",
-      meta: bits.join(" - "),
-      status: status?.running ? "running" : "completed",
-      severity: status?.last_error ? "warning" : "info",
-      created_at: last || tick || Math.floor(Date.now() / 1000),
-      event_count: 0,
-    };
+    const label = status?.last_error ? "Scheduler needs attention" : "Automatic sync";
+    const nextLabel = next > Date.now() / 1000 ? `Next sync ${futureTime(next)}` : next > 0 ? "Next sync due" : "Waiting for the next run";
+    return `<div class="cw-profile-activity-schedule${status?.last_error ? " is-warn" : ""}"><span>${esc(label)}</span><span>${esc(nextLabel)}</span></div>`;
   };
   const profileActivityRow = (row) => {
     const tone = activityTone(row);
-    const badge = String(row?.badge || activityLabel(row)).trim();
+    const badge = activityLabel(row);
     const bits = activityMetaBits(row);
     const time = relTime(row?.created_at);
     const events = activityEventCount(row);
     const detail = bits.length
       ? bits.map(activityChipHtml).join("")
       : `<span class="cw-profile-activity-chip">${esc(badge)}</span>`;
-    const side = [
-      `<span>${esc(time || badge)}</span>`,
-      events ? `<span class="cw-profile-activity-count">${esc(events)}</span>` : "",
-    ].filter(Boolean).join("");
+    const status = tone === "bad" ? "Failed" : tone === "warn" ? "Needs attention" : tone === "live" ? "In progress" : ({completed:"Completed",skipped:"Skipped",stopped:"Stopped"}[String(row?.status || "").toLowerCase()] || "");
     return `
       <button class="cw-profile-activity-row cw-profile-activity-row--${esc(String(row?.kind || "sync").toLowerCase())} is-${esc(tone)}" type="button" data-event-group-id="${esc(row?.id || "")}" data-event-domain="${esc(String(row?.domain || "sync").toLowerCase())}">
-        <span class="material-symbols-rounded" aria-hidden="true">${esc(activityIcon(row))}</span>
         <span class="cw-profile-activity-copy">
           <span class="cw-profile-activity-top">
-            <span class="cw-profile-activity-badge">${esc(badge)}</span>
             <strong>${esc(activityTitle(row))}</strong>
+            ${status && !isScrobbleActivity(row) ? `<span class="cw-profile-activity-status">${esc(status)}</span>` : ""}
           </span>
-          <span class="cw-profile-activity-meta">${detail}</span>
+          <span class="cw-profile-activity-meta">${detail}${events ? `<span class="cw-profile-activity-count">${esc(events)}</span>` : ""}</span>
         </span>
-        <small>${side}</small>
+        <small>${esc(time || badge)}</small>
       </button>
     `;
   };
@@ -550,8 +506,16 @@
   async function loadProfileActivity({ preserve = false } = {}) {
     const host = $("#profile-activity");
     if (!host) return;
-    if (!preserve || !host.children.length) host.innerHTML = skeleton("activity", 4);
     await waitForOverviewProfile();
+    const cacheKey = profileCacheKey(mobilePaging.matches ? "activity.mobile" : "activity");
+    const cached = readCache(cacheKey);
+    const render = payload => {
+      const rows = (payload.items || []).slice().sort((a, b) => Number(b?.created_at || 0) - Number(a?.created_at || 0));
+      const html = (rows.length ? rows.slice(0, mobilePaging.matches ? 3 : ACTIVITY_LIMIT).map(profileActivityRow).join("") : empty("No recent activity yet.")) + (schedulerActivityHtml(payload.scheduler) || "");
+      if (host.innerHTML !== html) host.innerHTML = html;
+    };
+    if (cached) render(cached);
+    else if (!preserve || !host.children.length) host.innerHTML = skeleton("activity", 4);
     const params = new URLSearchParams({ limit: String(mobilePaging.matches ? 3 : ACTIVITY_LIMIT), visibility: "all" });
     const userProfile = String(window.CW?.OverviewProfile?.id || "").trim();
     if (userProfile) params.set("user_profile", userProfile);
@@ -561,11 +525,13 @@
       api(`/api/events/feed?${params.toString()}`),
       includeSchedulerStatus ? api("/api/scheduling/status") : Promise.resolve(null),
     ]);
-    const rows = feedRes.status === "fulfilled" && Array.isArray(feedRes.value?.items) ? feedRes.value.items.slice() : [];
-    const schedulerRow = schedulerRes.status === "fulfilled" ? schedulerActivityRow(schedulerRes.value) : null;
-    if (schedulerRow && !rows.some((row) => String(row?.kind || "") === "scheduler")) rows.push(schedulerRow);
-    rows.sort((a, b) => Number(b?.created_at || 0) - Number(a?.created_at || 0));
-    host.innerHTML = rows.length ? rows.slice(0, mobilePaging.matches ? 3 : ACTIVITY_LIMIT).map(profileActivityRow).join("") : empty("No recent activity yet.");
+    if (cacheKey !== profileCacheKey(mobilePaging.matches ? "activity.mobile" : "activity")) return;
+    const next = {
+      items: feedRes.status === "fulfilled" ? feedRes.value?.items || [] : cached?.items || [],
+      scheduler: schedulerRes.status === "fulfilled" ? schedulerRes.value : cached?.scheduler,
+    };
+    render(next);
+    if (feedRes.status === "fulfilled") writeCache(cacheKey, next);
   }
 
   function wireProfileActivity() {
@@ -597,7 +563,7 @@
 
   function setAvatar(url) {
     const normalized = window.CW?.AccountMenu?.normalizeAvatarUrl?.(url) || String(url || "").trim();
-    const nodes = [viewingAs() ? null : $("#profile-avatar-button"), viewingAs() ? null : $("#cw-nav-profile-avatar"), $("#profile-settings-avatar")].filter(Boolean);
+    const nodes = [$("#profile-hero-avatar"), viewingAs() ? null : $("#cw-nav-profile-avatar"), $("#profile-settings-avatar")].filter(Boolean);
     for (const node of nodes) {
       if (window.CW?.AccountMenu?.setAvatarNode) {
         window.CW.AccountMenu.setAvatarNode(node, normalized);
@@ -712,7 +678,7 @@
     profileDateTime.configure(profile.preferences);
     const display = String(profile.display_name || profile.label || profile.username || "Profile");
     const viewed = viewingAs();
-    $("#profile-display-name").textContent = viewed ? (viewAsState.label || viewAsState.id) : display;
+    $("#profile-display-name").textContent = display;
     $("#profile-username").textContent = viewed ? `Opened by @${profile.username || ""}` : `@${profile.username || ""}`;
     $("#profile-role").textContent = viewed ? "Profile" : (profile.is_admin ? "Administrator" : "Managed User");
     $("#profile-display-input").value = display;
@@ -738,20 +704,10 @@
     host.classList.remove("hidden");
   }
 
-  function daysTracked(user) {
-    const ts = Number(user?.created_at || 0);
-    if (!Number.isFinite(ts) || ts <= 0) return 0;
-    return Math.max(0, Math.floor((Date.now() / 1000 - ts) / 86400));
-  }
-
-  function renderHeroChips({ itemsWatched, services }) {
+  function renderHeroChips({ services }) {
     const host = $("#profile-hero-chips");
     if (!host) return;
-    const chips = [];
-    const days = viewingAs() ? 0 : daysTracked(profile);
-    if (days > 0) chips.push(["calendar_month", numberFmt.format(days), "Days tracked"]);
-    chips.push(["visibility", numberFmt.format(itemsWatched || 0), "Items watched"]);
-    chips.push(["hub", numberFmt.format(services || 0), "Services connected"]);
+    const chips = [["hub", numberFmt.format(services || 0), "services"]];
     host.innerHTML = chips.map(([icon, value, label]) => `
       <div class="cw-profile-chip">
         <span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>
@@ -894,16 +850,50 @@
     }
   }
 
-  function progressPct(item) {
-    const raw = Number(item?.progress_percent ?? item?.progress ?? item?.percent);
-    if (!Number.isFinite(raw) || raw <= 0) return 0;
-    return Math.max(0, Math.min(100, raw));
-  }
+  const progressOf = (item) => {
+    const live = Number(item?.live_progress_percent);
+    const raw = item?.live_progress_percent != null && Number.isFinite(live) ? live : (item?.progress_percent ?? item?.progress ?? item?.percent);
+    const value = Number(raw);
+    return raw == null || !Number.isFinite(value) ? null : Math.max(0, Math.min(100, value));
+  };
+  const remainingOf = (item) => {
+    const live = Number(item?.live_remaining_seconds);
+    const seconds = item?.live_remaining_seconds != null && Number.isFinite(live) ? live : Number(item?.remaining_seconds ?? (Number(item?.remaining_minutes) * 60));
+    if (!Number.isFinite(seconds) || seconds <= 0) return "";
+    const minutes = Math.round(seconds / 60);
+    return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m left` : `${minutes}m left`;
+  };
+  const liveState = (item) => String(item?.live_state || "").toLowerCase();
+  const pausedEpoch = (item) => {
+    const live = Number(item?.live_updated);
+    return Number.isFinite(live) && live > 0 ? live : epochOf(item?.paused_at || item?.updated_at || item?.progress_at || item?.sort_epoch);
+  };
+  const pausedLabel = (item) => {
+    const live = liveState(item);
+    if (live === "playing") return "Playing now";
+    if (live === "buffering") return "Buffering now";
+    const epoch = pausedEpoch(item);
+    return epoch ? `Paused ${relTime(epoch)}` : "";
+  };
 
+  const liveRouteProviders = (item) => {
+    const refs = new Map();
+    for (const route of Array.isArray(item?.live_routes) ? item.live_routes : []) {
+      for (const side of ["source", "destination"]) {
+        const provider = providerKey(route?.[side]);
+        if (!provider) continue;
+        const instance = String(route[`${side}_instance`] || "default");
+        const label = String(route[`${side}_label`] || (instance === "default" ? "Default" : instance));
+        const method = route.kind === "webhook" ? "webhook" : "watcher";
+        refs.set(`${provider}:${instance}`, { provider, instance, title: `${visibleProviderLabel(provider)} · ${label}: active ${method} route` });
+      }
+    }
+    return [...refs.values()];
+  };
   const progressProviders = (item) => {
     const out = [];
     const push = (value) => {
-      const name = providerName(value);
+      const name = providerKey(providerName(value));
       if (!name || name.toLowerCase() === "combined" || out.includes(name)) return;
       out.push(name);
     };
@@ -913,26 +903,29 @@
       push(item?.provider);
       push(item?.source);
     }
+    for (const ref of liveRouteProviders(item)) push(ref);
     return out;
   };
 
   function progressCard(item) {
     const key = storePosterItem(item);
-    const pct = progressPct(item);
+    const pct = progressOf(item) ?? 0;
     const art = watchlistPreviewArt(item) || poster(item, "w780");
     const episode = episodeOf(item);
-    const sub = episode || yearOf(item) || "";
-    const episodeBadge = episode ? `<span class="cw-cw-episode">${esc(episode)}</span>` : "";
-    const providerIcons = progressProviders(item).map(providerIconHtml).filter(Boolean).join("");
+    const sub = [episode || yearOf(item), `${Math.round(pct)}% watched`].filter(Boolean).join(" · ");
+    const remainingLabel = remainingOf(item);
+    const routes = liveRouteProviders(item);
+    const providerIcons = progressProviders(item).map((provider) => providerIconHtml(provider, {
+      title: routes.filter((ref) => ref.provider === provider).map((ref) => ref.title).join("\n"),
+    })).filter(Boolean).join("");
     const providerStrip = providerIcons ? `<span class="cw-cw-providers">${providerIcons}</span>` : "";
     return `<button class="cw-cw-card" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(titleOf(item))}">
-      <span class="cw-cw-art">${episodeBadge}${providerStrip}<img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'"></span>
-      <span class="cw-cw-title">${esc(titleOf(item))}</span>
-      <span class="cw-cw-sub">${esc(sub)}</span>
-      <span class="cw-cw-foot">
-        <span class="cw-cw-track"><i style="width:${pct}%"></i></span>
-        <span class="cw-cw-pct">${pct ? `${Math.round(pct)}%` : ""}</span>
+      <span class="cw-cw-art"><img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'">
+        ${remainingLabel ? `<span class="cw-cw-remaining">${esc(remainingLabel)}</span>` : ""}
+        <span class="cw-cw-copy"><span class="cw-cw-title">${esc(titleOf(item))}</span><span class="cw-cw-sub">${esc(sub)}</span></span>
       </span>
+      <span class="cw-cw-foot">${providerStrip}<span>${esc(pausedLabel(item))}</span></span>
+      <span class="cw-cw-track" role="progressbar" aria-label="Watch progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></span>
     </button>`;
   }
 
@@ -944,58 +937,21 @@
     return episodeOf(item) ? "Show" : "Movie";
   }
 
-  function addedEpoch(item) {
-    for (const key of ["added_epoch", "added_at", "added", "created_at", "ts"]) {
-      const raw = Number(item?.[key]);
-      if (Number.isFinite(raw) && raw > 0) return raw > 1e12 ? Math.round(raw / 1000) : raw;
-    }
-    for (const key of ["added_when", "added_at", "added", "created_at"]) {
-      const raw = item?.[key];
-      if (typeof raw === "string" && raw.trim()) {
-        const parsed = Date.parse(raw);
-        if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-      }
-    }
-    return 0;
-  }
-
-  function syncedEpoch(item, fallbackEpoch = 0) {
-    for (const key of ["synced_epoch", "synced_at", "updated_epoch", "updated_at", "last_synced", "last_sync_epoch"]) {
-      const raw = Number(item?.[key]);
-      if (Number.isFinite(raw) && raw > 0) return raw > 1e12 ? Math.round(raw / 1000) : raw;
-    }
-    for (const key of ["synced_at", "updated_at", "last_synced"]) {
-      const raw = item?.[key];
-      if (typeof raw === "string" && raw.trim()) {
-        const parsed = Date.parse(raw);
-        if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-      }
-    }
-    const fallback = Number(fallbackEpoch || 0);
-    return Number.isFinite(fallback) && fallback > 0 ? (fallback > 1e12 ? Math.round(fallback / 1000) : fallback) : 0;
-  }
-
-  function watchlistRow(item, fallbackSyncEpoch = 0) {
+  function watchlistCard(item) {
     const key = storePosterItem(item);
-    const kind = mediaKindLabel(item);
-    const year = yearOf(item);
-    const when = addedEpoch(item);
-    const syncedWhen = syncedEpoch(item, fallbackSyncEpoch);
-    const meta = [kind, year, when ? `updated ${relTime(when)}` : ""].filter(Boolean).join(" - ");
-    const art = watchlistWidgetArt(item);
-    const synced = item?.synced === false || item?.is_synced === false ? "" : `<span class="cw-profile-watchlist-status">Synced</span>`;
-    const syncBadge = syncedWhen ? `<span class="cw-profile-watchlist-sync">${esc(relTime(syncedWhen))}</span>` : "";
-    return `<button class="cw-profile-row cw-profile-click-row" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(titleOf(item))}">
-      <span class="cw-profile-watchlist-art">${syncBadge}<img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'"></span>
-      <div class="cw-profile-watchlist-copy"><strong>${esc(titleOf(item))}</strong><span>${esc(meta)}</span></div>
-      ${synced}
+    const meta = [yearOf(item), mediaKindLabel(item)].filter(Boolean).join(" \u00b7 ");
+    const art = poster(item, "w342");
+    const providers = progressProviders(item).map(providerIconHtml).filter(Boolean).join("");
+    return `<button class="cw-hub-poster" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(titleOf(item))}">
+      <span class="cw-hub-poster-art"><img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'"></span>
+      <span class="cw-hub-poster-title">${esc(titleOf(item))}</span>
+      <span class="cw-hub-poster-meta">${esc(meta)}</span>
+      <span class="cw-hub-providers">${providers}</span>
     </button>`;
   }
 
   const watchedEpoch = (item) => {
-    const raw = Number(item?.ts || item?.sort_epoch || item?.last_watched_at || item?.watched_at || 0);
-    if (!Number.isFinite(raw) || raw <= 0) return 0;
-    return raw > 100000000000 ? Math.floor(raw / 1000) : raw;
+    return epochOf(item?.ts || item?.sort_epoch || item?.last_watched_at || item?.watched_at || 0);
   };
 
   const newestItem = (rows) => {
@@ -1028,8 +984,56 @@
     });
   }
 
+  let heroLastItem = null;
+  let heroLiveItem = null;
+  let heroMediaRequest = 0;
+
+  function renderHeroMedia() {
+    const item = heroLiveItem || heroLastItem;
+    const host = $("#profile-hero-media");
+    if (!host) return;
+    const request = ++heroMediaRequest;
+    const title = item ? titleOf(item) : "Everything you watch, across your providers";
+    const label = host.querySelector("strong");
+    const logo = host.querySelector("img");
+    label.textContent = title;
+    const key = host.dataset.profilePosterKey;
+    if (item && key) posterItems.set(key, overlayItem(item));
+    else host.dataset.profilePosterKey = item ? storePosterItem(item) : "";
+    host.setAttribute("aria-label", item ? `Show details for ${title}` : title);
+    host.setAttribute("role", item ? "button" : "group");
+    host.tabIndex = item ? 0 : -1;
+    bindLastWatchedPreview(host);
+    const id = item ? tmdbId(item) : "";
+    const show = item && (mediaType(item) || isEpisodeItem(item));
+    const url = id ? `/art/tmdb/${show ? "tv" : "movie"}/${encodeURIComponent(id)}?kind=logo&size=w500` : "";
+    if (logo.dataset.url !== url) {
+      logo.dataset.url = url;
+      logo.hidden = true;
+      label.hidden = false;
+      logo.alt = title;
+      logo.onload = () => { if (logo.dataset.url === url) { logo.hidden = false; label.hidden = true; } };
+      logo.onerror = () => { logo.hidden = true; label.hidden = false; };
+      if (url) logo.src = url;
+      else logo.removeAttribute("src");
+    }
+    const descriptor = item && id ? {...item, type:show ? "show" : "movie", tmdb:id, ids:{...item.ids, tmdb:id}} : null;
+    const apply = meta => {
+      if (request !== heroMediaRequest) return;
+      $("#profile-hero-summary").textContent = item ? [meta?.year || yearOf(item), show ? "TV Series" : "Movie", episodeOf(item)].filter(Boolean).join(" · ") : "";
+      const seasons = Number(meta?.detail?.number_of_seasons || 0);
+      const runtime = Number(meta?.runtime_minutes || 0);
+      const extra = item ? [show ? seasons ? `${seasons} ${seasons === 1 ? "season" : "seasons"}` : "" : runtime ? `${runtime} min` : "", show ? meta?.detail?.status : "", ...(Array.isArray(meta?.genres) ? meta.genres.slice(0, 2) : [])].filter(Boolean).join(" · ") : "";
+      $("#profile-hero-extra").textContent = extra ? ` · ${extra}` : "";
+    };
+    apply(descriptor ? window.CW?.Meta?.peek?.(descriptor) : null);
+    if (descriptor) void window.CW?.Meta?.get?.(descriptor, "detail", {seriesInfo:true})?.then(apply).catch(() => {});
+  }
+
   function renderHero(scrobbleItems, historyItems) {
-    const item = newestItem(scrobbleItems) || newestItem(historyItems);
+    const item = newestItem([...(scrobbleItems || []), ...(historyItems || [])]);
+    heroLastItem = item;
+    renderHeroMedia();
     const hero = $("#profile-hero");
     const last = $(".cw-profile-last");
     const art = item ? heroBackdrop(item) : "";
@@ -1051,16 +1055,11 @@
       last.setAttribute("aria-label", `Show details for ${titleOf(item)}`);
       bindLastWatchedPreview(last);
     }
-    const lastPoster = $("#profile-last-poster");
-    if (lastPoster) {
-      lastPoster.onerror = () => {
-        lastPoster.onerror = null;
-        lastPoster.src = "/assets/img/placeholder_poster.svg?v=2";
-      };
-      lastPoster.src = poster(item, "w185");
-    }
     $("#profile-last-title").textContent = titleOf(item);
-    $("#profile-last-meta").textContent = [episodeOf(item) || yearOf(item), relTime(watchedEpoch(item))].filter(Boolean).join(" - ");
+    $("#profile-last-meta").textContent = [episodeOf(item), relTime(watchedEpoch(item))].filter(Boolean).join(" · ");
+  }
+
+  function renderNowRoute(item) {
     const route = providerRoute(item);
     const sourceHtml = providerIconHtml(route.source);
     const sinkHtml = route.sinks.map(providerIconHtml).filter(Boolean).join("");
@@ -1068,7 +1067,7 @@
       ? `<span class="cw-profile-provider-sep material-symbols-rounded" aria-hidden="true">chevron_right</span>`
       : "";
     const badges = `${sourceHtml}${sep}${sinkHtml}`;
-    const providerNode = $("#profile-last-provider");
+    const providerNode = $("#profile-now-provider");
     if (providerNode) {
       providerNode.innerHTML = badges;
       providerNode.hidden = !badges;
@@ -1090,25 +1089,34 @@
     const panel = $("#profile-now");
     if (!hero || !layer || !panel) return;
     const item = nowPlayingItem(payload);
+    heroLiveItem = item;
+    renderHeroMedia();
     if (!item) {
       hero.classList.remove("is-playing");
       layer.style.backgroundImage = "";
       const posterNode = $("#profile-now-poster");
-      if (posterNode) posterNode.src = "/assets/img/placeholder_poster.svg?v=2";
+      if (posterNode?.dataset.url) {
+        delete posterNode.dataset.url;
+        posterNode.onerror = null;
+        posterNode.src = "/assets/img/placeholder_poster.svg?v=2";
+      }
       panel.classList.add("hidden");
       return;
     }
     const art = heroBackdrop(item);
     layer.style.backgroundImage = art ? `url("${String(art).replace(/"/g, "%22")}")` : "";
     const posterNode = $("#profile-now-poster");
-    if (posterNode) {
+    const posterUrl = poster(item, "w185");
+    if (posterNode && posterNode.dataset.url !== posterUrl) {
+      posterNode.dataset.url = posterUrl;
       posterNode.onerror = () => {
         posterNode.onerror = null;
         posterNode.src = "/assets/img/placeholder_poster.svg?v=2";
       };
-      posterNode.src = poster(item, "w185");
+      posterNode.src = posterUrl;
     }
     $("#profile-now-title").textContent = titleOf(item);
+    renderNowRoute(item);
     $("#profile-now-meta").textContent = [
       visibleProviderLabel(providerOf(item)),
       episodeOf(item) || yearOf(item),
@@ -1123,12 +1131,16 @@
     hero.classList.add("is-playing");
   }
 
-  async function refreshNowPlaying() {
-    try {
-      renderNowPlaying(await api("/api/watch/currently_watching"));
-    } catch {
-      renderNowPlaying(null);
+  let nowPlayingRequest = null;
+
+  function refreshNowPlaying() {
+    if (!nowPlayingRequest) {
+      nowPlayingRequest = api("/api/watch/currently_watching")
+        .then(renderNowPlaying)
+        .catch(() => renderNowPlaying(null))
+        .finally(() => { nowPlayingRequest = null; });
     }
+    return nowPlayingRequest;
   }
 
   function statType(item) {
@@ -1177,58 +1189,116 @@
     const fallbackHours = scrobble.reduce((sum, item) => sum + durationMinutes(item), 0) / 60;
     const hours = Number(widgets?.recent_scrobble?.scrobble_hours ?? fallbackHours) || 0;
     const values = [
-      ["movies", "movie", "theaters", "Movies", numberFmt.format(movies), "Total movies in your syncs"],
-      ["tv", "tv", "live_tv", "TV Shows", numberFmt.format(shows), "Total TV shows in your syncs"],
-      ["anime", "animation", "auto_awesome", "Anime", numberFmt.format(anime), "Total anime in your syncs"],
-      ["collections", "inventory_2", "video_library", "Collections", numberFmt.format(owned), "Movies and shows you own"],
-      ["watchlist", "bookmark", "format_list_bulleted", "Watchlist Items", numberFmt.format(watchlist), "Items on your watchlist"],
-      ["hours", "schedule", "show_chart", "Hours Watched", hours ? `${numberFmt.format(Math.round(hours * 10) / 10)} h` : "0 h", "Total time spent watching"],
+      ["movies", "Movies", numberFmt.format(movies), "Total movies in your syncs"],
+      ["tv", "TV shows", numberFmt.format(shows), "Total TV shows in your syncs"],
+      ["anime", "Anime", numberFmt.format(anime), "Total anime in your syncs"],
+      ["collections", "Collections", numberFmt.format(owned), "Movies and shows you own"],
+      ["watchlist", "Watchlist", numberFmt.format(watchlist), "Items on your watchlist"],
+      ["hours", "Hours watched", hours ? numberFmt.format(Math.round(hours * 10) / 10) : "0", "Total time spent watching"],
     ];
-    $("#profile-quick-stats").innerHTML = values.map(([key, icon, backdropIcon, label, value, description]) => `
-      <div class="cw-profile-stat cw-profile-stat--${esc(key)}" data-stat="${esc(key)}" data-stat-bg="${esc(backdropIcon)}">
-        <span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>
-        <div class="cw-profile-stat-copy"><small>${esc(label)}</small><strong>${esc(value)}</strong><span>${esc(description)}</span></div>
+    $("#profile-quick-stats").innerHTML = values.map(([key, label, value, description]) => `
+      <div class="cw-hub-stat" data-stat="${esc(key)}" title="${esc(description)}">
+        <strong>${esc(value)}</strong><span>${esc(label)}</span>
       </div>`).join("");
   }
 
+  function patchOverviewNode(current, next) {
+    if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) { current.replaceWith(next); return; }
+    if (current.nodeType === Node.TEXT_NODE) {
+      if (current.textContent !== next.textContent) current.textContent = next.textContent;
+      return;
+    }
+    if (current.nodeType !== Node.ELEMENT_NODE) return;
+    for (const attr of [...current.attributes]) if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+    for (const attr of next.attributes) if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+    const oldChildren = [...current.childNodes], newChildren = [...next.childNodes];
+    for (let index = 0; index < Math.max(oldChildren.length, newChildren.length); index++) {
+      if (!newChildren[index]) oldChildren[index].remove();
+      else if (!oldChildren[index]) current.append(newChildren[index]);
+      else patchOverviewNode(oldChildren[index], newChildren[index]);
+    }
+  }
+
+  function renderOverviewCards(host, items, card, message) {
+    const existing = new Map([...host.children].map(node => [node.dataset.overviewKey, node]));
+    const seen = new Map();
+    const keep = new Set();
+    for (const [index, item] of items.entries()) {
+      const identity = JSON.stringify([item.key || item.id || tmdbId(item) || titleOf(item), mediaKindLabel(item), episodeOf(item)]);
+      const occurrence = seen.get(identity) || 0;
+      seen.set(identity, occurrence + 1);
+      const key = `${identity}:${occurrence}`;
+      const template = document.createElement("template");
+      template.innerHTML = card(item);
+      const next = template.content.firstElementChild;
+      next.dataset.overviewKey = key;
+      const current = existing.get(key);
+      if (current) {
+        const generatedKey = next.dataset.profilePosterKey, retainedKey = current.dataset.profilePosterKey;
+        posterItems.set(retainedKey, posterItems.get(generatedKey));
+        posterItems.delete(generatedKey);
+        next.dataset.profilePosterKey = retainedKey;
+        patchOverviewNode(current, next);
+      }
+      const node = current || next;
+      keep.add(node);
+      if (host.children[index] !== node) host.insertBefore(node, host.children[index] || null);
+    }
+    for (const node of [...host.children]) if (!keep.has(node)) { posterItems.delete(node.dataset.profilePosterKey); node.remove(); }
+    if (!items.length) {
+      const html = empty(message);
+      if (host.innerHTML !== html) host.innerHTML = html;
+    }
+  }
+
   function renderProgressItems(progressItems) {
-    $("#profile-progress").innerHTML = progressItems.length ? progressItems.slice(0, mobilePaging.matches ? 3 : 9).map(progressCard).join("") : empty("No recent progress yet.");
+    renderOverviewCards($("#profile-progress"), progressItems.slice(0, mobilePaging.matches ? 3 : 4), progressCard, "No recent progress yet.");
   }
 
   let overviewPayload = null;
   let overviewPagingDirty = false;
+  let overviewRequest = 0;
+  let overviewHeroSignature = "";
 
   function renderOverview(payload = {}) {
     overviewPayload = payload;
     prunePosterItems();
     const widgets = payload.widgets || {};
     const wall = payload.wall || { items: [] };
-    const progress = payload.progress || { items: [] };
+    const progress = payload.progress;
     const insights = payload.insights || null;
     const status = payload.status || null;
     const collection = payload.collection || null;
     const history = widgets?.recent_history?.items || [];
-    const ratings = widgets?.latest_ratings?.items || [];
     const scrobble = widgets?.recent_scrobble?.items || [];
     const widgetProgress = widgets?.recent_progress?.items || [];
-    const progressItems = progress?.items?.length ? progress.items : widgetProgress;
-    const scrobbleTotal = Number(widgets?.recent_scrobble?.scrobble_total ?? widgets?.recent_scrobble?.total ?? scrobble.length) || 0;
-    renderHero(scrobble, history);
+    const progressItems = Array.isArray(progress?.items) ? progress.items : widgetProgress;
+    const heroSignature = JSON.stringify([scrobble, history]);
+    if (payload.widgets && overviewHeroSignature !== heroSignature) { overviewHeroSignature = heroSignature; renderHero(scrobble, history); }
     renderQuickStats({ wall, widgets, progressItems, insights, collection });
     const watchlistItems = Array.isArray(wall?.items) ? wall.items : [];
     renderHeroChips({
-      itemsWatched: scrobbleTotal,
       services: connectedServices(status),
     });
-    renderProgressItems(progressItems);
-    $("#profile-watchlist").innerHTML = watchlistItems.length ? watchlistItems.slice(0, 3).map((item) => watchlistRow(item, wall?.last_sync_epoch)).join("") : empty("No watchlist items yet.");
+    if (payload.progress || payload.widgets) renderProgressItems(progressItems);
+    if (payload.wall) renderOverviewCards($("#profile-watchlist"), watchlistItems.slice(0, 4), watchlistCard, "No watchlist items yet.");
   }
 
   async function loadOverview() {
+    const request = ++overviewRequest;
     const cacheKey = profileCacheKey(mobilePaging.matches ? "overview.mobile" : "overview");
-    const cached = readCache(cacheKey) || readAnyCache(cacheKey);
+    const cached = readCache(cacheKey);
     if (cached) renderOverview(cached);
     else paintOverviewSkeletons();
+    const next = { ...cached };
+    const current = () => request === overviewRequest && cacheKey === profileCacheKey(mobilePaging.matches ? "overview.mobile" : "overview");
+    const update = (key, value) => {
+      if (!current()) return;
+      next[key] = value;
+      renderOverview(next);
+      writeCache(cacheKey, next);
+    };
+    void refreshNowPlaying();
     const widgetParams = new URLSearchParams({
       include: "history,ratings,scrobble,progress",
       history_limit: mobilePaging.matches ? "3" : "8",
@@ -1238,46 +1308,17 @@
     });
     if (cached?.widgets?.version) widgetParams.set("known_version", cached.widgets.version);
 
-    const [widgetsRes, wallRes, insightsRes, statusRes, collectionRes] = await Promise.allSettled([
-      api(`/api/dashboard/widgets?${widgetParams.toString()}`),
-      api(`/api/state/wall?limit=${mobilePaging.matches ? 3 : 8}`),
-      api("/api/insights?limit_samples=0&history=0&runtime=0&include_events=0"),
-      api("/api/status"),
-      api("/api/profile/collection?page=1&page_size=1"),
+    await Promise.allSettled([
+      api(`/api/dashboard/widgets?${widgetParams.toString()}`).then(value => {
+        if (!value?.not_modified) update("widgets", value);
+      }),
+      api(`/api/state/wall?limit=${mobilePaging.matches ? 4 : 8}`).then(value => update("wall", value)),
+      api("/api/insights?limit_samples=0&history=0&runtime=0&include_events=0").then(value => update("insights", value)),
+      api("/api/status").then(value => update("status", value)),
+      api("/api/profile/collection?page=1&page_size=1").then(value => update("collection", {counts:value?.counts || {}, total:Number(value?.total) || 0})),
+      api(`/api/playback_progress/items?page=1&page_size=${mobilePaging.matches ? 3 : 8}`).then(value => update("progress", value || {items:[]})),
     ]);
-    const widgetsNotModified = widgetsRes.status === "fulfilled" && widgetsRes.value?.not_modified && cached?.widgets;
-    const widgets = widgetsRes.status === "fulfilled"
-      ? (widgetsNotModified ? (cached?.widgets || {}) : widgetsRes.value)
-      : (cached?.widgets || {});
-    const next = {
-      widgets,
-      wall: wallRes.status === "fulfilled" ? wallRes.value : (cached?.wall || { items: [] }),
-      progress: cached?.progress || { items: [] },
-      insights: insightsRes.status === "fulfilled" ? insightsRes.value : (cached?.insights || null),
-      status: statusRes.status === "fulfilled" ? statusRes.value : (cached?.status || null),
-      collection: collectionRes.status === "fulfilled"
-        ? { counts: collectionRes.value?.counts || {}, total: Number(collectionRes.value?.total) || 0 }
-        : (cached?.collection || null),
-    };
-    if (!next.progress?.items?.length && next.widgets?.recent_progress?.items?.length) {
-      next.progress = { items: next.widgets.recent_progress.items };
-    }
-    renderOverview(next);
-    writeCache(cacheKey, next);
-    if (widgetsNotModified) {
-      refreshNowPlaying();
-      return;
-    }
-
-    api(`/api/playback_progress/items?page=1&page_size=${mobilePaging.matches ? 3 : 8}`).then((progress) => {
-      const fresh = { ...next, progress: progress || { items: [] } };
-      overviewPayload = fresh;
-      const progressItems = fresh.progress?.items?.length ? fresh.progress.items : (fresh.widgets?.recent_progress?.items || []);
-      renderProgressItems(progressItems);
-      renderQuickStats({ wall: fresh.wall, widgets: fresh.widgets, progressItems, insights: fresh.insights, collection: fresh.collection });
-      writeCache(cacheKey, fresh);
-    }).catch(() => {});
-    refreshNowPlaying();
+    if (current()) renderOverview({...next, widgets:next.widgets || {}, wall:next.wall || {items:[]}});
   }
 
   mobilePaging.addEventListener("change", () => {
@@ -1310,7 +1351,7 @@
     page: 1,
     pageSize: COLLECTION_PAGE_SIZES.includes(Number(collectionPrefs.pageSize)) ? Number(collectionPrefs.pageSize) : 24,
     view: collectionPrefs.view === "list" ? "list" : "grid",
-    timeline: collectionPrefs.timeline !== false,
+    timeline: collectionPrefs.timeline === true,
     zoom: Number.isInteger(collectionPrefs.zoom) ? collectionPrefs.zoom : 0,
     months: [],
     type: "all",
@@ -1440,16 +1481,13 @@
       <span class="cw-collection-info">
         <strong class="cw-collection-name">${esc(title)}</strong>
         <span class="cw-collection-meta">${esc(meta)}</span>
-        ${providerStrip ? `<span class="cw-collection-sources">${providerStrip}</span>` : ""}
       </span>`;
-    const selectKey = collectionSelectable() ? String(item?.key || "") : "";
-    if (selectKey) {
-      return `<article class="cw-collection-card cw-tl-card${collectionState.selected.has(selectKey) ? " is-selected" : ""}" data-collection-key="${esc(selectKey)}">
+    const selectKey = String(item?.key || key);
+    return `<article class="cw-collection-card cw-tl-card${collectionState.selected.has(selectKey) ? " is-selected" : ""}" data-collection-key="${esc(selectKey)}">
       <button class="cw-collection-open" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(ariaTitle)}">${inner}</button>
-      ${collectionSelectBox(selectKey)}
+      ${collectionSelectable() ? collectionSelectBox(selectKey) : ""}
+      <span class="cw-collection-card-foot"><span class="cw-collection-sources">${providerStrip}</span>${cardActionsButton(`data-collection-actions="${esc(selectKey)}"`, `Actions for ${title}`)}</span>
     </article>`;
-    }
-    return `<button class="cw-collection-card" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(ariaTitle)}">${inner}</button>`;
   }
 
   const collectionSelectable = () => canWriteRecords();
@@ -1472,6 +1510,7 @@
 
   function syncCollectionSelection() {
     const grid = $("#profile-collection-grid");
+    refreshProviderStrips(grid);
     const bar = $("#profile-collection-bulk");
     if (!collectionSelectable()) {
       collectionState.selected.clear();
@@ -1622,10 +1661,10 @@
     const stored = recallCollectionMeta(item);
     const release = collectionIsoFmt(collectionReleaseIso(item, null)) || stored?.r || "";
     const genres = collectionGenreText(item, null) || stored?.g || "";
-    const selectKey = collectionSelectable() ? String(item?.key || "") : "";
+    const selectKey = String(item?.key || key);
     const img = `<img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'">`;
     const cells = `<span class="cw-collection-cell cw-collection-cell--title">
-        ${selectKey ? collectionSelectBox(selectKey) : ""}
+        ${collectionSelectable() ? collectionSelectBox(selectKey) : ""}
         <strong>${esc(title)}</strong>
         ${stamp ? `<span class="cw-collection-pill">${esc(stamp)}</span>` : ""}
       </span>
@@ -1636,7 +1675,7 @@
         ${added ? `<small>${esc(relTime(added))}</small>` : ""}
       </span>
       <span class="cw-collection-cell cw-collection-cell--type"><span class="cw-collection-pill cw-collection-pill--type"><span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>${esc(kind)}</span></span>
-      <span class="cw-collection-cell cw-collection-cell--providers">${providerStrip}</span>`;
+      <span class="cw-collection-cell cw-collection-cell--providers"><span class="cw-collection-sources">${providerStrip}</span>${cardActionsButton(`data-collection-actions="${esc(selectKey)}"`, `Actions for ${title}`)}</span>`;
     if (selectKey) {
       return `<article class="cw-collection-row cw-tl-row${collectionState.selected.has(selectKey) ? " is-selected" : ""}" data-collection-index="${index}" data-collection-key="${esc(selectKey)}">
       <button class="cw-collection-cell cw-collection-cell--poster cw-collection-open" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(title)}">${img}</button>
@@ -1835,19 +1874,12 @@
     const counts = data.counts || {};
     const providers = Array.isArray(data.providers) ? data.providers.length : 0;
     const values = [
-      ["violet", "movie", "Movies", "Owned", counts.movie || 0],
-      ["blue", "tv", "Shows", "Owned", counts.show || 0],
-      ["green", "hub", "Providers", "Connected", providers],
-      ["amber", "inventory_2", "Items", "Total", counts.all ?? data.total ?? 0],
+      ["Movies", counts.movie || 0],
+      ["Shows", counts.show || 0],
+      ["Providers", providers],
+      ["Items", counts.all ?? data.total ?? 0],
     ];
-    host.innerHTML = values.map(([tone, icon, label, note, value]) => `<span class="cw-collection-tile" data-tone="${esc(tone)}">
-      <span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>
-      <span class="cw-collection-tile-body">
-        <strong>${esc(numberFmt.format(Number(value) || 0))}</strong>
-        <span>${esc(label)}</span>
-        <small>${esc(note)}</small>
-      </span>
-    </span>`).join("");
+    host.innerHTML = values.map(([label, value]) => `<span class="cw-hub-records-stat"><strong>${esc(numberFmt.format(Number(value) || 0))}</strong><span>${esc(label)}</span></span>`).join("");
   }
 
   function paintCollectionItems() {
@@ -1915,6 +1947,7 @@
       btn.classList.toggle("active", collectionState.timeline);
       btn.setAttribute("aria-pressed", String(collectionState.timeline));
       btn.title = collectionState.timeline ? "Hide timeline" : "Show timeline";
+      btn.setAttribute("aria-label", btn.title);
     });
   }
 
@@ -2049,6 +2082,18 @@
     collectionBar().wire();
     const collectionPanel = $("#profile-panel-collection");
     collectionPanel?.addEventListener("click", (event) => {
+      const action = event.target?.closest?.("[data-collection-actions]");
+      if (action) {
+        event.preventDefault();
+        event.stopPropagation();
+        const item = collectionState.items.find((entry) => String(entry.key) === action.dataset.collectionActions);
+        if (!item) return;
+        const card = action.closest("[data-collection-key]");
+        const entries = [{ label: "View media details", icon: "info", run: () => card?.querySelector("[data-profile-poster-key]")?.click() }];
+        if (collectionSelectable() && window.CW?.ItemActions) entries.unshift({ label: "Manage providers", icon: "edit", run: () => window.CW.ItemActions.openMenu({ anchor: action, feature: "collection", item: { ...collectionSelectionEntry(item), tmdb: item.tmdb }, refs: { present: timelineEndpoints(collectionSelectionEntry(item).present), missing: [] }, fillMissing: true, scope: () => [card], onChanged: () => loadCollection({ quiet: true }) }) });
+        openCardActions(action, entries, {title:item.title});
+        return;
+      }
       const pick = event.target?.closest?.("[data-collection-select]");
       if (pick) {
         void selectCollection(pick.dataset.collectionSelect);
@@ -2178,15 +2223,60 @@
     return `${verbs[role] || ""} ${label}${rating != null ? ` · ${rating}/10` : ""}`.trim();
   }
 
-  const PROVIDER_CHIP_MAX = 6;
+  function cardActionsButton(attrs, label = "Actions") {
+    return `<button type="button" class="cw-card-actions" ${attrs} title="${esc(label)}" aria-label="${esc(label)}" aria-haspopup="${attrs.includes("data-ia-cover") ? "dialog" : "menu"}"${attrs.includes("data-ia-cover") ? "" : ' aria-expanded="false"'}><span class="material-symbols-rounded" aria-hidden="true">more_horiz</span></button>`;
+  }
+
+  function openCardActions(anchor, entries, options) {
+    window.CW.CardActions.open(anchor, entries, options);
+  }
 
   function providerChipStrip(entries, moreClass) {
-    if (entries.length <= PROVIDER_CHIP_MAX) return entries.map((entry) => entry.html).join("");
-    const ordered = entries.filter((entry) => entry.missing).concat(entries.filter((entry) => !entry.missing));
-    const shown = ordered.slice(0, PROVIDER_CHIP_MAX - 1);
-    const hidden = ordered.slice(PROVIDER_CHIP_MAX - 1);
-    const names = hidden.map((entry) => entry.title);
-    return `${shown.map((entry) => entry.html).join("")}<span class="${esc(moreClass)} cw-provider-more" title="${esc(names.join("\n"))}" aria-label="${esc(`${hidden.length} more: ${names.join(", ")}`)}">+${hidden.length}</span>`;
+    return `<span class="cw-provider-strip">${entries.map((entry) => entry.html).join("")}<button type="button" class="${esc(moreClass)} cw-provider-more" data-provider-overflow hidden aria-haspopup="menu" aria-expanded="false"></button></span>`;
+  }
+
+  const providerStripNodes = new Set();
+  let providerStripObserver = null;
+
+  function fitProviderStrip(strip) {
+    const more = strip.querySelector("[data-provider-overflow]");
+    const chips = [...strip.children].filter((node) => node !== more);
+    if (!more || !strip.clientWidth) return;
+    const style = getComputedStyle(strip);
+    const gap = parseFloat(style.columnGap) || 6;
+    const width = strip.clientWidth - (parseFloat(style.paddingLeft) || 0) - (parseFloat(style.paddingRight) || 0);
+    chips.forEach((chip) => { chip.hidden = false; });
+    more.hidden = true;
+    const widths = chips.map((chip) => chip.getBoundingClientRect().width);
+    if (widths.reduce((sum, width) => sum + width, 0) + gap * Math.max(0, chips.length - 1) <= width) return;
+    more.textContent = `+${chips.length}`;
+    more.hidden = false;
+    let available = width - more.getBoundingClientRect().width;
+    let shown = 0;
+    while (shown < chips.length && available >= widths[shown] + gap) available -= widths[shown++] + gap;
+    chips.forEach((chip, index) => { chip.hidden = index >= shown; });
+    more.textContent = `+${chips.length - shown}`;
+    more.setAttribute("aria-label", `${chips.length - shown} more providers`);
+    more.title = chips.slice(shown).map((chip) => chip.title || chip.getAttribute("aria-label") || "Provider").join("\n");
+    more.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openCardActions(more, chips.slice(shown).map((chip) => ({ label: chip.title || chip.getAttribute("aria-label") || "Provider", icon: "account_circle", run: () => { if (chip.matches("button")) chip.click(); } })));
+    };
+  }
+
+  function refreshProviderStrips(host) {
+    providerStripObserver ||= new ResizeObserver((entries) => entries.forEach(({ target }) => fitProviderStrip(target)));
+    for (const node of providerStripNodes) {
+      if (node.isConnected) continue;
+      providerStripObserver.unobserve(node);
+      providerStripNodes.delete(node);
+    }
+    host?.querySelectorAll(".cw-provider-strip").forEach((node) => {
+      providerStripNodes.add(node);
+      providerStripObserver.observe(node);
+      fitProviderStrip(node);
+    });
   }
 
   function timelineChipEntry(ref, role, options = {}) {
@@ -2231,9 +2321,7 @@
     const state = conflict ? " is-conflict" : full ? " is-full" : "";
     const hint = conflict ? "Scores still differ after provider rounding or reaction conversion. Badges show each provider's saved score."
       : adjusted ? "Equivalent scores. Scores match after provider rounding or reaction conversion. Badges show each provider's saved score." : "Add or remove on your providers";
-    const labelHtml = actionable
-      ? `<button type="button" class="cw-hist-coverage-label" data-ia-cover aria-haspopup="dialog" title="${esc(hint)}">${esc(label)}<span class="material-symbols-rounded" aria-hidden="true">expand_more</span></button>`
-      : `<span class="cw-hist-coverage-label"${adjusted || conflict ? ` title="${esc(hint)}"` : ""}>${esc(label)}</span>`;
+    const labelHtml = cardActionsButton(actionable ? "data-ia-cover" : "data-hub-details", `${label}. ${hint}`);
     return `<span class="cw-hist-coverage${state}"><span class="cw-hist-providers">${chips}</span>${labelHtml}</span>`;
   }
 
@@ -2255,7 +2343,7 @@
       ? `<span class="material-symbols-rounded cw-hist-route-arrow" aria-hidden="true">arrow_forward</span><span class="cw-hist-providers">${providerChipStrip(sinks.map((ref) => timelineChipEntry(ref, "sink")), "cw-hist-provider")}</span>`
       : "";
     const label = sinks.length ? `Sent to ${numberFmt.format(sinks.length)}` : "Not sent";
-    return `<span class="cw-hist-route${sinks.length ? "" : " is-unsent"}">${from}${to}<span class="cw-hist-coverage-label">${esc(label)}</span></span>`;
+    return `<span class="cw-hist-route${sinks.length ? "" : " is-unsent"}">${from}${to}${cardActionsButton("data-hub-route-actions", `${label}. Scrobble actions`)}</span>`;
   }
 
   const RECORD_PHASE_WORKING = { remove: "Removing…", remove_progress: "Removing…", mark_watched: "Marking watched…", update_progress: "Updating…" };
@@ -2832,7 +2920,7 @@
       pageCount: 1,
       view: prefs.view === "list" ? "list" : "grid",
       zoom: Number.isInteger(prefs.zoom) && prefs.zoom >= 0 && prefs.zoom < TIMELINE_ZOOM_STEPS.length ? prefs.zoom : 0,
-      timeline: prefs.timeline !== false,
+      timeline: prefs.timeline === true,
       months: [],
       items: [],
       total: 0,
@@ -2872,7 +2960,7 @@
       const reload = () => load({ quiet: true });
       const movie = String(item.type || "").toLowerCase() === "movie";
       void actions.openMenu({
-        anchor: node,
+        anchor: node.hidden ? node.closest(".cw-provider-strip")?.querySelector("[data-provider-overflow]") || node : node,
         feature,
         item: entry,
         refs: { present: timelineEndpoints(item.present), missing: timelineEndpoints(item.missing) },
@@ -2939,11 +3027,11 @@
       const info = `<strong class="cw-hist-name">${esc(title)}</strong>
           <span class="cw-hist-meta">${esc(timelineSubtitle(item))}</span>
           ${detail(item)}`;
-      const key = selectable() ? selectionKey(item) : "";
+      const key = selectionKey(item);
       if (key) {
         return `<article class="cw-hist-card cw-tl-card${state.selected.has(key) ? " is-selected" : ""}" data-timeline-key="${esc(key)}">
           <button class="cw-hist-art cw-tl-open" type="button" data-profile-poster-key="${esc(posterKey)}" aria-label="Show details for ${esc(title)}">${art}</button>
-          ${selectBox(key)}
+          ${selectable() ? selectBox(key) : ""}
           <span class="cw-hist-info">${info}</span>
         </article>`;
       }
@@ -2958,8 +3046,8 @@
       const epoch = epochOf(item?.sort_epoch);
       const title = titleOf(item);
       const code = timelineCode(item);
-      const key = selectable() ? selectionKey(item) : "";
-      const titleCell = `${key ? selectBox(key) : ""}<span class="cw-tl-title-stack"><span class="cw-tl-title-line"><strong>${esc(title)}</strong>${code ? `<span class="cw-collection-pill">${esc(code)}</span>` : ""}${rewatchPill(item, true)}</span>${cfg.showIds ? timelineIds(item) : ""}</span>`;
+      const key = selectionKey(item);
+      const titleCell = `${key && selectable() ? selectBox(key) : ""}<span class="cw-tl-title-stack"><span class="cw-tl-title-line"><strong>${esc(title)}</strong>${code ? `<span class="cw-collection-pill">${esc(code)}</span>` : ""}${rewatchPill(item, true)}</span>${cfg.showIds ? timelineIds(item) : ""}</span>`;
       const cells = `<span class="cw-hist-cell cw-hist-cell--when"><strong>${esc(timeFmt(epoch) || "—")}</strong><small>${esc(relTime(epoch))}</small></span>
         <span class="cw-hist-cell cw-hist-cell--type">${pill(item)}</span>
         <span class="cw-hist-cell cw-hist-cell--where">${detail(item)}</span>`;
@@ -3096,6 +3184,7 @@
         </section>`).join("");
       }
       timelineImages.observe(host);
+      refreshProviderStrips(host);
       syncSelection();
     }
 
@@ -3117,18 +3206,11 @@
       });
     }
 
-    function tile(tone, icon, label, note, value, coverage = "") {
+    function tile(label, note, value, coverage = "") {
       const tag = coverage ? "button" : "span";
       const active = !!coverage && state.coverage === coverage;
       const attrs = coverage ? ` type="button" data-timeline-coverage-set="${esc(coverage)}" aria-pressed="${active}" title="Filter on ${esc(label.toLowerCase())}"` : "";
-      return `<${tag} class="cw-collection-tile${active ? " active" : ""}" data-tone="${esc(tone)}"${attrs}>
-        <span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>
-        <span class="cw-collection-tile-body">
-          <strong>${esc(value)}</strong>
-          <span>${esc(label)}</span>
-          <small>${esc(note)}</small>
-        </span>
-      </${tag}>`;
+      return `<${tag} class="cw-hub-records-stat${active ? " active" : ""}"${attrs}${coverage ? "" : ` title="${esc(note)}"`}><strong>${esc(value)}</strong><span>${esc(label)}</span></${tag}>`;
     }
 
     function renderMetrics(data = {}) {
@@ -3161,11 +3243,11 @@
       if (signature !== scoresSignature) {
         scoresSignature = signature;
         const all = `<button type="button" data-timeline-rating="" title="${esc(`All scores · ${noun(counts?.all)}`)}"><span class="cw-hist-score-value">All</span><small>${esc(count(counts?.all))}</small></button>`;
-        host.innerHTML = all + values.map((value, index) => {
+        host.innerHTML = all + values.map((value) => {
           const amount = Number(histogram[value]) || 0;
           const height = amount ? Math.max(8, Math.round((amount / max) * 100)) : 0;
           return `<button type="button" data-timeline-rating="${value}" title="${esc(`${value}/10 · ${noun(amount)}`)}"${amount ? "" : " disabled"}>
-            <span class="cw-hist-score-bar" style="height:${height}%;--d:${index * 35}ms"></span>
+            <span class="cw-hist-score-bar" style="height:${height}%"></span>
             <span class="cw-hist-score-value"><span class="material-symbols-rounded" aria-hidden="true">star</span>${value}</span>
             <small>${esc(count(amount))}</small>
           </button>`;
@@ -3243,8 +3325,7 @@
         const node = q(suffix);
         if (node) node.textContent = text;
       };
-      setText("kicker", source.kicker);
-      setText("title", source.title);
+      setText("title", cfg.title || source.title);
       setText("lede", source.lede);
       const search = q("search");
       if (search) search.placeholder = source.search;
@@ -3262,7 +3343,18 @@
         btn.classList.toggle("active", state.timeline);
         btn.setAttribute("aria-pressed", String(state.timeline));
         btn.title = state.timeline ? "Hide timeline" : "Show timeline";
+        btn.setAttribute("aria-label", btn.title);
       });
+      const filters = host?.querySelector("[data-timeline-filters-toggle]");
+      if (filters) {
+        filters.hidden = !source.coverage;
+        filters.textContent = state.coverage === "all" ? "Filters" : "Filters · 1";
+        filters.classList.toggle("active", state.coverage !== "all");
+        if (!source.coverage) {
+          q("filters").hidden = true;
+          filters.setAttribute("aria-expanded", "false");
+        }
+      }
     }
 
     function writeHash() {
@@ -3342,6 +3434,7 @@
         select.value = state.coverage;
         enhanceCoverageSelect(select);
       }
+      syncSourceUi();
       void load({ reset: true });
     }
 
@@ -3374,6 +3467,17 @@
       enhanceCoverageSelect();
       host.addEventListener("click", (event) => {
         const target = event.target;
+        const routeActions = target?.closest?.("[data-hub-route-actions],[data-hub-details]");
+        if (routeActions) {
+          event.preventDefault();
+          event.stopPropagation();
+          const card = routeActions.closest("[data-timeline-key]");
+          openCardActions(routeActions, [
+            { label: "View media details", icon: "info", run: () => card?.querySelector("[data-profile-poster-key]")?.click() },
+            ...(routeActions.hasAttribute("data-hub-route-actions") ? [{ label: "Open synced history", icon: "history", run: () => setSource("synced") }] : []),
+          ]);
+          return;
+        }
         const actionNode = target?.closest?.("[data-ia-chip],[data-ia-cover]");
         if (actionNode) {
           event.preventDefault();
@@ -3392,6 +3496,13 @@
         const sourceBtn = target?.closest?.("[data-timeline-source]");
         if (sourceBtn) {
           setSource(sourceBtn.dataset.timelineSource);
+          return;
+        }
+        const filtersBtn = target?.closest?.("[data-timeline-filters-toggle]");
+        if (filtersBtn) {
+          const filters = q("filters");
+          filters.hidden = !filters.hidden;
+          filtersBtn.setAttribute("aria-expanded", String(!filters.hidden));
           return;
         }
         if (target?.closest?.("[data-timeline-toggle]")) {
@@ -3482,13 +3593,14 @@
   const coverageTiles = (stats, tile, count) => {
     const endpoints = Number(stats.endpoints) || 0;
     return [
-      tile("green", "done_all", "Everywhere", endpoints === 1 ? "On your provider" : `On all ${count(endpoints)} providers`, count(stats.full), "full"),
-      tile("blue", "sync_problem", "Missing", "On some providers", count(stats.partial), "partial"),
+      tile("Everywhere", endpoints === 1 ? "On your provider" : `On all ${count(endpoints)} providers`, count(stats.full), "full"),
+      tile("Missing", "On some providers", count(stats.partial), "partial"),
     ];
   };
 
   const historyPanel = createTimelinePanel({
     key: "history",
+    title: "History",
     endpoint: "/api/profile/history",
     prefsKey: "cw.profile.history",
     aliases: { synced: "synced", sync: "synced", scrobble: "scrobble", scrobbles: "scrobble" },
@@ -3499,7 +3611,6 @@
         removeKind: "history",
         coverage: true,
         scores: false,
-        kicker: "Sync output",
         title: "Synced history",
         lede: "Plays read back from every provider after sync.",
         noun: "play",
@@ -3507,9 +3618,9 @@
         empty: "No synced plays match this view.",
         types: [["all", "apps", "All"], ["movie", "movie", "Movies"], ["episode", "play_circle", "Episodes"]],
         tiles: (stats, tile, count) => [
-          tile("violet", "history", "Plays", `${count(stats.plays)} ${Number(stats.plays) === 1 ? "title" : "titles"}`, count(stats.watches ?? stats.plays)),
+          tile("Plays", `${count(stats.plays)} ${Number(stats.plays) === 1 ? "title" : "titles"}`, count(stats.watches ?? stats.plays)),
           ...coverageTiles(stats, tile, count),
-          tile("amber", "hub", "Providers", "Holding history", count(stats.endpoints)),
+          tile("Providers", "Holding history", count(stats.endpoints)),
         ],
       },
       scrobble: {
@@ -3517,7 +3628,6 @@
         removeKind: "history",
         coverage: false,
         scores: false,
-        kicker: "Recorded by CrossWatch",
         title: "Scrobbles",
         lede: "Plays CrossWatch caught live from watchers and webhooks, and where it sent them",
         noun: "scrobble",
@@ -3525,10 +3635,10 @@
         empty: "No scrobbles match this view.",
         types: [["all", "apps", "All"], ["movie", "movie", "Movies"], ["episode", "play_circle", "Episodes"]],
         tiles: (stats, tile, count) => [
-          tile("violet", "sensors", "Scrobbles", "Recorded live", count(stats.plays)),
-          tile("blue", "movie", "Movies", "Scrobbled", count(stats.movies)),
-          tile("green", "play_circle", "Episodes", "Scrobbled", count(stats.episodes)),
-          tile("amber", "schedule", "Hours", "Watched", numberFmt.format(Math.round((Number(stats.hours) || 0) * 10) / 10)),
+          tile("Scrobbles", "Recorded live", count(stats.plays)),
+          tile("Movies", "Scrobbled", count(stats.movies)),
+          tile("Episodes", "Scrobbled", count(stats.episodes)),
+          tile("Hours", "Watched", numberFmt.format(Math.round((Number(stats.hours) || 0) * 10) / 10)),
         ],
       },
     },
@@ -3546,7 +3656,6 @@
         removeKind: "ratings",
         coverage: true,
         scores: true,
-        kicker: "Sync output",
         title: "Ratings",
         lede: "Your scores read back from every provider after sync.",
         noun: "rating",
@@ -3556,9 +3665,9 @@
         tiles: (stats, tile, count) => {
           const average = Number(stats.average) || 0;
           return [
-            tile("amber", "star", "Ratings", average ? `Average ${numberFmt.format(average)} / 10` : "Synced ratings", count(stats.plays)),
+            tile("Ratings", average ? `Average ${numberFmt.format(average)} / 10` : "Synced ratings", count(stats.plays)),
             ...coverageTiles(stats, tile, count),
-            tile("red", "compare_arrows", "Conflicts", "Scores differ", count(stats.mismatch), "mismatch"),
+            tile("Conflicts", "Scores differ", count(stats.mismatch), "mismatch"),
           ];
         },
       },
@@ -3579,7 +3688,6 @@
         removeKind: "watchlist",
         coverage: true,
         scores: false,
-        kicker: "Sync output",
         title: "Watchlist",
         lede: "Everything on your watchlists.",
         noun: "title",
@@ -3587,9 +3695,9 @@
         empty: "No watchlist titles match this view.",
         types: [["all", "apps", "All"], ["movie", "movie", "Movies"], ["show", "tv", "Shows"], ["anime", "animation", "Anime"]],
         tiles: (stats, tile, count) => [
-          tile("violet", "bookmark", "Titles", "On your watchlists", count(stats.plays)),
+          tile("Titles", "On your watchlists", count(stats.plays)),
           ...coverageTiles(stats, tile, count),
-          tile("amber", "hub", "Providers", "Holding watchlists", count(stats.endpoints)),
+          tile("Providers", "Holding watchlists", count(stats.endpoints)),
         ],
       },
     },
@@ -3626,7 +3734,7 @@
       pageCount: 1,
       pageSize: PAGE_SIZES.includes(Number(prefs.pageSize)) ? Number(prefs.pageSize) : 48,
       view: prefs.view === "list" ? "list" : "grid",
-      timeline: prefs.timeline !== false,
+      timeline: prefs.timeline === true,
       zoom: Number.isInteger(prefs.zoom) ? prefs.zoom : 0,
       months: [],
       total: 0,
@@ -3688,30 +3796,6 @@
     };
     const actionTitle = (action) => (action === "mark_watched" ? "Mark as watched" : action === "update_progress" ? "Edit progress" : "Remove progress");
 
-    const progressOf = (item) => {
-      const live = Number(item?.live_progress_percent);
-      const value = item?.live_progress_percent != null && Number.isFinite(live) ? live : Number(item?.progress_percent);
-      return item?.progress_percent == null && item?.live_progress_percent == null ? null : Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
-    };
-    const remainingOf = (item) => {
-      const live = Number(item?.live_remaining_seconds);
-      const seconds = item?.live_remaining_seconds != null && Number.isFinite(live) ? live : Number(item?.remaining_seconds);
-      if (!Number.isFinite(seconds) || seconds <= 0) return "";
-      const minutes = Math.round(seconds / 60);
-      return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m left` : `${minutes}m left`;
-    };
-    const liveState = (item) => String(item?.live_state || "").toLowerCase();
-    const pausedEpoch = (item) => {
-      const live = Number(item?.live_updated);
-      return Number.isFinite(live) && live > 0 ? live : epochOf(item?.updated_at || item?.progress_at);
-    };
-    const pausedLabel = (item) => {
-      const live = liveState(item);
-      if (live === "playing") return "Playing now";
-      if (live === "buffering") return "Buffering now";
-      const epoch = pausedEpoch(item);
-      return epoch ? `Paused ${relTime(epoch)}` : "";
-    };
     const titleFor = (item) => (item?.media_type === "movie" ? (item?.title || "Untitled") : (item?.series_title || item?.title || "Untitled"));
     const codeFor = (item) => (item?.media_type !== "movie" && item?.season != null && item?.episode != null ? `S${timelinePad(item.season)}E${timelinePad(item.episode)}` : "");
     const subtitleFor = (item) => {
@@ -3751,18 +3835,17 @@
       return { rid: String(index), provider, instance: String(record?.instance_id || "default"), provider_label: name, label: codeFor(item) ? `${codeFor(item)} on ${name}` : name, record };
     });
     const providerChips = (item) => {
-      if (canAct() && window.CW?.ItemActions) {
-        return providerChipStrip(progressRowsOf(item).map((row) => timelineChipEntry(
-          { provider: row.provider, instance: row.instance },
-          "source",
-          { action: true, play: row.rid, title: `${row.provider_label}: resume point` },
-        )), "cw-hist-provider");
+      const rows = progressRowsOf(item);
+      const present = new Set(rows.map((row) => `${row.provider}:${row.instance}`));
+      const entries = rows.map((row) => timelineChipEntry(
+        { provider: row.provider, instance: row.instance },
+        "source",
+        { action: canAct() && !!window.CW?.ItemActions, play: row.rid, title: `${row.provider_label}: resume point` },
+      ));
+      for (const ref of liveRouteProviders(item)) {
+        if (!present.has(`${ref.provider}:${ref.instance}`)) entries.push(timelineChipEntry(ref, "source", { title: ref.title }));
       }
-      const rows = Array.isArray(item?.providers) && item.providers.length ? item.providers : [item];
-      return providerChipStrip(timelineEndpoints(rows.map((row) => ({
-        provider: row?.provider,
-        instance: String(row?.instance_id || "default").toLowerCase() === "default" ? "default" : profileLabel(row),
-      }))).map((ref) => timelineChipEntry(ref, "source")), "cw-hist-provider");
+      return providerChipStrip(entries, "cw-hist-provider");
     };
     const errorName = (error) => {
       const provider = String(error?.provider || "").trim();
@@ -3786,11 +3869,7 @@
     }
 
     function actions(item, key) {
-      if (!canAct()) return "";
-      const button = (action, icon, label, enabled, tone = "") => (enabled
-        ? `<button class="cw-tl-action${tone}" type="button" data-playback-action="${action}" data-playback-key="${esc(key)}" title="${label}" aria-label="${label}"><span class="material-symbols-rounded" aria-hidden="true">${icon}</span></button>`
-        : "");
-      return `<span class="cw-tl-actions">${button("update_progress", "edit", "Edit progress", item?.can_update_progress)}${button("mark_watched", "check_circle", "Mark as watched", item?.can_mark_watched, " is-good")}${button("remove_progress", "delete", "Remove progress", item?.can_remove_progress, " is-danger")}</span>`;
+      return cardActionsButton(`data-playback-menu="${esc(key)}"`, `Actions for ${titleFor(item)}`);
     }
 
     function card(item) {
@@ -3880,6 +3959,7 @@
         </section>`).join("");
       }
       timelineImages.observe(host);
+      refreshProviderStrips(host);
       syncSelection();
     }
 
@@ -3887,7 +3967,8 @@
       const pending = state.pendingAction;
       const feedback = state.actionFeedback;
       const icons = { update_progress: "edit", mark_watched: "check_circle", remove_progress: "delete" };
-      panel()?.querySelectorAll("[data-playback-action], [data-playback-bulk]").forEach((button) => {
+      panel()?.querySelectorAll("[data-playback-menu]").forEach((button) => { button.disabled = !!pending; });
+      panel()?.querySelectorAll("[data-playback-bulk]").forEach((button) => {
         const action = button.dataset.playbackAction || button.dataset.playbackBulk;
         const active = !!pending && pending.action === action && (button.dataset.playbackBulk ? pending.bulk : pending.keys.has(button.dataset.playbackKey));
         const result = feedback?.action === action ? (button.dataset.playbackBulk ? (feedback.bulk ? feedback.outcome : "") : feedback.results.get(button.dataset.playbackKey)) : "";
@@ -3951,18 +4032,11 @@
       window.CW?.SelectionBar?.update(bar, state.selected.size);
     }
 
-    function tile(tone, icon, label, note, value, filter = null) {
+    function tile(label, note, value, filter = null) {
       const active = !!filter && state.filters[filter.key] === filter.value;
       const tag = filter ? "button" : "span";
-      const attrs = filter ? ` type="button" data-playback-filter="${esc(filter.key)}" data-playback-value="${esc(filter.value)}" aria-pressed="${active}" title="Filter on ${esc(label.toLowerCase())}"` : "";
-      return `<${tag} class="cw-collection-tile${active ? " active" : ""}" data-tone="${esc(tone)}"${attrs}>
-        <span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>
-        <span class="cw-collection-tile-body">
-          <strong>${esc(value)}</strong>
-          <span>${esc(label)}</span>
-          <small>${esc(note)}</small>
-        </span>
-      </${tag}>`;
+      const attrs = filter ? ` type="button" data-playback-filter="${esc(filter.key)}" data-playback-value="${esc(filter.value)}" aria-pressed="${active}"` : "";
+      return `<${tag} class="cw-hub-records-stat${active ? " active" : ""}" title="${esc(note)}"${attrs}><strong>${esc(value)}</strong><span>${esc(label)}</span></${tag}>`;
     }
 
     function renderMetrics() {
@@ -3973,10 +4047,10 @@
       const failing = new Set(state.errors.map((error) => `${error.provider}:${error.instance_id}`)).size;
       const pending = state.loading.length;
       host.innerHTML = [
-        tile("violet", "play_circle", "Unfinished", "Across your players", count(summary.total ?? state.total)),
-        tile("green", "flag", "Almost done", "90% or more watched", count(summary.almost_done), { key: "progress", value: "90:100" }),
-        tile("amber", "hourglass_bottom", "Stale", "Paused over 30 days", count(summary.stale), { key: "age", value: "older_30d" }),
-        tile(failing ? "red" : "blue", "hub", "Providers", failing ? `${count(failing)} need attention` : pending ? `${count(pending)} still loading` : "All responding", `${count(Math.max(0, readable - failing - pending))}/${count(readable)}`),
+        tile("Unfinished", "Across your players", count(summary.total ?? state.total)),
+        tile("Almost done", "90% or more watched", count(summary.almost_done), { key: "progress", value: "90:100" }),
+        tile("Stale", "Paused over 30 days", count(summary.stale), { key: "age", value: "older_30d" }),
+        tile("Providers", failing ? `${count(failing)} need attention` : pending ? `${count(pending)} still loading` : "All responding", `${count(Math.max(0, readable - failing - pending))}/${count(readable)}`),
       ].join("");
     }
 
@@ -4140,6 +4214,7 @@
         btn.classList.toggle("active", state.timeline);
         btn.setAttribute("aria-pressed", String(state.timeline));
         btn.title = state.timeline ? "Hide timeline" : "Show timeline";
+        btn.setAttribute("aria-label", btn.title);
       });
     }
 
@@ -4228,6 +4303,7 @@
       const panel = q("filters-panel");
       const btn = q("filters-btn");
       if (!panel || !btn) return;
+      if (panel.closest(".cw-hub-mobile-sheet")) return;
       const open = typeof force === "boolean" ? force : panel.hidden;
       panel.hidden = !open;
       btn.setAttribute("aria-expanded", String(open));
@@ -4496,6 +4572,20 @@
       });
       host.addEventListener("click", (event) => {
         const target = event.target;
+        const menuButton = target?.closest?.("[data-playback-menu]");
+        if (menuButton) {
+          event.preventDefault();
+          const item = state.items.find((entry) => keyOf(entry) === menuButton.dataset.playbackMenu);
+          if (!item || state.pendingAction) return;
+          const entries = [{ label: "View media details", icon: "info", run: () => menuButton.closest("[data-playback-key]")?.querySelector("[data-profile-poster-key]")?.click() }];
+          if (canAct()) {
+            for (const [action, icon, label] of [["update_progress", "edit", "Edit progress"], ["mark_watched", "check_circle", "Mark as watched"], ["remove_progress", "delete", "Remove resume point"]]) {
+              if (item[CAPABILITY[action]]) entries.push({ label, icon, danger: action === "remove_progress", attrs: ` data-playback-action="${action}"`, run: () => runAction(action, [item]) });
+            }
+          }
+          openCardActions(menuButton, entries, {title:titleFor(item),subtitle:item.season != null && item.episode != null ? `S${String(item.season).padStart(2,"0")} · E${String(item.episode).padStart(2,"0")}` : ""});
+          return;
+        }
         const chip = target?.closest?.("[data-ia-chip]");
         if (chip && window.CW?.ItemActions) {
           event.preventDefault();
@@ -4503,7 +4593,7 @@
           const item = state.items.find((entry) => keyOf(entry) === card?.dataset.playbackKey);
           if (item) {
             void window.CW.ItemActions.openMenu({
-              anchor: chip,
+              anchor: chip.hidden ? chip.closest(".cw-provider-strip")?.querySelector("[data-provider-overflow]") || chip : chip,
               feature: "progress",
               item: { title: titleFor(item), type: item.media_type },
               progressRows: progressRowsOf(item),
@@ -4512,12 +4602,6 @@
               onChanged: () => load({ background: true }),
             });
           }
-          return;
-        }
-        const actionBtn = target?.closest?.("[data-playback-action]");
-        if (actionBtn) {
-          const item = state.items.find((entry) => keyOf(entry) === actionBtn.dataset.playbackKey);
-          if (item) void runAction(actionBtn.dataset.playbackAction, [item]);
           return;
         }
         const bulkBtn = target?.closest?.("[data-playback-bulk]");
@@ -4657,21 +4741,8 @@
 
   function wireTabs() {
     const tabs = document.querySelector('.cw-profile-tabs');
-    const mobileView = document.createElement('label');
-    mobileView.className = 'cw-profile-mobile-view';
-    mobileView.innerHTML = '<span>View</span><select aria-label="Profile section" data-cw-native-select="true"></select>';
-    const mobileSelect = mobileView.querySelector('select');
-    tabs?.before(mobileView);
-    const syncMobileView = () => {
-      const buttons = Array.from(document.querySelectorAll('[data-profile-tab]'));
-      mobileSelect.replaceChildren(...buttons.filter(btn => !btn.hidden && !(btn.dataset.profileTab === 'account' && viewingAs())).map(btn => {
-        const option = document.createElement('option');
-        option.value = btn.dataset.profileTab;
-        option.textContent = btn.id === 'profile-tab-account' ? 'Settings' : btn.textContent.trim();
-        return option;
-      }));
-      mobileSelect.value = buttons.find(btn => btn.classList.contains('active'))?.dataset.profileTab || 'overview';
-    };
+    const header = document.querySelector('body > header');
+    if (header) new ResizeObserver(() => document.body.style.setProperty('--cw-mobile-header-height', `${header.getBoundingClientRect().height}px`)).observe(header);
     const tabFromHash = () => {
       const raw = profileRouteSegment(String(window.location?.hash || "").replace(/^#\/?/, "").split("?")[0].split("/")[0]);
       const key = raw === "security" || raw === "preferences" ? "account" : raw;
@@ -4683,7 +4754,8 @@
       if (!btn) return false;
       document.querySelectorAll("[data-profile-tab]").forEach((tab) => tab.classList.toggle("active", tab === btn));
       document.querySelectorAll(".cw-profile-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `profile-panel-${key}`));
-      syncMobileView();
+      document.body.dataset.profileView = key;
+      if (mobilePaging.matches && tabs) tabs.scrollLeft = Math.max(0, btn.offsetLeft - tabs.offsetLeft - 12);
       if (key === "overview" && overviewPagingDirty) {
         overviewPagingDirty = false;
         void loadOverview().catch(() => {});
@@ -4701,11 +4773,11 @@
         selectTab(btn.dataset.profileTab);
       });
     });
-    mobileSelect.addEventListener('change', () => {
-      if (!selectTab(mobileSelect.value)) syncMobileView();
+    $("#profile-hero-avatar")?.addEventListener("click", event => {
+      if (viewingAs() || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault();
+      selectTab("account");
     });
-    if (tabs) new MutationObserver(syncMobileView).observe(tabs, {subtree: true, attributes: true, attributeFilter: ['hidden']});
-    syncMobileView();
     window.addEventListener("hashchange", () => {
       const key = tabFromHash();
       if (key) selectTab(key, { fromHash: true });
@@ -4719,7 +4791,6 @@
     const pick = () => {
       if (!viewingAs()) input?.click();
     };
-    $("#profile-avatar-button")?.addEventListener("click", pick);
     $("#profile-avatar-replace")?.addEventListener("click", pick);
     $("#profile-avatar-remove")?.addEventListener("click", async (event) => {
       if (!armConfirm(event.currentTarget, "Confirm remove")) return;
@@ -5097,7 +5168,7 @@
 
   function wirePosterOverlay() {
     const openFromTarget = (target, event) => {
-      if (target?.closest?.("[data-collection-resize]")) return false;
+      if (target?.closest?.("[data-collection-resize],[data-provider-overflow],[data-collection-actions]")) return false;
       const btn = target?.closest?.("[data-profile-poster-key]");
       if (!btn) return false;
       const item = posterItems.get(btn.dataset.profilePosterKey || "");
@@ -5228,21 +5299,16 @@
     if (name) name.textContent = viewAsState.label || viewAsState.id;
     const settingsTab = $("#profile-tab-account");
     if (settingsTab) settingsTab.hidden = on;
-    const hero = $("#profile-avatar-button");
-    if (on && hero) {
-      hero.innerHTML = `<span class="material-symbols-rounded" aria-hidden="true">person</span>`;
-      hero.title = "Profile picture";
-      hero.setAttribute("aria-label", "Profile picture");
-    }
   }
 
   async function resolveViewAs() {
+    try { await window.__cwAuthBootstrapPromise; } catch {}
     const overview = window.CW?.OverviewProfile;
-    if (document.documentElement?.dataset?.cwRole !== "admin" || !overview) return;
-    const ready = overview.ready;
+    const ready = overview?.ready;
     if (ready && typeof ready.then === "function") {
-      await Promise.race([ready.catch(() => {}), new Promise((resolve) => setTimeout(resolve, 3000))]);
+      await ready.catch(() => {});
     }
+    if (document.documentElement?.dataset?.cwRole !== "admin" || !overview) return;
     const wanted = new URLSearchParams(window.location.search).get(VIEW_AS_PARAM);
     if (wanted !== null) overview.setActive(wanted);
     viewAsState.id = String(overview.id || "");
@@ -5259,15 +5325,182 @@
     });
   }
 
+  function wireMobileRecordTools() {
+    const narrow = window.matchMedia("(max-width:760px)");
+    const typeSelector = "[data-timeline-type],[data-playback-type],[data-collection-type]";
+    document.querySelectorAll(".cw-hub-records.cw-profile-panel").forEach((panel) => {
+      const toolbar = panel.querySelector(".cw-hub-records-toolbar");
+      if (!toolbar) return;
+      const key = panel.id.replace("profile-panel-", "");
+      const metrics = panel.querySelector(".cw-hub-records-tiles");
+      const sources = [...panel.querySelectorAll("[data-timeline-source]")];
+      const line = document.createElement("div");
+      line.className = "cw-hub-mobile-summary";
+      const source = document.createElement("select");
+      source.setAttribute("aria-label", "History source");
+      source.dataset.cwNativeSelect = "true";
+      sources.forEach((button) => source.add(new Option(button.textContent.trim(), button.dataset.timelineSource)));
+      if (sources.length) line.append(source);
+      const total = document.createElement("span");
+      line.append(total);
+      toolbar.before(line);
+      const chips = document.createElement("div");
+      chips.className = "cw-hub-mobile-active";
+      chips.setAttribute("aria-label", "Active filters");
+      toolbar.after(chips);
+      const trigger = document.createElement("button");
+      trigger.type = "button";
+      trigger.className = "cw-hub-mobile-filter";
+      trigger.setAttribute("aria-label", "Filters and display options");
+      trigger.setAttribute("aria-haspopup", "dialog");
+      trigger.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">tune</span><span hidden></span>';
+      toolbar.append(trigger);
+      const dialog = document.createElement("dialog");
+      dialog.className = "cw-hub-mobile-sheet";
+      dialog.id = `profile-${key}-mobile-tools`;
+      dialog.setAttribute("aria-labelledby", `${dialog.id}-title`);
+      trigger.setAttribute("aria-controls", dialog.id);
+      dialog.innerHTML = `<header><h2 id="${dialog.id}-title">Filters and display</h2><button type="button" aria-label="Close filters"><span class="material-symbols-rounded" aria-hidden="true">close</span></button></header><div class="cw-hub-mobile-sheet-body"></div><footer><button type="button" class="cw-btn">Done</button></footer>`;
+      panel.append(dialog);
+      const body = dialog.querySelector(".cw-hub-mobile-sheet-body");
+      const moved = [];
+      let enabled = false;
+      let signature = "";
+      const defaults = { coverage: "all", sort: key === "collection" ? "collected_at" : "last_updated" };
+      const selectedFilters = () => {
+        const entries = [];
+        body.querySelectorAll("select").forEach((select) => {
+          if (select.closest("[hidden]")) return;
+          const field = select.id.replace(`profile-${key}-`, "");
+          const fallback = defaults[field] || "";
+          if (!select.value || select.value === fallback) return;
+          entries.push({ label: select.selectedOptions[0]?.textContent.trim() || select.value, clear: () => {
+            select.value = fallback;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+          } });
+        });
+        const types = [...body.querySelectorAll(typeSelector)];
+        const active = types.find((button) => button.getAttribute("aria-pressed") === "true");
+        if (active && active !== types[0]) entries.push({ label: active.querySelector("span:not(.material-symbols-rounded)")?.textContent || active.textContent, clear: () => types[0]?.click() });
+        const rating = body.querySelector('[data-timeline-rating]:not([data-timeline-rating=""])[aria-pressed="true"]');
+        if (rating) entries.push({ label: `${rating.dataset.timelineRating}/10`, clear: () => rating.click() });
+        return entries;
+      };
+      const sync = () => {
+        if (!enabled) return;
+        if (dialog.open && !panel.classList.contains("active")) dialog.close();
+        const stats = [...metrics?.querySelectorAll(".cw-hub-records-stat") || []];
+        const stat = key === "collection" ? stats.at(-1) : stats[0];
+        const text = stat ? `${stat.querySelector("strong")?.textContent || "0"} ${stat.querySelector("span")?.textContent.toLowerCase() || "items"}` : "";
+        if (total.textContent !== text) total.textContent = text;
+        source.value = panel.dataset.source || sources[0]?.dataset.timelineSource || "";
+        const coverage = body.querySelector(".cw-hub-records-filters");
+        if (coverage && coverage.hidden !== (panel.dataset.coverage !== "on")) coverage.hidden = panel.dataset.coverage !== "on";
+        const entries = selectedFilters();
+        const status = body.querySelector(".cw-play-status");
+        const warning = status?.dataset.issues;
+        const next = JSON.stringify([entries.map((entry) => entry.label), warning]);
+        if (signature !== next) {
+          signature = next;
+          chips.replaceChildren();
+          entries.forEach((entry) => {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = entry.label;
+            button.setAttribute("aria-label", `Remove ${entry.label} filter`);
+            const icon = document.createElement("span");
+            icon.className = "material-symbols-rounded";
+            icon.setAttribute("aria-hidden", "true");
+            icon.textContent = "close";
+            button.append(icon);
+            button.addEventListener("click", () => { entry.clear(); sync(); });
+            chips.append(button);
+          });
+          if (warning) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = warning === "loading" ? "Providers loading" : "Provider needs attention";
+            button.addEventListener("click", () => trigger.click());
+            chips.append(button);
+          }
+          chips.hidden = !chips.childElementCount;
+          const badge = trigger.lastElementChild;
+          badge.textContent = String(entries.length);
+          badge.hidden = !entries.length;
+        }
+      };
+      const relocateMenus = (destination) => {
+        panel.querySelectorAll(".cw-icon-select").forEach((wrap) => {
+          if (wrap.__cwMenu && (destination !== dialog || dialog.contains(wrap))) destination.append(wrap.__cwMenu);
+        });
+      };
+      const close = () => { if (dialog.open) dialog.close(); };
+      trigger.addEventListener("click", () => {
+        window.CW?.IconSelect?.closeAll?.();
+        relocateMenus(dialog);
+        sync();
+        dialog.showModal();
+        document.documentElement.classList.add("cw-hub-sheet-open");
+      });
+      dialog.querySelector("header button").addEventListener("click", close);
+      dialog.querySelector("footer button").addEventListener("click", close);
+      dialog.addEventListener("close", () => {
+        window.CW?.IconSelect?.closeAll?.();
+        document.documentElement.classList.remove("cw-hub-sheet-open");
+      });
+      dialog.addEventListener("click", (event) => {
+        if (event.target === dialog) {
+          const rect = dialog.getBoundingClientRect();
+          if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) close();
+        }
+        if (event.target.closest("[data-timeline-toggle],[data-playback-timeline],[data-collection-timeline],[data-timeline-view],[data-playback-view],[data-collection-view],[data-playback-open-settings]")) close();
+      });
+      source.addEventListener("change", () => sources.find((button) => button.dataset.timelineSource === source.value)?.click());
+      panel.addEventListener("change", sync);
+      const observer = new MutationObserver(sync);
+      observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-pressed", "data-issues", "hidden"] });
+      observer.observe(panel, { attributes: true, attributeFilter: ["data-source", "data-coverage", "class"] });
+      const adapt = () => {
+        if (enabled === narrow.matches) return;
+        enabled = narrow.matches;
+        panel.classList.toggle("has-mobile-tools", enabled);
+        if (enabled) {
+          [".cw-hub-records-chips", ".cw-hist-scores", ".cw-hub-records-controls", ".cw-hub-records-filters", ".cw-hub-records-tiles", ".cw-hub-progress-summary", ".cw-play-status"].forEach((selector) => {
+            const node = panel.querySelector(selector);
+            if (!node) return;
+            const marker = document.createTextNode("");
+            node.before(marker);
+            moved.push({ node, marker });
+            body.append(node);
+          });
+          const filters = body.querySelector(".cw-play-filterpanel");
+          if (filters) filters.hidden = false;
+          sync();
+        } else {
+          close();
+          relocateMenus(document.body);
+          moved.splice(0).forEach(({ node, marker }) => marker.replaceWith(node));
+          panel.querySelectorAll(".cw-hub-records-filters,.cw-play-filterpanel").forEach((node) => { node.hidden = true; });
+          panel.querySelectorAll("[data-timeline-filters-toggle],[data-playback-filters-toggle]").forEach((button) => button.setAttribute("aria-expanded", "false"));
+        }
+      };
+      narrow.addEventListener("change", adapt);
+      adapt();
+    });
+  }
+
   async function init() {
     await resolveViewAs();
-    await refreshProfile().catch((error) => toast(error.message || "Profile could not be loaded", true));
+    const account = window.CW?.AuthState?.read?.()?.user;
+    if (account) renderProfile({user:account});
+    void refreshProfile().catch((error) => toast(error.message || "Profile could not be loaded", true));
     historyPanel.wire();
     ratingsPanel.wire();
     playbackPanel.wire();
     watchlistPanel.wire();
     wireTabs();
     wireCollection();
+    wireMobileRecordTools();
     wirePreferences();
     wireAvatar();
     wireForms();
@@ -5278,6 +5511,10 @@
     wirePosterOverlay();
     wireProfileActivity();
     void openUpgradeNotice();
+    if (nowTimer) clearInterval(nowTimer);
+    nowTimer = setInterval(() => {
+      if (document.visibilityState === "visible") refreshNowPlaying();
+    }, 15000);
     const [overviewResult, activityResult] = await Promise.allSettled([
       loadOverview(),
       loadProfileActivity(),
@@ -5289,10 +5526,6 @@
       const host = $("#profile-activity");
       if (host) host.innerHTML = empty("Recent activity could not be loaded.");
     }
-    if (nowTimer) clearInterval(nowTimer);
-    nowTimer = setInterval(() => {
-      if (document.visibilityState === "visible") refreshNowPlaying();
-    }, 15000);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init, { once: true });

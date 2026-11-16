@@ -34,12 +34,11 @@ async function fixture(t, theme = 'flat-dark', restricted = false, saved = null,
     if (path.startsWith('/api/')) return route.fulfill({json:{}});
     const attrs = theme === 'original' ? 'class="cw-theme-original"' : `data-cw-theme="${theme}" class="cw-theme-${theme === 'flat-light' ? 'light' : 'dark'}"`;
     return route.fulfill({contentType:'text/html',body:`<!doctype html><html ${attrs} data-tab="main" data-cw-role="${restricted || managedWrite ? 'user' : 'admin'}"><head><meta name="viewport" content="width=device-width,initial-scale=1">${[...styles,theme==='original'?'themes/original-coverage':'themes/flat'].map(path=>`<link rel="stylesheet" href="/assets/${path}.css">`).join('')}</head><body>
-      <header><nav class="tabs"><button id="tab-main" class="tab">Home</button>${restricted?'':'<button id="tab-tracker" class="tab">Tracker</button><button id="tab-snapshots" class="tab">Captures</button><button id="tab-playlists" class="tab">Playlists</button><button id="tab-editor" class="tab">Editor</button><div class="cw-tabmenu" id="tab-settings-menu"><button id="tab-settings" class="tab" aria-haspopup="menu" aria-expanded="false" onclick="document.getElementById(&quot;cw-settings-menu&quot;).classList.toggle(&quot;hidden&quot;)">Settings</button><div id="cw-settings-menu" class="cw-menu hidden"><button class="cw-menu-item" data-settings-pane="providers">Connections</button><button class="cw-menu-item" data-settings-pane="sync">Sync pairs</button><button class="cw-menu-item" data-settings-pane="scrobbler">Scrobbler</button><button class="cw-menu-item" data-settings-pane="app">UI and Security</button></div></div>'}<div class="cw-tabmenu" id="tab-about-menu"><button id="tab-about" class="tab">About</button></div></nav></header>
+      <header><nav class="tabs"><button id="tab-main" class="tab">Home</button>${restricted?'':'<button id="tab-tracker" class="tab">Tracker</button><button id="tab-snapshots" class="tab">Captures</button><button id="tab-playlists" class="tab">Playlists</button><button id="tab-editor" class="tab">Editor</button><div class="cw-tabmenu" id="tab-settings-menu"><button id="tab-settings" class="tab" aria-haspopup="menu" aria-expanded="false" onclick="document.getElementById(&quot;cw-settings-menu&quot;).classList.toggle(&quot;hidden&quot;)">Settings</button><div id="cw-settings-menu" class="cw-menu hidden"><button class="cw-menu-item" data-settings-pane="providers">Connections</button><button class="cw-menu-item" data-settings-pane="sync">Sync pairs</button><button class="cw-menu-item" data-settings-pane="scrobbler">Scrobbler</button><button class="cw-menu-item" data-settings-pane="app">UI and Security</button></div></div>'}<div class="cw-tabmenu" id="tab-about-menu"><button id="tab-about" class="tab">About</button></div>${profileAvailable ? '<a id="tab-profile" class="tab" href="/profile#overview">Profile</a>' : ''}</nav></header>
       <main id="layout"><section id="dashboard-widgets-card"></section><h1>Home</h1></main>
-      ${profileAvailable ? '<a href="/profile" data-cw-profile-menu-action="profile">Profile</a>' : ''}
       <script>window.auth={isManaged:${restricted},permissions:{write:${!restricted}},preferences:{}};window._cfgCache={tmdb_configured:true,ui:{}};window.CW={AuthState:{read:()=>auth}};window.openManualWatchedModal=()=>{window.quickAddOpened=true};window.addEventListener('hashchange',()=>{document.documentElement.dataset.tab=location.hash.slice(1).split('/')[0]||'main';document.dispatchEvent(new Event('tab-changed'));});</script>
       <script src="/assets/helpers/account-menu.js"></script><script src="/assets/helpers/playing-card.js"></script><script src="/assets/js/playingcard.js"></script>
-      <script>(()=>{const $=selector=>document.querySelector(selector),esc=value=>value;const WIDGETS=[{key:'history',label:'Recent history'},{key:'watchlist',label:'Watchlist'}],widgetLayout={},lastSettings={},currentConfig=null,mobileViewport=matchMedia('(max-width:760px)');function patchLayout(){}function resetLayout(){}function markWidgetsDirty(){}${picker}window.updateMobilePicker=updateMobilePicker;document.addEventListener('cw-mobile-navigation-ready',()=>updateMobilePicker());document.addEventListener('DOMContentLoaded',()=>updateMobilePicker());})();</script>
+      <script>(()=>{const $=selector=>document.querySelector(selector),esc=value=>value;const ON_PROFILE_PAGE=location.pathname==='/profile',WIDGETS=[{key:'history',label:'Recent history'},{key:'watchlist',label:'Watchlist'}],widgetLayout={},lastSettings={},currentConfig=null,mobileViewport=matchMedia('(max-width:760px)');function patchLayout(){}function resetLayout(){}function markWidgetsDirty(){}${picker}window.updateMobilePicker=updateMobilePicker;document.addEventListener('cw-mobile-navigation-ready',()=>updateMobilePicker());document.addEventListener('DOMContentLoaded',()=>updateMobilePicker());})();</script>
       <script>${quickAdd}</script></body></html>`});
   });
   await page.goto('https://mobile-preferences.test/');
@@ -51,6 +50,148 @@ async function openSettings(page) {
   await page.locator('#cw-mobile-more').click();
   await page.locator('#cw-mobile-widgets > summary').click();
 }
+
+test('Quick add is available on Home and stays hidden in Tracker and Media Hub',async t=>{
+  const {page}=await fixture(t);
+  await page.locator('#cw-quick-add .cw-qa-fab').waitFor();
+  for(const tab of ['tracker','profile','main']) {
+    await page.evaluate(tab=>{
+      document.documentElement.dataset.tab=tab;
+      document.dispatchEvent(new Event('tab-changed'));
+    },tab);
+    assert.equal(await page.locator('#cw-quick-add .cw-qa-fab').isVisible(),tab==='main');
+  }
+});
+
+async function swipeSurface(page, content = '<button id="swipe-card" style="width:100%;height:100%">Media card</button>') {
+  await page.evaluate(content => {
+    document.querySelector('#swipe-surface')?.remove();
+    const surface = document.createElement('div');
+    surface.id = 'swipe-surface';
+    surface.style.cssText = 'position:fixed;inset:200px 0 auto;height:260px;z-index:1000;background:#111;';
+    surface.innerHTML = content;
+    surface.addEventListener('click', () => { window.swipeCardClicks = (window.swipeCardClicks || 0) + 1; });
+    document.body.appendChild(surface);
+  }, content);
+}
+
+const touchSessions = new WeakMap();
+
+async function swipe(page, from = {x:290,y:300}, to = {x:90,y:300}, steps = 8, interval = 0) {
+  if (!touchSessions.has(page)) touchSessions.set(page, await page.context().newCDPSession(page));
+  const session = touchSessions.get(page);
+  await session.send('Input.dispatchTouchEvent', {type:'touchStart',touchPoints:[from]});
+  for (let step = 1; step <= steps; step++) {
+    if (interval) await page.waitForTimeout(interval);
+    await session.send('Input.dispatchTouchEvent', {type:'touchMove',touchPoints:[{x:from.x+(to.x-from.x)*step/steps,y:from.y+(to.y-from.y)*step/steps}]});
+  }
+  await session.send('Input.dispatchTouchEvent', {type:'touchEnd',touchPoints:[]});
+}
+
+test('mobile swipes claim the first horizontal move and allow slower gestures', async t => {
+  const {page} = await fixture(t);
+  await swipeSurface(page);
+  await page.evaluate(() => { document.body.style.minHeight = '2400px'; });
+  await swipe(page, {x:294,y:300}, {x:90,y:306}, 12);
+  await page.waitForURL('**/#tracker');
+  const started = Date.now();
+  await swipe(page, {x:90,y:300}, {x:294,y:306}, 40, 25);
+  assert.ok(Date.now() - started > 900);
+  await page.waitForURL('**/#main');
+  assert.equal(await page.evaluate(() => window.swipeCardClicks || 0), 0);
+});
+
+test('mobile swipes follow visible shortcuts and wrap in both directions without opening cards', async t => {
+  const {page} = await fixture(t);
+  await swipeSurface(page);
+  await page.locator('#swipe-card').tap();
+  await page.waitForFunction(() => window.swipeCardClicks === 1);
+  await page.evaluate(() => { window.swipeCardClicks = 0; });
+  await swipe(page);
+  await page.waitForURL('**/#tracker');
+  assert.equal(await page.evaluate(() => window.swipeCardClicks || 0), 0);
+  await swipe(page);
+  await page.waitForURL('**/profile#overview');
+  await page.locator('#cw-mobile-bottom-nav').waitFor();
+  await swipeSurface(page);
+  await swipe(page);
+  await page.waitForURL('**/#main');
+  await page.locator('#cw-mobile-bottom-nav').waitFor();
+  await swipeSurface(page);
+  await swipe(page, {x:90,y:300}, {x:290,y:300});
+  await page.waitForURL('**/profile#overview');
+  await page.locator('#cw-mobile-bottom-nav').waitFor();
+  await swipeSurface(page);
+  await swipe(page, {x:90,y:300}, {x:290,y:300});
+  await page.waitForURL('**/#tracker');
+  await page.locator('#cw-mobile-bottom-nav').waitFor();
+  await swipeSurface(page);
+  await swipe(page, {x:90,y:300}, {x:290,y:300});
+  await page.waitForURL(url => url.hash === '#main');
+  await page.locator('#swipe-card').tap();
+  await page.waitForFunction(() => window.swipeCardClicks === 1);
+  await swipe(page);
+  await page.waitForURL('**/#tracker');
+  assert.equal(await page.evaluate(() => window.swipeCardClicks || 0), 1);
+});
+
+test('mobile swipes pick up shortcut changes and leave gestures to interactive content', async t => {
+  const {page} = await fixture(t);
+  await openSettings(page);
+  await page.locator('#cw-mobile-shortcut-0').selectOption('snapshots');
+  await page.locator('#cw-mobile-shortcut-1').selectOption('editor');
+  await page.keyboard.press('Escape');
+  await swipeSurface(page);
+  await swipe(page);
+  await page.waitForURL('**/#snapshots');
+  await swipe(page);
+  await page.waitForURL('**/#editor');
+  await swipe(page, {x:90,y:300}, {x:290,y:300});
+  await page.waitForURL('**/#snapshots');
+  for (const content of [
+    '<div style="height:100%;overflow-x:auto"><div style="width:1200px;height:100%">Carousel</div></div>',
+    '<input type="range" style="width:100%;height:240px">',
+    '<textarea style="width:100%;height:240px"></textarea>',
+    '<div contenteditable="true" style="height:100%">Edit title</div>',
+    '<div draggable="true" style="height:100%">Drag item</div>',
+    '<div style="touch-action:none;height:100%">Timeline</div>',
+    '<div data-no-swipe style="height:100%">Custom gesture</div>'
+  ]) {
+    await swipeSurface(page, content);
+    await swipe(page);
+    assert.equal(new URL(page.url()).hash, '#snapshots', content);
+  }
+  await swipeSurface(page, '<div id="swipe-carousel" style="height:100%;overflow-x:auto"><div style="width:1200px;height:100%">Carousel</div></div>');
+  await swipe(page, {x:290,y:300}, {x:90,y:300});
+  await page.waitForFunction(() => document.querySelector('#swipe-carousel').scrollLeft > 0);
+  assert.equal(new URL(page.url()).hash, '#snapshots');
+  await swipeSurface(page, '<div id="swipe-scroll" style="height:100%;overflow-y:auto"><div style="height:1200px">Scrollable content</div></div>');
+  await swipe(page, {x:190,y:390}, {x:190,y:230});
+  await page.waitForFunction(() => document.querySelector('#swipe-scroll').scrollTop > 0);
+  assert.equal(new URL(page.url()).hash, '#snapshots');
+  await swipeSurface(page);
+  await swipe(page, {x:90,y:300}, {x:110,y:400});
+  await swipe(page, {x:5,y:300}, {x:290,y:300});
+  await swipe(page, {x:90,y:300}, {x:125,y:300});
+  assert.equal(new URL(page.url()).hash, '#snapshots');
+  await page.evaluate(() => {
+    const dialog = document.createElement('dialog');
+    dialog.id = 'swipe-dialog';
+    dialog.textContent = 'Dialog';
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  });
+  await swipe(page);
+  assert.equal(new URL(page.url()).hash, '#snapshots');
+  await page.evaluate(() => document.querySelector('#swipe-dialog').remove());
+  await page.locator('#cw-mobile-more').click();
+  await swipe(page);
+  assert.equal(new URL(page.url()).hash, '#snapshots');
+  await page.keyboard.press('Escape');
+  await page.setViewportSize({width:1200,height:900});
+  await swipe(page);
+  assert.equal(new URL(page.url()).hash, '#snapshots');
+});
 
 test('default mobile bar has two replaceable shortcuts and destination icons', async t => {
   const {page} = await fixture(t);
@@ -67,7 +208,7 @@ test('default mobile bar has two replaceable shortcuts and destination icons', a
   await page.locator('#cw-mobile-shortcut-1').selectOption('editor');
   assert.deepEqual(await routes(), ['main','snapshots','editor']);
   assert.equal(await page.locator('#tab-tracker').isVisible(), true);
-  assert.equal(await page.locator('#cw-mobile-navigation [data-mobile-route="profile/overview"]').isVisible(), true);
+  assert.equal(await page.locator('#cw-mobile-navigation #tab-profile').isVisible(), true);
   await page.locator('#cw-mobile-shortcut-1').selectOption('tracker');
   assert.equal(await page.locator('#tab-tracker').isVisible(), false);
   await page.reload();
@@ -109,7 +250,7 @@ for (const theme of ['original','flat-dark','flat-light']) test(`${theme}: More 
   await tile.click();
   await page.waitForURL('**/profile#overview');
   await page.locator('#cw-mobile-more').click();
-  await page.waitForFunction(()=>document.querySelector('#cw-mobile-navigation [data-mobile-route="profile/overview"]').getAttribute('aria-current')==='page');
+  await page.waitForFunction(()=>document.querySelector('#cw-mobile-navigation #tab-profile').getAttribute('aria-current')==='page');
   const selected=await tile.evaluate(node=>getComputedStyle(node).backgroundColor);
   assert.notEqual(selected,await menu.locator('#tab-editor').evaluate(node=>getComputedStyle(node).backgroundColor));
   await page.setViewportSize({width:1200,height:900});
@@ -208,7 +349,7 @@ test('More excludes fixed and pinned destinations, including settings submenu en
 for (const theme of ['original','flat-dark','flat-light']) test(`${theme}: My Media Hub pins Overview without adding slots`, async t => {
   const {page} = await fixture(t,theme,false,'["tracker","settings/sync"]');
   const pinned = page.locator('#cw-mobile-bottom-nav [data-mobile-route="profile/overview"]');
-  const extra = page.locator('#cw-mobile-navigation [data-mobile-route="profile/overview"]');
+  const extra = page.locator('#cw-mobile-navigation #tab-profile');
   await openSettings(page);
   assert.equal(await extra.getAttribute('href'), '/profile#overview');
   const first = page.locator('#cw-mobile-shortcut-0');
@@ -217,7 +358,7 @@ for (const theme of ['original','flat-dark','flat-light']) test(`${theme}: My Me
   await page.keyboard.press('Enter');
   assert.equal(await first.inputValue(), 'profile/overview');
   assert.equal(await pinned.count(), 1);
-  assert.equal(await extra.count(), 0);
+  assert.equal(await extra.isVisible(), false);
   assert.equal(await page.locator('#cw-mobile-bottom-nav > *').count(), 4);
   const second = page.locator('#cw-mobile-shortcut-1');
   assert.equal(await second.locator('option[value="profile/overview"]').isDisabled(), true);
@@ -255,7 +396,7 @@ for (const theme of ['original','flat-dark','flat-light']) test(`${theme}: My Me
   await extra.focus();
   await page.keyboard.press('Enter');
   await page.waitForURL('**/profile#overview');
-  await page.waitForFunction(()=>document.querySelector('#cw-mobile-navigation [data-mobile-route="profile/overview"]').getAttribute('aria-current')==='page');
+  await page.waitForFunction(()=>document.querySelector('#cw-mobile-navigation #tab-profile').getAttribute('aria-current')==='page');
   assert.equal(await extra.getAttribute('aria-current'), 'page');
   assert.equal(await page.locator('#cw-mobile-more').getAttribute('aria-expanded'), 'false');
   assert.equal(await page.locator('#cw-mobile-more').evaluate(node=>node.classList.contains('is-current')), true);
@@ -283,5 +424,5 @@ test('managed writers retain permitted shortcuts and routes from the media hub',
   await page.waitForURL('**/profile#overview');
   await openSettings(page);
   assert.deepEqual(await page.locator('#cw-mobile-shortcut-0 option').evaluateAll(nodes=>nodes.map(node=>node.value)), ['tracker','snapshots','playlists','editor','profile/overview']);
-  for (const route of ['main','tracker']) assert.equal(await page.locator(`#cw-mobile-bottom-nav [data-mobile-route="${route}"]`).getAttribute('href'), `/?main=1&ui=full#${route}`);
+  for (const route of ['main','tracker']) assert.equal(await page.locator(`#cw-mobile-bottom-nav [data-mobile-route="${route}"]`).getAttribute('href'), `/?main=1#${route}`);
 });

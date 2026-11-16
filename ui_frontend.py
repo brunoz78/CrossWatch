@@ -27,7 +27,7 @@ DEFAULT_MANIFEST: str = r"""{
   "short_name": "CrossWatch",
   "description": "Sync watchlists, history and ratings across Plex, Trakt, SIMKL, Jellyfin and more.",
   "id": "/",
-  "start_url": "/?ui=compact",
+  "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui", "browser"],
@@ -133,7 +133,7 @@ def register_ui_root(app: FastAPI) -> None:
 
 
 _HELPER_SCRIPTS = (
-    "selection-bar.js", "help-links.js", "touch-help.js", "provider-meta.js", "feature-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js", "details-log.js",
+    "selection-bar.js", "card-actions.js", "help-links.js", "touch-help.js", "provider-meta.js", "feature-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "pwa-install.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js", "details-log.js",
     "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js", "month-bar.js", "providers-ui.js", "settings-ui.js", "settings-save.js", "maintenance.js", "backups.js",
     "restart_apply.js",
 )
@@ -143,7 +143,7 @@ _APP_SCRIPTS = (
     "scrobbler.js", "user-profiles.js", "app-users.js", "mcp-access.js", "assistant-settings.js",
 )
 _USER_HELPER_SCRIPTS = (
-    "selection-bar.js", "help-links.js", "touch-help.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js",
+    "selection-bar.js", "card-actions.js", "help-links.js", "touch-help.js", "provider-meta.js", "icon-select.js", "profile-select.js", "page-loader.js", "dom.js", "events.js", "auth-state.js", "pwa-install.js", "account-menu.js", "notifications.js", "update-notifications.js", "database-notifications.js", "api.js", "core.js",
     "media-meta.js", "trailer.js", "playing-card.js", "watchlist-preview.js", "profile-datetime.js",
 )
 _USER_APP_SCRIPTS = (
@@ -297,7 +297,7 @@ def _assert_admin_shell_stripped(html: str, *, settings_panes: set[str] | None =
 
 def _profile_nav_tab(label: str, href: str, active: bool = False) -> str:
     cls = "tab active" if active else "tab"
-    route = {"Main": "main", "Captures": "snapshots", "Playlists": "playlists", "Tracker": "tracker", "Editor": "editor"}.get(label)
+    route = {"Main": "main", "Hub": "profile", "Captures": "snapshots", "Playlists": "playlists", "Tracker": "tracker", "Editor": "editor"}.get(label)
     tab_id = f' id="tab-{route}"' if route else ""
     return f"<button{tab_id} class=\"{cls}\" type=\"button\" onclick=\"location.href='{href}'\">{label}</button>"
 
@@ -345,62 +345,64 @@ def _profile_remove_dialog() -> str:
 def _profile_timeline_panel(
     key: str,
     *,
-    kicker: str,
     title: str,
     lede: str,
     search: str,
-    sources: tuple[tuple[str, str, str, str], ...],
+    sources: tuple[tuple[str, str], ...],
     coverage: tuple[tuple[str, str], ...],
     scores: bool = False,
     bulk: bool = False,
     timeline: bool = True,
 ) -> str:
     timeline_button = (
-        '          <button class="active cw-view-timeline" type="button" data-timeline-toggle title="Show timeline" aria-label="Show timeline" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>\n'
+        '          <button class="cw-view-timeline" type="button" data-timeline-toggle title="Show timeline" aria-label="Show timeline" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>\n'
         if timeline else ""
     )
     source_block = ""
     if len(sources) > 1:
         buttons = "\n".join(
             f'      <button class="{"active" if index == 0 else ""}" type="button" role="tab" aria-selected="{"true" if index == 0 else "false"}" data-timeline-source="{value}">\n'
-            f'        <span class="material-symbols-rounded" aria-hidden="true">{icon}</span>\n'
-            f'        <span class="cw-hist-source-copy"><strong>{label}</strong><small>{note}</small></span>\n'
+            f'        <span>{label}</span>\n'
             "      </button>"
-            for index, (value, icon, label, note) in enumerate(sources)
+            for index, (value, label) in enumerate(sources)
         )
-        source_block = f'    <div class="cw-hist-sources" role="tablist" aria-label="{title} source">\n{buttons}\n    </div>\n'
+        source_block = f'    <div class="cw-hub-source-line"><div class="cw-hub-sources" role="tablist" aria-label="{title} source">\n{buttons}\n    </div><p id="profile-{key}-lede">{lede}</p></div>\n'
     scores_block = f'    <div id="profile-{key}-scores" class="cw-hist-scores" aria-label="Filter by score"></div>\n' if scores else ""
     options = "\n".join(f'          <option value="{value}">{label}</option>' for value, label in coverage)
     bulk_block = _profile_bulk_bar(f"profile-{key}-bulk", "timeline") if bulk else ""
     default_source = sources[0][0] if sources else ""
-    return f"""  <section id="profile-panel-{key}" class="cw-profile-panel cw-timeline-panel" data-source="{default_source}" data-coverage="on" data-dated="{"on" if timeline else "off"}">
-    <div class="cw-collection-head">
-      <div class="cw-collection-headline">
-        <span class="cw-collection-kicker" id="profile-{key}-kicker">{kicker}</span>
+    lede_block = "" if source_block else f'<p id="profile-{key}-lede">{lede}</p>'
+    timeline_block = f'<div id="profile-{key}-timeline" class="cw-hist-timeline" aria-label="{title} per month" hidden></div>'
+    coverage_select = f'<select id="profile-{key}-coverage" class="cw-hist-coverage-select" aria-label="Sync coverage filter">{options}</select>'
+    filter_button = f'<button type="button" class="cw-hub-filter-toggle" data-timeline-filters-toggle aria-controls="profile-{key}-filters" aria-expanded="false">Filters</button>'
+    filter_block = f'<div id="profile-{key}-filters" class="cw-hub-records-filters" hidden><label>Coverage {coverage_select}</label></div>'
+    return f"""  <section id="profile-panel-{key}" class="cw-profile-panel cw-timeline-panel cw-hub-records cw-page-panel" data-source="{default_source}" data-coverage="on" data-dated="{"on" if timeline else "off"}">
+    <div class="cw-hub-records-head">
+      <div class="cw-hub-records-headline">
         <h2 id="profile-{key}-title">{title}</h2>
-        <p id="profile-{key}-lede">{lede}</p>
+        {lede_block}
       </div>
-      <div class="cw-collection-tiles" id="profile-{key}-metrics"></div>
+      <div class="cw-hub-records-tiles" id="profile-{key}-metrics"></div>
     </div>
-{source_block}    <div id="profile-{key}-timeline" class="cw-hist-timeline" aria-label="{title} per month" hidden></div>
-{scores_block}    <div class="cw-collection-toolbar">
-      <label class="cw-collection-search">
+{source_block}
+{scores_block}    <div class="cw-hub-records-toolbar">
+      <label class="cw-hub-records-search">
         <span class="material-symbols-rounded" aria-hidden="true">search</span>
         <input id="profile-{key}-search" type="search" placeholder="{search}">
       </label>
-      <div class="cw-collection-chips" id="profile-{key}-types" aria-label="{title} type filters"></div>
-      <div class="cw-collection-controls">
-        <select id="profile-{key}-coverage" class="cw-hist-coverage-select" aria-label="Sync coverage filter">
-{options}
-        </select>
+      <div class="cw-hub-records-chips" id="profile-{key}-types" aria-label="{title} type filters"></div>
+      <div class="cw-hub-records-controls">
         <select id="profile-{key}-provider" aria-label="Provider filter"><option value="">All providers</option></select>
-        <div class="cw-collection-views" role="group" aria-label="View mode">
+        {filter_button}
+        <div class="cw-hub-records-views" role="group" aria-label="View mode">
 {timeline_button}          <button class="active" type="button" data-timeline-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
           <button type="button" data-timeline-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
         </div>
         <button id="profile-{key}-refresh" class="cw-tl-ghost cw-collection-refresh" type="button" data-timeline-refresh title="Refresh {title}" aria-label="Refresh {title}"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
       </div>
     </div>
+    {filter_block}
+    {timeline_block}
     <div id="profile-{key}-list" class="cw-hist-list" data-view="grid" aria-live="polite"></div>
     <div id="profile-{key}-footer" class="cw-collection-footer" hidden>
       <nav id="profile-{key}-pages" class="cw-collection-pages" aria-label="{title} pages"></nav>
@@ -417,28 +419,26 @@ def _profile_timeline_panel(
 
 
 def _profile_playback_panel() -> str:
-    return """  <section id="profile-panel-playback" class="cw-profile-panel cw-timeline-panel cw-playback-panel" data-source="playback">
-    <div class="cw-collection-head">
-      <div class="cw-collection-headline">
-        <span class="cw-collection-kicker">Live from your players</span>
-        <h2>Progress</h2>
-        <p>Unfinished plays read live from every connected provider.</p>
-      </div>
-      <div class="cw-collection-tiles" id="profile-playback-metrics"></div>
+    return """  <section id="profile-panel-playback" class="cw-profile-panel cw-timeline-panel cw-playback-panel cw-hub-records cw-page-panel" data-source="playback">
+    <div class="cw-hub-records-head">
+      <h2>Progress</h2>
+      <div class="cw-hub-records-tiles" id="profile-playback-metrics"></div>
+    </div>
+    <div class="cw-hub-progress-summary"><span>Across your connected providers</span>
+      <span id="profile-playback-sync" class="cw-play-sync" data-state="ready" aria-live="polite"><span class="cw-play-sync-dot" aria-hidden="true"></span><span>Updated <strong>not yet</strong></span></span>
     </div>
     <div id="profile-playback-status" class="cw-play-status">
       <span id="profile-playback-errors" class="cw-play-issues" role="status" hidden></span>
     </div>
-    <div id="profile-playback-timeline" class="cw-hist-timeline" aria-label="Progress per month" hidden></div>
-    <div class="cw-collection-toolbar">
-      <label class="cw-collection-search">
+    <div class="cw-hub-records-toolbar">
+      <label class="cw-hub-records-search">
         <span class="material-symbols-rounded" aria-hidden="true">search</span>
         <input id="profile-playback-search" type="search" placeholder="Search playback...">
       </label>
-      <div class="cw-collection-chips" id="profile-playback-types" aria-label="Playback type filters"></div>
-      <div class="cw-collection-controls">
+      <div class="cw-hub-records-chips" id="profile-playback-types" aria-label="Playback type filters"></div>
+      <div class="cw-hub-records-controls">
         <div class="cw-play-filters">
-          <button id="profile-playback-filters-btn" class="cw-tl-ghost cw-play-filterbtn" type="button" data-playback-filters-toggle aria-expanded="false" aria-haspopup="true" aria-controls="profile-playback-filters-panel" title="Filter playback" aria-label="Filter playback"><span class="material-symbols-rounded" aria-hidden="true">filter_list</span><span>Filters</span><span id="profile-playback-filters-count" class="cw-play-filtercount" aria-live="polite" hidden>0</span></button>
+          <button id="profile-playback-filters-btn" class="cw-hub-filter-toggle cw-play-filterbtn" type="button" data-playback-filters-toggle aria-expanded="false" aria-haspopup="true" aria-controls="profile-playback-filters-panel" title="Filter playback" aria-label="Filter playback"><span class="material-symbols-rounded" aria-hidden="true">filter_list</span><span>Filters</span><span id="profile-playback-filters-count" class="cw-play-filtercount" aria-live="polite" hidden>0</span></button>
           <div id="profile-playback-filters-panel" class="cw-play-filterpanel" role="group" aria-labelledby="profile-playback-filters-btn" hidden>
             <label class="cw-play-filterrow"><span>Provider</span>
               <select id="profile-playback-provider" aria-label="Provider filter"><option value="">All providers</option></select>
@@ -478,16 +478,16 @@ def _profile_playback_panel() -> str:
             </div>
           </div>
         </div>
-        <div class="cw-collection-views" role="group" aria-label="View mode">
-          <button class="active cw-view-timeline" type="button" data-playback-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
+        <div class="cw-hub-records-views" role="group" aria-label="View mode">
+          <button class="cw-view-timeline" type="button" data-playback-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
           <button class="active" type="button" data-playback-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
           <button type="button" data-playback-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
         </div>
-        <span id="profile-playback-sync" class="cw-play-sync" data-state="ready" aria-live="polite"><span class="cw-play-sync-dot" aria-hidden="true"></span><span>Updated <strong>not yet</strong></span></span>
-        <button id="profile-playback-settings" class="cw-tl-ghost cw-play-toolbtn" type="button" data-playback-open-settings hidden title="Choose playback providers" aria-label="Choose playback providers"><span class="material-symbols-rounded" aria-hidden="true">tune</span></button>
-        <button id="profile-playback-refresh" class="cw-tl-ghost cw-play-toolbtn" type="button" data-playback-retry title="Refresh Progress" aria-label="Refresh Progress"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
+        <button id="profile-playback-settings" class="cw-hub-filter-toggle cw-play-toolbtn" type="button" data-playback-open-settings hidden title="Choose playback providers" aria-label="Choose playback providers"><span class="material-symbols-rounded" aria-hidden="true">tune</span></button>
+        <button id="profile-playback-refresh" class="cw-hub-filter-toggle cw-play-toolbtn" type="button" data-playback-retry title="Refresh Progress" aria-label="Refresh Progress"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
       </div>
     </div>
+    <div id="profile-playback-timeline" class="cw-hist-timeline" aria-label="Progress per month" hidden></div>
     <div id="profile-playback-list" class="cw-hist-list" data-view="grid" aria-live="polite"></div>
     <div id="profile-playback-footer" class="cw-collection-footer" hidden>
       <nav id="profile-playback-pages" class="cw-collection-pages" aria-label="Playback pages"></nav>
@@ -584,38 +584,27 @@ def _profile_avatar_inner(user: dict | None = None) -> str:
     return '<span class="material-symbols-rounded" aria-hidden="true">person</span>'
 
 
-_PROFILE_MENU_ITEMS = (
-    ("profile", "home", "Overview", ""),
-    ("watchlist", "bookmark", "Watchlist", "watchlist"),
-    ("history", "history", "History", ""),
-    ("ratings", "star", "Ratings", ""),
-    ("collections", "video_library", "Collections", ""),
-    ("playback", "resume", "Progress", "playback"),
-)
-
-
 def _profile_menu_items(user: dict | None = None) -> str:
-    is_admin = bool(isinstance(user, dict) and user.get("is_admin"))
-    perms = _managed_user_permissions(user)
-    media = "\n".join(
-        f'        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="{action}"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">{icon}</span><span>{label}</span></button>'
-        for action, icon, label, permission in _PROFILE_MENU_ITEMS
-        if not permission or is_admin or perms.get(permission)
-    )
-    tracker = ""
-    if is_admin or _managed_tracker_allowed(user):
-        tracker = """
-        <div class="cw-menu-sep" role="separator"></div>
-        <button class="cw-menu-item cw-account-group-toggle" type="button" role="menuitem" aria-expanded="true" aria-controls="cw-account-tracker"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">menu_book</span><span>CW Tracker</span><span class="material-symbols-rounded cw-account-chevron" aria-hidden="true">expand_more</span></button>
-        <div id="cw-account-tracker" class="cw-account-group" role="group" aria-label="CW Tracker">
-          <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="tracker"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">home</span><span>Overview</span></button>
-        </div>"""
-    return f"""        <button class="cw-menu-item cw-account-group-toggle" type="button" role="menuitem" aria-expanded="true" aria-controls="cw-account-media"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">bar_chart</span><span>My Media Hub</span><span class="material-symbols-rounded cw-account-chevron" aria-hidden="true">expand_more</span></button>
-        <div id="cw-account-media" class="cw-account-group" role="group" aria-label="My Media Hub">
-{media}
-        </div>{tracker}
-        <div class="cw-menu-sep" role="separator"></div>
-        <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="account"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">person</span><span>My Profile</span></button>"""
+    user = user or {}
+    name = html_lib.escape(str(user.get("display_name") or user.get("label") or user.get("username") or "Profile"))
+    username = html_lib.escape(str(user.get("username") or ""))
+    preferences = ""
+    if user.get("is_admin") or _managed_user_permissions(user).get("write"):
+        preferences = '<button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="preferences"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">tune</span><span>Preferences</span></button>'
+    return f"""<div class="cw-account-identity"><strong>{name}</strong><span>@{username}</span></div>
+        <div data-cw-account-panel="main">
+          <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="account"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">person</span><span>My profile</span></button>
+          {preferences}
+          <button class="cw-menu-item" type="button" role="menuitem" data-cw-account-view="help"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help &amp; About</span></button>
+          <div class="cw-menu-sep" role="separator"></div>
+          <button class="cw-menu-item danger" type="button" role="menuitem" data-cw-profile-menu-action="logout"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Log out</span></button>
+        </div>
+        <div data-cw-account-panel="help" hidden>
+          <button class="cw-menu-item" type="button" role="menuitem" data-cw-account-view="main"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">arrow_back</span><span>Back</span></button>
+          <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="help"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help</span></button>
+          <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="about"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">info</span><span>About CrossWatch</span></button>
+        </div>
+        <div class="cw-account-version">__CW_CURRENT_VERSION__</div>"""
 
 
 def _nav_profile_link(user: dict | None = None) -> str:
@@ -626,8 +615,6 @@ def _nav_profile_link(user: dict | None = None) -> str:
       </button>
       <div class="cw-menu cw-profile-menu cw-page-account-menu hidden" id="cw-profile-menu" role="menu" aria-labelledby="cw-nav-profile-link">
 __CW_NAV_PROFILE_ITEMS__
-        <div class="cw-menu-sep" role="separator" aria-hidden="true"></div>
-        <button class="cw-menu-item danger" type="button" role="menuitem" data-cw-profile-menu-action="logout"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Logout</span></button>
       </div>
     </div>""".replace("__CW_NAV_PROFILE_AVATAR__", _nav_profile_avatar(user)).replace("__CW_NAV_PROFILE_ITEMS__", _profile_menu_items(user))
 
@@ -645,9 +632,10 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
     if write_allowed:
         tabs = [
             '    <button id="tab-main" class="tab active" type="button" onclick="showTab(\'main\')">Main</button>',
+            *(['    <button id="tab-tracker" class="tab" type="button" onclick="showTab(\'tracker\')">Tracker</button>'] if tracker else []),
+            _profile_nav_tab("Hub", "/profile#overview"),
             '    <button id="tab-snapshots" class="tab" type="button" onclick="showTab(\'snapshots\')">Captures</button>',
             '    <button id="tab-playlists" class="tab" type="button" onclick="showTab(\'playlists\')">Playlists</button>',
-            *(['    <button id="tab-tracker" class="tab" type="button" onclick="showTab(\'tracker\')">Tracker</button>'] if tracker else []),
             '    <button id="tab-editor" class="tab" type="button" onclick="showTab(\'editor\')">Editor</button>',
             *(['    <button id="tab-settings" class="tab" type="button" onclick="showTab(\'settings\')">Settings</button>'] if settings_panes else []),
             _nav_profile_link(user),
@@ -659,7 +647,7 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
             '  <nav class="tabs" aria-label="Primary navigation">\n' + "\n".join(tabs) + "\n",
         )
     else:
-        tabs = ['    <button id="tab-main" class="tab" data-cw-profile-home="1" type="button" onclick="location.href=\'/profile\'">Main</button>']
+        tabs = [_profile_nav_tab("Hub", "/profile#overview")]
         tabs.append(_nav_profile_link(user))
         html = html.replace(
             '<div class="brand" role="button" tabindex="0" title="Go to Main" onclick="showTab(\'main\')" onkeypress="if(event.key===\'Enter\'||event.key===\' \')showTab(\'main\')">',
@@ -691,11 +679,6 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
         html = _remove_html_section(html, '  <section id="ops-card"')
         html = _remove_html_section(html, '  <section id="stats-card"')
         html = _remove_html_section(html, '  <section id="dashboard-widgets-card"')
-    html = _remove_html_range(
-        html,
-        '    <div class="cw-tabmenu" id="tab-settings-menu">',
-        '    <div class="cw-tabmenu" id="tab-about-menu">',
-    )
     if settings_panes:
         html = _strip_settings_panes(html, settings_panes)
         html = _remove_line(html, '<div id="save-frost" class="hidden" aria-hidden="true"></div>')
@@ -881,34 +864,6 @@ def _get_index_html_static() -> str:
 <script>
 (() => {
   try {
-    const q = new URLSearchParams(window.location.search || "");
-    const ui = String(q.get("ui") || "").toLowerCase();
-    const explicit = ui === "compact" || ui === "full" || q.get("compact") === "1" || q.get("full") === "1";
-    const hasCompactViewport = !!window.matchMedia?.("(max-width: 680px)")?.matches;
-    const uaLooksMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
-    const likelyHandheld = (() => {
-      try {
-        if (typeof navigator.userAgentData?.mobile === "boolean") return navigator.userAgentData.mobile;
-      } catch {}
-      if (uaLooksMobile) return true;
-      try {
-        const coarse = !!window.matchMedia?.("(pointer: coarse)")?.matches;
-        const fine = !!window.matchMedia?.("(pointer: fine)")?.matches;
-        const points = Number(navigator.maxTouchPoints || 0);
-        return points > 1 && coarse && !fine && hasCompactViewport;
-      } catch {}
-      return false;
-    })();
-    let saved = "";
-    try { saved = String(localStorage.getItem("cw_ui_mode") || "").toLowerCase(); } catch {}
-    const wantCompact = ui === "compact" || q.get("compact") === "1" || (!explicit && (saved === "compact" || (saved !== "full" && hasCompactViewport && likelyHandheld)));
-    if (wantCompact) document.documentElement.classList.add("cw-compact");
-  } catch {}
-})();
-</script>
-<script>
-(() => {
-  try {
     const segment = (value) => {
       try { value = decodeURIComponent(String(value || "")); } catch {}
       return String(value || "").trim().toLowerCase().replace(/-/g, "_");
@@ -926,7 +881,6 @@ def _get_index_html_static() -> str:
     }
     const tabs = new Set(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
     let tab = tabs.has(route) ? route : "main";
-    if (document.documentElement.classList.contains("cw-compact") && tab !== "main") tab = "main";
     document.documentElement.dataset.cwInitialTab = tab;
     document.documentElement.dataset.tab = tab;
     if (tab === "settings") {
@@ -1019,9 +973,10 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
 
   <nav class="tabs" aria-label="Primary navigation">
     <button id="tab-main" class="tab active" type="button" onclick="showTab('main')">Main</button>
+    <button id="tab-tracker" class="tab" type="button" onclick="showTab('tracker')">Tracker</button>
+    <button id="tab-profile" class="tab" type="button" onclick="location.href='/profile#overview'">Hub</button>
     <button id="tab-snapshots" class="tab" type="button" onclick="showTab('snapshots')">Captures</button>
     <button id="tab-playlists" class="tab" type="button" onclick="showTab('playlists')">Playlists</button>
-    <button id="tab-tracker" class="tab" type="button" onclick="showTab('tracker')">Tracker</button>
     <button id="tab-editor" class="tab" type="button" onclick="showTab('editor')">Editor</button>
     <div class="cw-tabmenu" id="tab-settings-menu">
       <button id="tab-settings" class="tab" type="button"
@@ -1041,25 +996,9 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
         <button class="cw-menu-item" data-settings-pane="maintenance" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect('maintenance')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">build</span><span>Maintenance</span></button>
       </div>
     </div>
-    <div class="cw-tabmenu" id="tab-about-menu">
-      <button id="tab-about" class="tab" type="button"
-              aria-haspopup="menu" aria-expanded="false"
-              onclick="window.cwToggleAboutMenu(event)">
-        <span>About</span>
-        <span class="tab-caret" aria-hidden="true"></span>
-      </button>
-      <div class="cw-menu hidden" id="cw-about-menu" role="menu" aria-labelledby="tab-about">
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('about')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">info</span><span>About</span></button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('help')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help</span></button>
-        <button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect('assistant')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">auto_awesome</span><span>Ask CrossWatch</span></button>
-      </div>
-    </div>
 __CW_NAV_PROFILE_MENU__
   </nav>
 
-  <div class="cw-ui-toggle" aria-label="UI mode">
-    <button id="cw-ui-mode-switch" class="cw-ui-mode-switch" type="button" role="switch" aria-checked="false" aria-label="Compact mode" onclick="cwSetUiMode(document.documentElement.classList.contains('cw-compact') ? 'full' : 'compact')"><span>Compact</span><span class="cw-ui-switch-track" aria-hidden="true"><span class="cw-ui-switch-thumb"></span></span></button>
-  </div>
 </header>
 
 <div id="cw-main-loading" role="status">Loading dashboard...</div>
@@ -1134,6 +1073,7 @@ __CW_NAV_PROFILE_MENU__
               <button id="det-copy" class="ghost det-tool-icon" type="button" title="Copy current output" aria-label="Copy current output"><span class="material-symbols-rounded" aria-hidden="true">content_copy</span></button>
               <button id="det-clear" class="ghost det-tool-icon" type="button" title="Clear current output" aria-label="Clear current output"><span class="material-symbols-rounded" aria-hidden="true">delete</span></button>
               <button id="det-follow" class="ghost det-follow" type="button" title="Toggle auto-follow" aria-pressed="true"><span class="material-symbols-rounded det-follow-icon" aria-hidden="true">podcasts</span><span>Follow</span><span class="material-symbols-rounded det-follow-caret" aria-hidden="true">expand_more</span></button>
+              <button id="det-more" class="ghost det-tool-icon" type="button" aria-label="Log actions" aria-haspopup="menu"><span class="material-symbols-rounded" aria-hidden="true">more_horiz</span></button>
             </div>
           </div>
           <div class="det-panels">
@@ -1197,12 +1137,12 @@ __CW_NAV_PROFILE_MENU__
 
     <div class="stat-tiles" id="stat-providers"></div>
 
-    <div class="stat-block" id="recent-activity-block">
+    <div class="stat-block cw-recent-feed" id="recent-activity-block">
       <div class="stat-block-header"><span class="pill plain">Recent Scrobble</span><button id="activity-view-all" class="ghost refresh-insights" type="button">View all</button></div>
       <div id="recent-activity" class="history-list"></div>
     </div>
 
-    <div class="stat-block">
+    <div class="stat-block cw-recent-feed">
       <div class="stat-block-header"><span class="pill plain">Recent syncs</span><button class="ghost refresh-insights material-symbols-rounded" onclick="refreshInsights()" title="Refresh" aria-label="Refresh recent syncs">refresh</button></div>
       <div id="sync-history" class="history-list"></div>
     </div>
@@ -2693,73 +2633,63 @@ def get_profile_html(user: dict | None = None) -> str:
         '<button class="cw-menu-item" data-settings-pane="maintenance" type="button" role="menuitem" onclick="window.cwSettingsMenuSelect(\'maintenance\')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">build</span><span>Maintenance</span></button>'
         '</div></div>'
     )
-    about_nav = (
-        '<div class="cw-tabmenu" id="tab-about-menu">'
-        '<button id="tab-about" class="tab" type="button" aria-haspopup="menu" aria-expanded="false" onclick="window.cwToggleAboutMenu(event)"><span>About</span><span class="tab-caret" aria-hidden="true"></span></button>'
-        '<div class="cw-menu hidden" id="cw-about-menu" role="menu" aria-labelledby="tab-about">'
-        '<button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect(\'about\')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">info</span><span>About</span></button>'
-        '<button class="cw-menu-item" type="button" role="menuitem" onclick="window.cwAboutMenuSelect(\'help\')"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help</span></button>'
-        '</div></div>'
-    )
     nav_items: list[str] = []
     if is_admin:
         nav_items.extend([
             _profile_nav_tab("Main", "/"),
+            _profile_nav_tab("Tracker", "/#tracker"),
+            _profile_nav_tab("Hub", "/profile#overview", active=True),
             _profile_nav_tab("Captures", "/#snapshots"),
             _profile_nav_tab("Playlists", "/#playlists"),
-            _profile_nav_tab("Tracker", "/#tracker"),
             _profile_nav_tab("Editor", "/#editor"),
             settings_nav,
-            about_nav,
         ])
     elif write_nav:
         nav_items.extend([
             _profile_nav_tab("Main", "/?main=1#main"),
+            *([_profile_nav_tab("Tracker", "/?main=1#tracker")] if _managed_tracker_allowed(user) else []),
+            _profile_nav_tab("Hub", "/profile#overview", active=True),
             _profile_nav_tab("Captures", "/?main=1#snapshots"),
             _profile_nav_tab("Playlists", "/?main=1#playlists"),
-            *([_profile_nav_tab("Tracker", "/?main=1#tracker")] if _managed_tracker_allowed(user) else []),
             _profile_nav_tab("Editor", "/?main=1#editor"),
         ])
     else:
-        nav_items.append(_profile_nav_tab("Main", "/profile", active=True))
+        nav_items.append(_profile_nav_tab("Hub", "/profile#overview", active=True))
     nav_items.append(_nav_profile_link(user).strip())
     profile_nav = "\n    ".join(nav_items)
     history_panel = _profile_timeline_panel(
         "history",
-        kicker="Sync output",
-        title="Synced history",
+        title="History",
         lede="Plays read back from every provider after sync.",
         search="Search synced history...",
         sources=(
-            ("synced", "sync", "Synced history", "Read from your providers after each sync run"),
-            ("scrobble", "sensors", "Scrobbles", "Recorded live by CrossWatch, with where each play was sent"),
+            ("synced", "Synced history"),
+            ("scrobble", "Scrobbles"),
         ),
         coverage=(("all", "Any coverage"), ("partial", "Missing somewhere"), ("full", "On every provider")),
         bulk=True,
     )
     ratings_panel = _profile_timeline_panel(
         "ratings",
-        kicker="Sync output",
         title="Ratings",
         lede="Your scores read back from every provider after sync.",
         search="Search ratings...",
-        sources=(("ratings", "star", "Ratings", ""),),
+        sources=(("ratings", "Ratings"),),
         coverage=(("all", "Any coverage"), ("partial", "Missing somewhere"), ("full", "On every provider"), ("mismatch", "Scores differ")),
         scores=True,
         bulk=True,
     )
     playback_allowed = bool(perms.get("playback"))
-    playback_tab = '    <button id="profile-tab-playback" type="button" data-profile-tab="playback">Progress</button>' if playback_allowed else ""
+    playback_tab = '    <button id="profile-tab-playback" type="button" data-profile-tab="playback"><span class="material-symbols-rounded" aria-hidden="true">play_circle</span><span data-tab-label>Progress</span></button>' if playback_allowed else ""
     playback_panel = _profile_playback_panel() if playback_allowed else ""
     watchlist_allowed = bool(perms.get("watchlist"))
-    watchlist_tab = '    <button id="profile-tab-watchlist" type="button" data-profile-tab="watchlist">Watchlist</button>' if watchlist_allowed else ""
+    watchlist_tab = '    <button id="profile-tab-watchlist" type="button" data-profile-tab="watchlist"><span class="material-symbols-rounded" aria-hidden="true">bookmark</span><span data-tab-label>Watchlist</span></button>' if watchlist_allowed else ""
     watchlist_panel = _profile_timeline_panel(
         "watchlist",
-        kicker="Sync output",
         title="Watchlist",
         lede="Everything on your watchlists.",
         search="Filter by title, id or provider...",
-        sources=(("watchlist", "bookmark", "Watchlist", ""),),
+        sources=(("watchlist", "Watchlist"),),
         coverage=(("all", "Any coverage"), ("partial", "Missing somewhere"), ("full", "On every provider")),
         bulk=True,
         timeline=False,
@@ -2782,6 +2712,12 @@ def get_profile_html(user: dict | None = None) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
 <title>Profile | CrossWatch</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/pwa/apple-touch-icon.png?v=__CW_VERSION__">
+<meta name="application-name" content="CrossWatch">
+<meta name="apple-mobile-web-app-title" content="CrossWatch">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <link rel="icon" type="image/png" sizes="64x64" href="/assets/pwa/favicon-64.png?v=__CW_VERSION__">
 <meta name="theme-color" content="#0b0b0f">
 <script>
@@ -2839,40 +2775,40 @@ def get_profile_html(user: dict | None = None) -> str:
   <nav class="tabs" aria-label="Primary navigation">
     {profile_nav}
   </nav>
-  <div class="cw-ui-toggle" aria-label="UI mode">
-    <button id="cw-profile-compact-switch" class="cw-ui-mode-switch" type="button" role="switch" aria-checked="false" aria-label="Compact mode"><span>Compact</span><span class="cw-ui-switch-track" aria-hidden="true"><span class="cw-ui-switch-thumb"></span></span></button>
-  </div>
 </header>
 <main class="cw-profile-shell" data-profile-id="{profile_id}" data-username="{username}" data-display-name="{display_name}">
-  <section class="cw-profile-hero" id="profile-hero">
+  <section class="cw-profile-hero cw-media-hero" id="profile-hero">
     <div class="cw-profile-hero-art" id="profile-hero-art"></div>
     <div class="cw-profile-hero-now" id="profile-hero-now"></div>
-    <div class="cw-profile-hero-seam" id="profile-hero-seam"></div>
     <div class="cw-profile-hero-shade"></div>
-    <div class="cw-profile-identity">
-      <div class="cw-profile-avatar-wrap">
-        <button id="profile-avatar-button" class="cw-profile-avatar" type="button" title="Replace profile picture" aria-label="Replace profile picture">{profile_avatar_inner}</button>
-        <span class="cw-profile-avatar-badge material-symbols-rounded" aria-hidden="true">photo_camera</span>
-        <input id="profile-avatar-input" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+    <div class="cw-media-hero-topbar">
+      <div class="cw-media-hero-brand">
+        <h1 class="cw-media-hero-kicker">My Media Hub</h1>
+        <div class="cw-profile-identity cw-media-hero-identity">
+          <a id="profile-hero-avatar" class="cw-media-hero-avatar" href="/profile#account" aria-label="Open user settings" title="User settings">{profile_avatar_inner}</a>
+          <div class="cw-profile-nameblock">
+            <span id="profile-role" class="cw-profile-role" hidden>{role_label}</span>
+            <div id="profile-display-name">{display_name}</div>
+            <div id="profile-username" class="cw-profile-username">@{username}</div>
+            <div id="profile-member-since" class="cw-profile-since hidden"><span class="material-symbols-rounded" aria-hidden="true">person</span><span></span></div>
+            <div id="profile-hero-chips" class="cw-profile-chips"></div>
+          </div>
+        </div>
       </div>
-      <div class="cw-profile-nameblock">
-        <div class="cw-profile-rolebar"><span id="profile-role" class="cw-profile-role">{role_label}</span>{view_as_picker}</div>
-        <h1 id="profile-display-name">{display_name}</h1>
-        <div id="profile-username" class="cw-profile-username">@{username}</div>
-        <div id="profile-member-since" class="cw-profile-since hidden"><span class="material-symbols-rounded" aria-hidden="true">person</span><span></span></div>
-        <div id="profile-hero-chips" class="cw-profile-chips"></div>
-      </div>
+      <div class="cw-media-hero-account">{view_as_picker}</div>
+    </div>
+    <div id="profile-hero-media" class="cw-media-hero-context" aria-live="polite">
+      <span class="cw-media-hero-heading"><strong>Everything you watch, across your providers</strong><img class="cw-media-hero-logo" alt="" hidden></span>
+      <div class="cw-media-hero-details"><span id="profile-hero-summary"></span><span id="profile-hero-extra" class="cw-media-hero-extra"></span></div>
     </div>
     <article class="cw-profile-last hidden" role="button" tabindex="0" aria-label="Show last watched details">
       <div class="cw-profile-last-copy">
         <div class="cw-profile-last-head">
-          <span class="cw-profile-last-kicker">Last Watched</span>
+          <span class="cw-profile-last-kicker">Last watched</span>
           <strong id="profile-last-title">Nothing watched yet</strong>
           <span id="profile-last-meta">History will appear here.</span>
-          <span id="profile-last-provider"></span>
         </div>
       </div>
-      <img id="profile-last-poster" class="cw-profile-last-poster" src="/assets/img/placeholder_poster.svg?v=2" alt="">
     </article>
     <div id="profile-now" class="cw-profile-now hidden" aria-live="polite">
       <div class="cw-profile-now-copy">
@@ -2881,6 +2817,7 @@ def get_profile_html(user: dict | None = None) -> str:
           <span class="cw-profile-now-kicker">Now Playing</span>
           <strong id="profile-now-title"></strong>
           <span id="profile-now-meta"></span>
+          <span id="profile-now-provider"></span>
         </div>
         <div class="cw-profile-now-track"><span id="profile-now-fill"></span></div>
         <div class="cw-profile-now-times"><span id="profile-now-pct"></span><span id="profile-now-left"></span></div>
@@ -2890,35 +2827,30 @@ def get_profile_html(user: dict | None = None) -> str:
   </section>
 {view_as_banner}
   <div class="cw-profile-tabs" role="tablist" aria-label="Profile tabs">
-    <button id="profile-tab-overview" class="active" type="button" data-profile-tab="overview">Overview</button>
+    <button id="profile-tab-overview" class="active" type="button" data-profile-tab="overview"><span class="material-symbols-rounded" aria-hidden="true">space_dashboard</span><span data-tab-label>Overview</span></button>
 {watchlist_tab}
-    <button id="profile-tab-history" type="button" data-profile-tab="history">History</button>
-    <button id="profile-tab-ratings" type="button" data-profile-tab="ratings">Ratings</button>
-    <button id="profile-tab-collection" type="button" data-profile-tab="collection">Collections</button>
+    <button id="profile-tab-history" type="button" data-profile-tab="history"><span class="material-symbols-rounded" aria-hidden="true">history</span><span data-tab-label>History</span></button>
+    <button id="profile-tab-ratings" type="button" data-profile-tab="ratings"><span class="material-symbols-rounded" aria-hidden="true">star</span><span data-tab-label>Ratings</span></button>
 {playback_tab}
+    <button id="profile-tab-collection" type="button" data-profile-tab="collection"><span class="material-symbols-rounded" aria-hidden="true">video_library</span><span data-tab-label>Collection</span></button>
     <button id="profile-tab-account" class="cw-profile-tab-settings" type="button" data-profile-tab="account"><span class="material-symbols-rounded" aria-hidden="true">settings</span><span>Settings</span></button>
   </div>
   <section id="profile-panel-overview" class="cw-profile-panel active">
-    <div class="cw-profile-pair-grid">
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Continue Watching</h2><a href="{playback_href}">View all</a></div>
-        <div id="profile-progress" class="cw-profile-poster-row"></div>
+    <article class="cw-hub-section cw-hub-continue">
+      <div class="cw-hub-section-head"><h2>Continue watching</h2><a href="{playback_href}">View all</a></div>
+      <div id="profile-progress"></div>
+    </article>
+    <div class="cw-hub-secondary">
+      <article class="cw-hub-section">
+        <div class="cw-hub-section-head"><h2>Recently added to watchlist</h2><a href="{watchlist_href}">View all</a></div>
+        <div id="profile-watchlist"></div>
       </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Recent Watchlist</h2><a href="{watchlist_href}">View all</a></div>
-        <div id="profile-watchlist" class="cw-profile-list"></div>
-      </article>
-    </div>
-    <div class="cw-profile-pair-grid">
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Recent Activity</h2><button id="profile-activity-view-all" class="ghost refresh-insights" type="button">View all</button></div>
+      <article class="cw-hub-section">
+        <div class="cw-hub-section-head"><h2>Recent activity</h2><button id="profile-activity-view-all" type="button">View all</button></div>
         <div id="profile-activity" class="cw-profile-activity-list"></div>
       </article>
-      <article class="cw-profile-widget">
-        <div class="cw-profile-widget-head"><h2>Quick Stats</h2></div>
-        <div id="profile-quick-stats" class="cw-profile-quick-grid"></div>
-      </article>
     </div>
+    <div id="profile-quick-stats" class="cw-hub-stats" aria-label="Media statistics"></div>
   <section id="dashboard-widgets-card" class="cw-dashboard-widgets hidden" aria-label="Media widgets">
     <article id="recent-history-widget" class="cw-dash-widget cw-dash-widget--history">
       <div class="cw-dash-widget-head">
@@ -2991,23 +2923,21 @@ def get_profile_html(user: dict | None = None) -> str:
     </article>
   </section>
   </section>
-  <section id="profile-panel-collection" class="cw-profile-panel">
-    <div class="cw-collection-head">
-      <div class="cw-collection-headline">
-        <span class="cw-collection-kicker">Owned Media</span>
+  <section id="profile-panel-collection" class="cw-profile-panel cw-hub-records cw-page-panel">
+    <div class="cw-hub-records-head">
+      <div class="cw-hub-records-headline">
         <h2>Collections</h2>
         <p>Your unified library across all providers</p>
       </div>
-      <div class="cw-collection-tiles" id="profile-collection-metrics"></div>
+      <div class="cw-hub-records-tiles" id="profile-collection-metrics"></div>
     </div>
-    <div id="profile-collection-timeline" class="cw-hist-timeline" aria-label="Collections per month" hidden></div>
-    <div class="cw-collection-toolbar">
-      <label class="cw-collection-search">
+    <div class="cw-hub-records-toolbar">
+      <label class="cw-hub-records-search">
         <span class="material-symbols-rounded" aria-hidden="true">search</span>
         <input id="profile-collection-search" type="search" placeholder="Search collections...">
       </label>
-      <div class="cw-collection-chips" id="profile-collection-types" aria-label="Collection type filters"></div>
-      <div class="cw-collection-controls">
+      <div class="cw-hub-records-chips" id="profile-collection-types" aria-label="Collection type filters"></div>
+      <div class="cw-hub-records-controls">
         <select id="profile-collection-provider" aria-label="Provider filter"><option value="">All providers</option></select>
         <select id="profile-collection-sort" aria-label="Collection sort">
           <option value="collected_at">Recently added</option>
@@ -3017,14 +2947,15 @@ def get_profile_html(user: dict | None = None) -> str:
           <option value="year_desc">Year: newest</option>
           <option value="year_asc">Year: oldest</option>
         </select>
-        <div class="cw-collection-views" role="group" aria-label="View mode">
-          <button class="active cw-view-timeline" type="button" data-collection-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
+        <div class="cw-hub-records-views" role="group" aria-label="View mode">
+          <button class="cw-view-timeline" type="button" data-collection-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
           <button class="active" type="button" data-collection-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
           <button type="button" data-collection-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
         </div>
         <button id="profile-collection-refresh" class="cw-tl-ghost cw-collection-refresh" type="button" data-collection-refresh title="Refresh Collections" aria-label="Refresh Collections"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
       </div>
     </div>
+    <div id="profile-collection-timeline" class="cw-hist-timeline" aria-label="Collections per month" hidden></div>
     <div id="profile-collection-grid" class="cw-collection-grid" data-view="grid" aria-live="polite"></div>
     <div id="profile-collection-footer" class="cw-collection-footer" hidden>
       <nav id="profile-collection-pages" class="cw-collection-pages" aria-label="Collection pages"></nav>
@@ -3059,6 +2990,7 @@ def get_profile_html(user: dict | None = None) -> str:
           <header class="cw-set-head"><div><h2>Profile</h2><p>How you appear in CrossWatch.</p></div></header>
           <div class="cw-set-row">
             <span id="profile-settings-avatar" class="cw-set-avatar" aria-hidden="true">{profile_avatar_inner}</span>
+            <input id="profile-avatar-input" type="file" accept="image/png,image/jpeg,image/webp" hidden>
             <span class="cw-set-copy"><strong>Profile picture</strong><small>Shown on your profile and in the menu.</small></span>
             <span class="cw-set-actions">
               <button id="profile-avatar-replace" class="cw-set-btn" type="button">Change</button>
@@ -3231,10 +3163,12 @@ def get_profile_html(user: dict | None = None) -> str:
 </script>
 <script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>
 <script src="/assets/helpers/selection-bar.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/card-actions.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/provider-meta.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/icon-select.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/profile-select.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/auth-state.js?v=__CW_VERSION__" defer></script>
+<script src="/assets/helpers/pwa-install.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/account-menu.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/notifications.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/update-notifications.js?v=__CW_VERSION__" defer></script>

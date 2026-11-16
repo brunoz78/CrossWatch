@@ -140,9 +140,70 @@ function show(presence) {
   return api;
 }
 
+for (const tracker of [false, true]) test(`${tracker ? "Tracker" : "Media hub"} seasons show newest first without reversing next episodes`, () => {
+  const api = show({ synced: entry(1, epoch, [{ season: 1, episode: 2, epoch }]) });
+  api.state.meta.detail.seasons = [1, 0, 3, 2].map(season => ({season, episode_count:2}));
+  if (tracker) api.state.tracker = {data:{plays:[{season:1, episode:2, date:new Date(epoch * 1000).toISOString()}]}};
+  for (const season of [0, 2, 3]) api.state.seasons.set(String(season), {episodes:[]});
+  assert.deepEqual([...api.seasonProgress().matchAll(/data-mm-season-toggle="(\d+)"/g)].map(match => Number(match[1])), [3, 2, 1]);
+  api.state.overviewChosenSeason = 0;
+  assert.deepEqual([...api.seasonProgress().matchAll(/data-mm-season-toggle="(\d+)"/g)].map(match => Number(match[1])), [3, 2, 1, 0]);
+  assert.deepEqual([...api.episodesTab().matchAll(/data-mm-season="(\d+)"/g)].map(match => Number(match[1])), [3, 2, 1, 0]);
+  assert.equal(api.upNext().first.season, 2);
+  assert.equal(api.upNext().first.episode, 1);
+  if (tracker) api.state.tracker.data.plays = [];
+  else api.state.presence = {};
+  assert.equal(api.upNext().first.season, 1);
+  assert.equal(api.upNext().first.episode, 1);
+  assert.deepEqual(api.state.meta.detail.seasons.map(row => row.season), [1, 0, 3, 2]);
+});
+
+test("season rows use actual watched episode positions and include resume-only activity", () => {
+  const api = show({scrobble:entry(1, epoch, [{season:1,episode:3,epoch}])});
+  api.state.meta.detail.seasons[0].air_date = "2026-01-02";
+  api.state.progress = [{season:1,episode:2,pct:66,remaining:1320}];
+  api.state.overviewSeason = 1;
+  const html = api.seasonProgress();
+  assert.match(html, /2026 · 3 episodes/);
+  assert.match(html, /In progress/);
+  assert.match(html, /width:0%[^]*width:66%[^]*width:100%/);
+  assert.match(html, /Where you left off/);
+  assert.match(html, /22m left/);
+  assert.match(html, /66% watched/);
+  assert.doesNotMatch(html, /data-mm-episode="1:1"/);
+  assert.match(html, /Show all 3 episodes/);
+  api.state.seasonEpisodesExpanded = true;
+  assert.match(api.seasonProgress(), /data-mm-episode="1:1"/);
+  assert.match(api.seasonProgress(), /Show less/);
+  api.state.presence = {};
+  assert.match(api.seasonProgress(), /In progress/);
+  api.state.progress = [{season:1,episode:99,pct:66}];
+  assert.match(api.seasonProgress(), /Not started/);
+});
+
+test("season episode previews retain complete history and escape metadata", () => {
+  const api = show({});
+  api.state.overviewSeason = 1;
+  api.state.seasons.set("1", {episodes:Array.from({length:5}, (_, index) => ({episode:index+1,name:'<img src=x>',air_date:"2099-01-01"}))});
+  let html = api.seasonProgress();
+  assert.equal((html.match(/data-mm-episode=/g) || []).length, 3);
+  assert.match(html, /Show all 5 episodes/);
+  assert.match(html, /Upcoming/);
+  assert.doesNotMatch(html, /<img src=x>/);
+  api.state.seasonEpisodesExpanded = true;
+  assert.equal((api.seasonProgress().match(/data-mm-episode=/g) || []).length, 5);
+  api.state.seasons.set("1", {loading:true});
+  assert.match(api.seasonProgress(), /Loading episodes/);
+  api.state.seasons.set("1", {error:true});
+  assert.match(api.seasonProgress(), /data-mm-season-retry="1"/);
+  api.state.seasons.set("1", {episodes:[]});
+  assert.match(api.seasonProgress(), /No episodes found/);
+});
+
 test("scrobbled episodes drive totals, next episode and watched badges", () => {
   const api = show({ scrobble: entry(1, epoch, [{ season: 1, episode: 1, epoch }]) });
-  assert.match(api.overviewTab(), /1\/3 episodes <b>33%/);
+  assert.match(api.overviewTab(), /1\/3 watched/);
+  assert.match(api.overviewTab(), /aria-valuenow="33"/);
   assert.equal(api.upNext().label, "Continue watching");
   assert.equal(api.upNext().first.episode, 2);
   assert.match(api.seasonProgress(), /1\/3/);
@@ -155,7 +216,8 @@ test("episodes shared by history and scrobbles count once and retain the latest 
     synced: entry(1, epoch - 86400, [{ season: 1, episode: 1, epoch: epoch - 86400 }]),
     scrobble: entry(2, epoch, [{ season: 1, episode: 1, epoch }, { season: 1, episode: 2, epoch }]),
   });
-  assert.match(api.overviewTab(), /2\/3 episodes <b>67%/);
+  assert.match(api.overviewTab(), /2\/3 watched/);
+  assert.match(api.overviewTab(), /aria-valuenow="67"/);
   assert.match(api.seasonProgress(), /2\/3/);
   assert.equal(api.upNext().first.episode, 3);
   const html = api.episodesTab();
@@ -167,10 +229,10 @@ test("episodes shared by history and scrobbles count once and retain the latest 
 test("unwatched shows start at the first episode and history-only shows still advance", () => {
   const empty = show({});
   assert.equal(empty.upNext().label, "Start watching");
-  assert.match(empty.overviewTab(), /0\/3 episodes/);
+  assert.match(empty.overviewTab(), /0\/3 watched/);
   const api = show({ synced: entry(1, epoch, [{ season: 1, episode: 1, epoch }]) });
   assert.equal(api.upNext().first.episode, 2);
-  assert.match(api.overviewTab(), /1\/3 episodes/);
+  assert.match(api.overviewTab(), /1\/3 watched/);
 });
 
 
@@ -178,10 +240,10 @@ test("pending and failed watch status never imply an unwatched title", () => {
   for (const api of [modal(), show(null)]) {
     api.state.presenceLoading = true;
     assert.match(api.overviewTab(), /Checking watch status/);
-    assert.doesNotMatch(api.overviewTab(), /Not watched yet|Not started|0\/3 episodes|Start watching/);
+    assert.doesNotMatch(api.overviewTab(), /Not watched yet|Not started|0\/3 watched|Start watching/);
     api.state.presenceLoading = false;
     assert.match(api.overviewTab(), /Watch status unavailable/);
-    assert.doesNotMatch(api.overviewTab(), /Not watched yet|Not started|0\/3 episodes|Start watching/);
+    assert.doesNotMatch(api.overviewTab(), /Not watched yet|Not started|0\/3 watched|Start watching/);
   }
 });
 
@@ -192,15 +254,15 @@ function deferred() {
 }
 
 function loadingModal() {
-  const metas = [], requests = [], body = {innerHTML:"",scrollTop:0,querySelector:()=>null}, panel = {innerHTML:""};
+  const metas = [], requests = [], body = {innerHTML:"",scrollTop:0,querySelector:()=>null}, panel = {innerHTML:"",contains:()=>false};
   const root = {hidden:true,classList:{toggle(){}},addEventListener(){},querySelector:selector => selector === ".cw-mm-body" ? body : selector === ".cw-mm-panel" ? panel : selector === "[data-mm-status-picker][open]" ? null : {style:{},focus(){}},querySelectorAll:()=>[]};
   const context = {
-    window:{addEventListener(){},CW:{Meta:{get:() => {const d=deferred();metas.push(d);return d.promise;}},ProfileDateTime:{format:date=>date.toISOString()}}},
+    window:{addEventListener(){},requestAnimationFrame:callback=>queueMicrotask(callback),CW:{Meta:{get:() => {const d=deferred();metas.push(d);return d.promise;}},ProfileDateTime:{format:date=>date.toISOString()}}},
     navigator:{language:"en-US"},
     document:{createElement:()=>root,body:{appendChild(){}},addEventListener(){},documentElement:{dataset:{cwPermPlayback:"off"},classList:{add(){},remove(){}}}},
     fetch:url=>{const d=deferred();requests.push({url,...d});return d.promise;},
   };
-  vm.runInNewContext(source.replace("  (window.CW ||= {}).ProfileMediaModal =", "  window.testExtra = { loadCollection, openPerson, onClick, state };\n  (window.CW ||= {}).ProfileMediaModal ="),context);
+  vm.runInNewContext(source.replace("  (window.CW ||= {}).ProfileMediaModal =", "  patchContent = (host, html) => { host.innerHTML = html; };\n  window.testExtra = { loadCollection, openPerson, onClick, state, scheduleRender };\n  (window.CW ||= {}).ProfileMediaModal ="),context);
   return {api:context.window.CW.ProfileMediaModal,extra:context.window.testExtra,metas,requests,body,panel};
 }
 
@@ -259,14 +321,14 @@ test("shows prefetch the watched season before metadata and retry interrupted lo
   f.requests[3].resolve(response({ok:true,episodes:[{episode:3,name:"Current episode"}]}));
   await Promise.all([first,second]);
   await tick();
-  assert.match(f.panel.innerHTML,/Current episode/);
-  assert.doesNotMatch(f.panel.innerHTML,/Stale episode/);
+  assert.match(f.body.innerHTML + f.panel.innerHTML,/Current episode/);
+  assert.doesNotMatch(f.body.innerHTML + f.panel.innerHTML,/Stale episode/);
 });
 
 
 test("unmatched watches do not inflate progress or suggest an unwatched starting point", () => {
   const api = show({ scrobble: entry(2, epoch, [{ season: 4, episode: 1, epoch }, { season: 1, episode: 9, epoch }]) });
-  assert.match(api.overviewTab(), /0\/3 episodes/);
+  assert.match(api.overviewTab(), /0\/3 watched/);
   assert.match(api.overviewTab(), /2 watched episodes could not be matched/);
   assert.doesNotMatch(api.overviewTab(), /Start watching/);
   assert.equal(api.upNext().first, null);
@@ -363,11 +425,63 @@ test("a show lists each paused episode with its provider", () => {
   ];
   const html = api.showResumePoints();
   assert.match(html, /Resume points/);
-  assert.match(html, /S2E4 · The Long Night/);
+  assert.match(html, /S2E4<\/span><strong>The Long Night/);
   assert.match(html, /S1E1/);
   assert.match(html, /48%/);
   api.state.progress = [];
   assert.equal(api.showResumePoints(), "");
+});
+
+test("resume points group providers by episode and keep account actions and progress distinct", () => {
+  const api = modal(null, "show", {canWrite:()=>true});
+  api.state.progress = [
+    {rid:"cw",provider:"CROSSWATCH",label:"CrossWatch",instance:"default",season:1,episode:1,episodeTitle:"S01E01",pct:65,remaining:1080},
+    {rid:"plex",provider:"PLEX",label:"Plex",instance:"family",instanceLabel:"Family",season:1,episode:1,episodeTitle:"No Strings",pct:42,remaining:1500,record:{can_remove_progress:true}},
+    {rid:"trakt",provider:"TRAKT",label:"Trakt",instance:"default",season:1,episode:1,episodeTitle:"No Strings",pct:60,remaining:1200},
+    {rid:"next",provider:"PLEX",label:"Plex",instance:"default",season:1,episode:2,episodeTitle:"S01E02",pct:10},
+    {rid:"unknown",provider:"PLEX",label:"Plex",instance:"default",pct:20},
+    {rid:"unknown2",provider:"TRAKT",label:"Trakt",instance:"default",pct:30},
+  ];
+  const html = api.showResumePoints();
+  assert.equal((html.match(/class="cw-mm-resume-episode"/g)||[]).length,4);
+  assert.equal((html.match(/<strong>No Strings<\/strong>/g)||[]).length,1);
+  assert.doesNotMatch(html,/S01E01|S01E02/);
+  assert.match(html,/Plex · Family/);
+  assert.match(html,/data-ia-ref="PLEX:family" data-ia-play="plex"/);
+  for (const pct of [65,42,60,10,20,30]) assert.match(html,new RegExp(`aria-valuenow="${pct}"`));
+  assert.match(html,/18m left/);
+  assert.match(html,/25m left/);
+  assert.equal((html.match(/data-mm-progress/g)||[]).length,1);
+});
+
+test("Tracker resume points and season previews include provider progress", () => {
+  const api=show({});
+  api.state.progress=[
+    {provider:"CROSSWATCH",label:"CrossWatch",instance:"family",instanceLabel:"Family",season:1,episode:2,pct:35},
+    {provider:"PUBLICMETADB",instance:"default",season:1,episode:2,pct:66},
+  ];
+  api.state.tracker={label:"Family",data:{provider_instance:"family",plays:[],progress:[]}};
+  const html=api.showResumePoints();
+  assert.match(html,/CrossWatch · Family/);
+  assert.match(html,/PUBLICMETADB/);
+  assert.match(html,/35%/);
+  assert.match(html,/66%/);
+  assert.equal((html.match(/class="cw-mm-resume-episode"/g)||[]).length,1);
+  api.state.overviewSeason=1;
+  api.state.progress=api.state.progress.slice(1);
+  assert.match(api.seasonProgress(),/66% watched/);
+  api.state.progress=[];
+  assert.equal(api.showResumePoints(),"");
+  assert.doesNotMatch(api.seasonProgress(),/In progress/);
+});
+
+test("Tracker movie progress includes providers alongside local watch history", () => {
+  const api=modal({});
+  api.state.progress=[{provider:"PUBLICMETADB",instance:"default",pct:66}];
+  api.state.tracker={data:{plays:[{date:"2026-11-13T12:00:00Z"}],progress:[]}};
+  assert.match(api.movieProgressBox(),/PUBLICMETADB/);
+  assert.match(api.movieProgressBox(),/66%/);
+  assert.match(api.movieProgressBox(),/Watched once/);
 });
 
 test("opened from the tracker the card shows that instance's plays and hands actions back", async () => {
@@ -386,12 +500,33 @@ test("opened from the tracker the card shows that instance's plays and hands act
   f.extra.onClick({target:target("data-mm-trk-edit")});
   assert.deepEqual(actions,[["rate",""],["edit","tmdb:1"]]);
   f.api.updateTracker({...data,plays:plays.slice(0,1)});
+  await tick();
   assert.match(f.body.innerHTML,/Watched once/);
   f.api.updateTracker({...data,title:{art:{tmdb:"2"}},plays:[]});
   assert.match(f.body.innerHTML,/Watched once/);
   f.metas[0].resolve({});
   f.requests[0].resolve(response({ok:true}));
   await opening;
+});
+
+test("background renders coalesce and queued updates cannot repaint a closed card", async () => {
+  const f=loadingModal();
+  const opening=f.api.open({type:"movie",tmdb:"1",title:"Example"});
+  f.metas[0].resolve({overview:"Initial description"});
+  f.requests[0].resolve(response({ok:true}));
+  await opening;
+  f.extra.state.meta.overview="Updated description";
+  const panelUpdate=f.extra.scheduleRender(true);
+  const fullUpdate=f.extra.scheduleRender();
+  assert.equal(panelUpdate,fullUpdate);
+  assert.equal(fullUpdate,f.extra.scheduleRender(true));
+  await fullUpdate;
+  assert.match(f.body.innerHTML,/Updated description/);
+  f.extra.state.meta.overview="Should not render";
+  const closedUpdate=f.extra.scheduleRender();
+  f.api.close();
+  await closedUpdate;
+  assert.doesNotMatch(f.body.innerHTML,/Should not render/);
 });
 
 test("a stacked preview has no tracker box and no write actions", async () => {

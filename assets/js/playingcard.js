@@ -55,14 +55,6 @@
 
   const tmdbIdOf = (p) => window.CW?.Meta?.tmdbId(p) || "";
 
-  const buildTmdbUrl = (p) => {
-    const id = tmdbIdOf(p);
-    if (!id) return "";
-    const resolved = window.CW?.Meta?.peek(p)?.resolved_type;
-    const type = String(resolved || p?.media_type || p?.type || "").toLowerCase() === "movie" ? "movie" : "tv";
-    return `https://www.themoviedb.org/${type}/${encodeURIComponent(String(id))}`;
-  };
-
   const artTypeOf = (p) => {
     const type = p?.media_type || p?.type || "";
     return String(type).toLowerCase() === "movie" ? "movie" : "tv";
@@ -106,9 +98,10 @@
     const s = String(src || "").toLowerCase();
     if (!s) return "";
     if (PM?.label) {
-      const base = s.replace(/trakt$/, "");
+      const webhook = ["plextrakt", "embytrakt", "jellyfintrakt"].includes(s);
+      const base = webhook ? s.slice(0, -5) : s;
       const label = PM.label(base);
-      if (label && label !== "?") return s.endsWith("trakt") ? `${label} webhook` : label;
+      if (label && label !== "?") return webhook ? `${label} webhook` : label;
     }
     if (s === "plex") return "PLEX";
     if (s === "emby") return "EMBY";
@@ -117,14 +110,6 @@
     if (s === "embytrakt") return "EMBY webhook";
     if (s === "jellyfintrakt") return "Jellyfin webhook";
     return String(src || "");
-  };
-
-  const sourceChipClass = (src) => {
-    const raw = String(src || "").toLowerCase();
-    if (raw.includes("plex")) return "pc-chip-source-plex";
-    if (raw.includes("emby")) return "pc-chip-source-emby";
-    if (raw.includes("jellyfin")) return "pc-chip-source-jellyfin";
-    return "";
   };
 
   const instanceLabel = (value, friendly = "") => {
@@ -139,8 +124,6 @@
     const mediaType = String(p?.media_type || p?.type || "").toLowerCase();
     return mediaType === "movie" ? "Movie" : mediaType === "episode" ? "Episode" : mediaType ? mediaType.toUpperCase() : "TV";
   };
-
-  const streamCount = (p, counts) => Number(p?._streams_count ?? counts.get(keyOf(p)) ?? 0) || 0;
 
   const statusText = (state, since = "") => {
     const st = String(state || "").toLowerCase();
@@ -166,7 +149,7 @@
     if (!id) return "";
     const resolved = meta?.resolved_type || meta?.type || window.CW?.Meta?.peek(p)?.resolved_type;
     const type = String(resolved || p?.media_type || p?.type || "").toLowerCase() === "movie" ? "movie" : "tv";
-    return `/art/tmdb/${type}/${encodeURIComponent(String(id))}?fallback=2&kind=backdrop&size=w1280${artEvidenceOf(p)}`;
+    return `/art/tmdb/${type}/${encodeURIComponent(String(id))}?kind=backdrop&size=w1280&v=2${artEvidenceOf(p)}`;
   };
 
   const SHARED_WATCH_KEY = "__CW_CURRENT_WATCHING_SHARED__";
@@ -208,6 +191,7 @@
     try { await window.CW?.OverviewProfile?.ready; } catch {}
     const now = Date.now();
     const scope = profileScope();
+    const revision = CARD.cacheRevision;
     if (CARD.cacheScope !== scope) {
       CARD.cacheScope = scope;
       CARD.cachePayload = null;
@@ -225,6 +209,7 @@
         const r = await fetch(currentlyWatchingUrl(), { cache: "no-store" });
         if (!r.ok) return { streams: [], primary: null, ts: 0 };
         const j = await r.json();
+        if (revision !== CARD.cacheRevision || scope !== profileScope()) return { streams: [], primary: null, ts: 0 };
         const streams = activeStreamsFromPayload(j);
         const ts = Number(j?.ts) || 0;
         countByKey.clear();
@@ -245,7 +230,7 @@
       } catch {
         return { streams: [], primary: null, ts: 0 };
       } finally {
-        CARD.cacheBusy = null;
+        if (revision === CARD.cacheRevision) CARD.cacheBusy = null;
       }
     })();
     return CARD.cacheBusy;
@@ -253,11 +238,13 @@
 
   const CARD = {
     selectedKey: "",
+    selectedRouteId: "",
     streams: [],
     dismissed: false,
     poll: null,
     tick: null,
     cacheBusy: null,
+    cacheRevision: 0,
     cacheAt: 0,
     cacheScope: "",
     cachePayload: null,
@@ -276,6 +263,7 @@
     },
     onPrev: () => applySelectionOffset(-1),
     onNext: () => applySelectionOffset(1),
+    onRouteSelect: (route) => selectStream(route.streamKey, route.id),
   });
 
   const stopStatusPoll = () => {
@@ -293,13 +281,8 @@
 
   const baseChips = (p, releaseLabel = "") => {
     const chips = [];
-    chips.push({ text: sourceLabel(p?.source), cls: sourceChipClass(p?.source) });
-    if (p?.provider_instance) chips.push({ text: instanceLabel(p.provider_instance, p.provider_instance_label) });
-    chips.push({ text: mediaTypeLabel(p) });
-    const sc = streamCount(p, countByKey);
-    if (sc > 1) chips.push({ text: `${sc} streams`, cls: "pc-chip-streams" });
     if (String(p?.media_type || p?.type || "").toLowerCase() === "episode" && p?.season !== null && p?.season !== undefined && p?.season !== "" && p?.episode) {
-      chips.push({ text: `S${String(p.season).padStart(2, "0")}E${String(p.episode).padStart(2, "0")}` });
+      if (p.year) chips.push({ text: String(p.year) });
       return chips;
     }
     const yearLabel = p?.year ? String(p.year) : "";
@@ -310,6 +293,27 @@
     chips.push({ text: yearLabel });
     if (releaseLabel && releaseLabel !== yearLabel) chips.push({ text: releaseLabel });
     return chips;
+  };
+
+  const routesFor = (p) => {
+    const rawSource = String(p.source || "").toLowerCase();
+    const webhook = ["plextrakt", "embytrakt", "jellyfintrakt"].includes(rawSource);
+    const provider = webhook ? rawSource.slice(0, -5) : rawSource;
+    const routes = Array.isArray(p.routes) ? p.routes.filter(route => route && route.source && route.destination) : [];
+    if (!routes.length) return [{
+      id: `source:${rawSource}:${p.provider_instance || "default"}`,
+      kind: webhook ? "webhook" : "watcher",
+      source: sourceLabel(provider) || "Unknown source",
+      sourceLabel: instanceLabel(p.provider_instance, p.provider_instance_label),
+    }];
+    return routes.map(route => ({
+      id: String(route.id || `${route.kind}:${route.source}:${route.source_instance}:${route.destination}:${route.destination_instance}`),
+      kind: route.kind === "webhook" ? "webhook" : "watcher",
+      source: sourceLabel(route.source),
+      destination: sourceLabel(route.destination),
+      sourceLabel: instanceLabel(route.source_instance, route.source_label),
+      destinationLabel: instanceLabel(route.destination_instance, route.destination_label),
+    }));
   };
 
   const progressModel = (p) => {
@@ -327,8 +331,16 @@
       const remainingStr = formatTime(Math.max(0, totalMs - totalMs * (pct / 100)));
       remaining = remainingStr ? `${remainingStr} left` : "";
     }
-    return { pct, remaining };
+    const elapsedTotal = totalMs > 0 ? `${formatTime(totalMs * pct / 100) || "0:00"} / ${formatTime(totalMs)}` : "";
+    return { pct, remaining, elapsedTotal };
   };
+
+  const activeRoutes = () => CARD.streams.flatMap(p => routesFor(p).map(route => ({
+    ...route,
+    id: JSON.stringify([keyOf(p), route.id]),
+    streamKey: keyOf(p),
+    mediaLabel: [p.title, p.media_type === "episode" && p.episode ? `S${String(p.season ?? 0).padStart(2, "0")} E${String(p.episode).padStart(2, "0")}` : "", p.account].filter(Boolean).join(" · "),
+  })));
 
   const statusModel = (p, st) => {
     const updatedSec = Number(p.updated) || 0;
@@ -361,7 +373,13 @@
     if (total <= 1) return;
     const current = selectedIndex();
     const next = (current + delta + total) % total;
-    CARD.selectedKey = keyOf(CARD.streams[next]);
+    selectStream(keyOf(CARD.streams[next]));
+  }
+
+  function selectStream(key, routeId = "") {
+    if (!CARD.streams.some(item => keyOf(item) === key)) return;
+    CARD.selectedKey = key;
+    CARD.selectedRouteId = routeId;
     CARD.dismissed = false;
     renderSelectedStream().catch(() => {});
   }
@@ -415,18 +433,33 @@
     }
 
     const overview = p?.overview || (meta ? (meta.overview || det.overview || det.tagline || "") : "");
-    const tmdbUrl = meta
-      ? buildTmdbUrl(Object.assign({}, p, { tmdb: tmdbIdOf(p) || (meta.ids && (meta.ids.tmdb || meta.ids.id)) }))
-      : buildTmdbUrl(p);
+    const mediaItem = { ...p, tmdb: tmdbIdOf(p) || meta?.ids?.tmdb || meta?.ids?.id || "" };
+    const routes = activeRoutes();
+    if (!routes.some(route => route.id === CARD.selectedRouteId && route.streamKey === keyOf(p))) {
+      CARD.selectedRouteId = routes.find(route => route.streamKey === keyOf(p))?.id || "";
+    }
 
     return {
+      key: keyOf(p),
+      routes,
+      selectedRouteId: CARD.selectedRouteId,
+      heading: !isMovie && p.season !== null && p.season !== undefined && p.episode
+        ? `S${String(p.season).padStart(2, "0")} E${String(p.episode).padStart(2, "0")}` : mediaTypeLabel(p),
       title: p.title || "Now Playing",
       year: p.year || "",
       isMovie,
       chips,
       overview,
       poster: buildArtUrl(p),
-      posterHref: tmdbUrl,
+      onOpen: mediaItem.tmdb ? () => {
+        const modal = window.CW?.ProfileMediaModal;
+        if (modal?.canOpen?.(mediaItem)) {
+          void modal.open(mediaItem);
+        } else {
+          const open = window.CW?.WatchlistPreview?.openPreviewDrawer || window.openPreviewDrawer;
+          void open?.(mediaItem);
+        }
+      } : null,
       backdrop: buildBackdropUrl(p, meta),
       information: meta ? FMT.informationFor(meta, isMovie) : "loading",
       rating,
@@ -437,6 +470,7 @@
   };
 
   async function renderSelectedStream() {
+    const revision = CARD.cacheRevision;
     if (!isUiEnabled()) { hide(true); return; }
     const p = selectedStream();
     if (!p) {
@@ -477,17 +511,19 @@
 
     const renderKey = keyOf(p);
     const meta = await getMetaFor(p);
-    if (!meta || CARD.selectedKey !== renderKey) return;
+    if (!meta || CARD.selectedKey !== renderKey || revision !== CARD.cacheRevision) return;
     card.render(modelFor(p, meta));
   }
 
   async function refreshCard(preferredKey = "", force = false) {
+    const revision = CARD.cacheRevision;
     if (!isUiEnabled()) {
       hide(true);
       return;
     }
 
     const data = await fetchCurrentlyWatchingData(force);
+    if (revision !== CARD.cacheRevision) return;
     if (!isUiEnabled()) { hide(true); return; }
     CARD.streams = Array.isArray(data?.streams) ? data.streams.slice() : [];
 
@@ -510,6 +546,10 @@
   });
 
   window.addEventListener("cw:overview-profile-changed", () => {
+    CARD.cacheRevision += 1;
+    CARD.cacheBusy = null;
+    CARD.streams = [];
+    hide(true);
     CARD.cachePayload = null;
     CARD.cacheAt = 0;
     CARD.cacheScope = profileScope();
@@ -521,6 +561,7 @@
     refreshCard(CARD.selectedKey, true).catch(() => {});
   });
 
+  Object.assign(window.CW.PlayingCard, { currentlyWatching: fetchCurrentlyWatchingData, progress: progressModel });
   window.updatePlayingCard = (payload) => refreshCard(keyOf(payload || {}), false);
   const refreshVisibility = () => refreshCard(CARD.selectedKey, false).catch(() => {});
   window.addEventListener('cw:mobile-playing-card-changed', refreshVisibility);
