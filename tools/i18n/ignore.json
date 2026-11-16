@@ -391,5 +391,10 @@
  "CrossWatch Wrapped",
  "Pocket ID",
  "tracker?instance={0}",
- "WRAPPED"
+ "WRAPPED",
+ "/art/tmdb/{0}/{1}?fallback=2&size=w185",
+ "/art/tmdb/{0}/{1}?kind=backdrop&size=w1280&v=2{2}",
+ "OPTION",
+ "{0}Features and media types",
+ "{0}Selection"
 ]
