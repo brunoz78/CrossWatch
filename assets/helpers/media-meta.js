@@ -23,7 +23,7 @@
 
   const isEpisode = (item) => {
     const raw = String(item?.media_type || item?.type || item?.entity || "").toLowerCase();
-    return raw === "episode" || item?.season != null || item?.episode != null;
+    return raw === "episode" || raw === "season" || item?.season != null || item?.episode != null;
   };
 
   const kindOf = (item) => {
@@ -39,7 +39,7 @@
   const tmdbOf = (item) => {
     const ids = item?.ids || {};
     const id = isEpisode(item)
-      ? (ids.tmdb_show || item?.tmdb_show || tmdbFromCanonical(item) || item?.tmdb || item?.tmdb_id || ids.tmdb || ids.id)
+      ? (item?.show_ids?.tmdb || ids.show_ids?.tmdb || item?.show?.ids?.tmdb || ids.tmdb_show || item?.tmdb_show || item?.tmdb || item?.tmdb_id || (ids.tmdb || ids.id ? "" : tmdbFromCanonical(item)))
       : (item?.tmdb || item?.tmdb_id || ids.tmdb || ids.tmdb_show || ids.id);
     return String(id || "").trim();
   };
@@ -80,7 +80,10 @@
 
   const descriptorFor = (item) => {
     const episode = isEpisode(item);
-    const ids = item?.ids || {};
+    const rawIds = item?.ids || {};
+    const ids = episode
+      ? { imdb: rawIds.imdb_show || item?.imdb_show, tvdb: rawIds.tvdb_show || item?.tvdb_show, ...item?.show?.ids, ...rawIds.show_ids, ...item?.show_ids }
+      : rawIds;
     return {
       tmdb: tmdbOf(item),
       type: kindOf(item),
@@ -190,4 +193,234 @@
   }
 
   (window.CW ||= {}).Meta = { key: keyOf, kind: kindOf, tmdbId: tmdbOf, isEpisode, get, peek, has, batch, invalidate };
+
+  const chosenArt = new Map(String(document.documentElement.dataset.cwArtOv || "").split(" ").filter(Boolean).map((part) => part.split("=")).filter((part) => part.length === 2 && part[1]));
+  const artKey = (type, id) => `${String(type || "").toLowerCase() === "movie" ? "movie" : "tv"}:${String(id || "").trim()}`;
+  const ART_URL_RE = /\/art\/(?:tmdb|fanart)\/(movie|tv|show)\/(\d+)\?[^"')\s]*/g;
+
+  function artParam(type, id) {
+    const rev = chosenArt.get(artKey(type, id));
+    return rev ? `&ov=${encodeURIComponent(rev)}` : "";
+  }
+
+  function rewriteArt(text, key, rev) {
+    return String(text || "").replace(ART_URL_RE, (url, type, id) => {
+      if (artKey(type, id) !== key || /[?&]kind=(still|episode_still)\b/.test(url)) return url;
+      const clean = url.replace(/&ov=[^&]*/g, "");
+      return rev ? `${clean}&ov=${encodeURIComponent(rev)}` : clean;
+    });
+  }
+
+  function setArtChoice(type, id, rev) {
+    const key = artKey(type, id);
+    if (rev) chosenArt.set(key, String(rev));
+    else chosenArt.delete(key);
+    document.querySelectorAll('img[src*="/art/tmdb/"], img[data-src*="/art/tmdb/"], [style*="/art/tmdb/"], img[src*="/art/fanart/"]').forEach((node) => {
+      ["src", "data-src", "style"].forEach((attr) => {
+        const value = node.getAttribute(attr);
+        if (!value || !(value.includes("/art/tmdb/") || value.includes("/art/fanart/"))) return;
+        const next = rewriteArt(value, key, rev);
+        if (next !== value) node.setAttribute(attr, next);
+      });
+    });
+    window.dispatchEvent(new CustomEvent("cw:art-choice", { detail: { type, id: String(id), rev: rev || "" } }));
+  }
+
+  window.CW.ArtChoice = { param: artParam, set: setArtChoice };
+
+  const SHELF_FORMATS = { "4k_bluray": "4K UHD", bluray: "Blu-ray", hd_dvd: "HD DVD", dvd: "DVD", digital: "Digital", vcd: "VCD", vhs: "VHS", betamax: "Betamax", laserdisc: "LaserDisc" };
+  const SHELF_STATUSES = { owned: "Owned", ordered: "Ordered", wishlist: "Wishlist" };
+  const SHELF_DISCS = { "4k_bluray": "bluray", bluray: "bluray", dvd: "dvd" };
+  const shelfIndex = { data: null, promise: null, currency: "" };
+  const shelfEsc = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+  function shelfLoad(force = false) {
+    if (shelfIndex.promise && !force) return shelfIndex.promise;
+    shelfIndex.promise = fetch("/api/profile/shelf", { cache: "no-store", credentials: "same-origin" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        shelfIndex.data = data?.items && typeof data.items === "object" ? data.items : {};
+        shelfIndex.currency = typeof data?.currency === "string" ? data.currency : "";
+        window.dispatchEvent(new CustomEvent("cw:shelf-changed", { detail: { loaded: true } }));
+        return shelfIndex.data;
+      })
+      .catch(() => {
+        shelfIndex.data ||= {};
+        return shelfIndex.data;
+      });
+    return shelfIndex.promise;
+  }
+
+  function shelfPeek(type, id) {
+    return shelfIndex.data?.[artKey(type, id)] || null;
+  }
+
+  function shelfSet(type, id, info) {
+    shelfIndex.data ||= {};
+    const key = artKey(type, id);
+    if (info) shelfIndex.data[key] = info;
+    else delete shelfIndex.data[key];
+    window.dispatchEvent(new CustomEvent("cw:shelf-changed", { detail: { type, id: String(id), info: info || null } }));
+  }
+
+  function shelfMoney(value, currency = shelfIndex.currency) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return "";
+    try {
+      return currency
+        ? new Intl.NumberFormat(window.__CW_LOCALE || undefined, { style: "currency", currency }).format(amount)
+        : new Intl.NumberFormat(window.__CW_LOCALE || undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount);
+    } catch {
+      return amount.toFixed(2);
+    }
+  }
+
+  function shelfLabel(info) {
+    if (!info) return "";
+    const formats = Array.isArray(info.formats) ? info.formats : [];
+    const first = SHELF_FORMATS[formats[0]] || "";
+    if (first) return formats.length > 1 ? `${first} +${formats.length - 1}` : first;
+    return SHELF_STATUSES[info.status] || "On shelf";
+  }
+
+  function shelfDiscUrl(type, id, format) {
+    const disc = SHELF_DISCS[format];
+    if (!disc || type !== "movie" || !/^\d+$/.test(String(id || "")) || !String(document.documentElement.dataset.cwArt || "").startsWith("f")) return "";
+    return `/art/fanart/movie/${encodeURIComponent(String(id))}?kind=disc&disc=${disc}${artParam("movie", id)}`;
+  }
+
+  function shelfLogoUrl(path, size = "w92") {
+    return /^\/[A-Za-z0-9_-]{4,64}\.(jpg|jpeg|png)$/i.test(String(path || "")) ? `/art/tmdb/image?path=${encodeURIComponent(path)}&size=${size}` : "";
+  }
+
+  const PILL_FORMATS = { "4k_bluray": "uhd-bluray.svg", bluray: "bluray.svg", dvd: "dvd.svg" };
+  const PILL_HDR = { dolby_vision: ["dolby-vision.svg", "Dolby Vision"], hdr10_plus: ["hdr10-plus.svg", "HDR10+"], hdr10: ["hdr10.svg", "HDR10"] };
+  const PILL_ATMOS = new Set(["dolby_atmos", "dolby_digital_plus_atmos"]);
+
+  function shelfPill({ format = "", media = {}, copies = 0, service = null } = {}) {
+    const info = media && typeof media === "object" ? media : {};
+    const logo = (file, alt) => `<img class="cw-media-pill-logo is-${file.replace(".svg", "")}" src="/assets/img/quality/${file}" alt="${shelfEsc(alt)}" loading="lazy" decoding="async">`;
+    const parts = [];
+    if (PILL_FORMATS[format]) parts.push(logo(PILL_FORMATS[format], SHELF_FORMATS[format]));
+    else if (format === "digital" && service?.name) {
+      const src = shelfLogoUrl(service.logo, "w45");
+      parts.push(`${src ? `<img class="cw-media-pill-service" src="${shelfEsc(src)}" alt="" loading="lazy" decoding="async">` : ""}<span class="cw-media-pill-text">${shelfEsc(service.name)}</span>`);
+    } else if (format) parts.push(`<span class="cw-media-pill-text">${shelfEsc(SHELF_FORMATS[format] || format)}</span>`);
+    else if (info.resolution === "uhd_4k") parts.push(logo("4k-uhd.svg", "4K"));
+    const hdr = PILL_HDR[info.hdr];
+    if (hdr) parts.push(logo(hdr[0], hdr[1]));
+    if (PILL_ATMOS.has(info.audio)) parts.push(logo("dolby-atmos.svg", "Dolby Atmos"));
+    if (Number(copies) > 1) parts.push(`<span class="cw-media-pill-text">×${Number(copies)}</span>`);
+    return parts.length ? `<span class="cw-media-pill">${parts.join("")}</span>` : "";
+  }
+
+  const CASE_FORMATS = { "4k_bluray": "uhd", bluray: "bluray", dvd: "dvd", hd_dvd: "dvd", vcd: "dvd", vhs: "dvd", betamax: "dvd", laserdisc: "dvd" };
+  const CASE_LOGOS = { bluray: "bluray.svg", uhd: "uhd-bluray.svg" };
+
+  const SHELF_CASES_KEY = "cw.shelf.cases";
+
+  function shelfCasesOn() {
+    try { return window.localStorage?.getItem(SHELF_CASES_KEY) !== "off"; } catch { return true; }
+  }
+
+  function shelfSetCases(on) {
+    try { window.localStorage?.setItem(SHELF_CASES_KEY, on ? "on" : "off"); } catch {}
+    window.dispatchEvent(new CustomEvent("cw:shelf-cases", { detail: { on: !!on } }));
+  }
+
+  function shelfCasesSwitch() {
+    return `<button type="button" class="cw-shelfv-cases" role="switch" aria-checked="${shelfCasesOn()}" title="Show disc cases around the posters" data-shelf-cases><span>Cases</span><span class="cw-shelfv-cases-ui" aria-hidden="true"></span></button>`;
+  }
+
+  document.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-shelf-cases]");
+    if (button) shelfSetCases(button.getAttribute("aria-checked") !== "true");
+  });
+
+  function shelfCaseKind(format = "", packaging = "") {
+    if (!shelfCasesOn()) return "plain";
+    if (packaging === "steelbook" && format !== "digital") return "steelbook";
+    return CASE_FORMATS[format] || "plain";
+  }
+
+  function shelfCase({ format = "", packaging = "", poster = "" } = {}) {
+    const kind = shelfCaseKind(format, packaging);
+    const art = `<img class="cw-case-art" src="${shelfEsc(poster)}" alt="" loading="lazy" decoding="async" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'">`;
+    if (kind === "plain") return `<span class="cw-case" data-case="plain">${art}</span>`;
+    const logo = CASE_LOGOS[kind];
+    return `<span class="cw-case" data-case="${kind}">${art}<img class="cw-case-frame" src="/assets/img/cases/${kind}.svg" alt="" decoding="async">${logo ? `<img class="cw-case-logo" src="/assets/img/quality/${logo}" alt="" decoding="async">` : ""}<span class="cw-case-sheen" aria-hidden="true"></span></span>`;
+  }
+
+  function shelfScene({ cover = "", disc = "", reflection = false } = {}) {
+    const scene = `<span class="cw-shelf-scene">${disc ? `<span class="cw-shelf-disc"><img src="${shelfEsc(disc)}" alt="" loading="lazy" decoding="async" onerror="this.closest('.cw-shelfv-item,.cw-mm-coll-art')?.classList.remove('has-disc');this.parentElement.remove()"></span>` : ""}${cover}</span>`;
+    return `${scene}${reflection ? `<span class="cw-shelf-reflection" aria-hidden="true">${scene}</span>` : ""}`;
+  }
+
+  const shelfPopState = { node: null, anchor: null };
+
+  function shelfDate(value) {
+    const parts = String(value || "").split("-").map(Number);
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return "";
+    try {
+      return new Date(parts[0], parts[1] - 1, parts[2]).toLocaleDateString(window.__CW_LOCALE || undefined, { day: "numeric", month: "short", year: "numeric" });
+    } catch {
+      return "";
+    }
+  }
+
+  function shelfPopHide() {
+    shelfPopState.anchor = null;
+    shelfPopState.node?.classList.remove("is-open");
+  }
+
+  function shelfPopHtml({ title = "", sub = "", info = {}, media = {} } = {}) {
+    const perFormat = Object.entries(info.per_format || {}).map(([key, count]) => `${count > 1 ? `${count}× ` : ""}${SHELF_FORMATS[key] || key}`).join(", ");
+    const copies = Number(info.copies) || 0;
+    const edition = [info.edition, info.packaging === "steelbook" && String(info.edition || "").toLowerCase() !== "steelbook" ? "Steelbook" : ""].filter(Boolean).join(" · ");
+    const bought = [shelfDate(info.purchased), Number(info.spent) > 0 ? shelfMoney(info.spent) : ""].filter(Boolean).join(" · ");
+    const rows = [
+      ["Copies", copies ? `${new Intl.NumberFormat(window.__CW_LOCALE || undefined).format(copies)} · ${perFormat}` : ""],
+      ["Edition", edition],
+      ["Bought", bought],
+      ["Shelf", (info.shelves || []).join(", ")],
+      ["Status", info.status && info.status !== "owned" ? SHELF_STATUSES[info.status] || info.status : ""],
+      ["Lent out", info.lent ? "Yes" : ""],
+    ].filter(([, value]) => value);
+    const pill = shelfPill({ format: (info.formats || [])[0] || "", media, service: info.service });
+    return `<h4>${shelfEsc(title)}</h4><span class="cw-shelfv-pop-sub">${shelfEsc(sub)}</span>${pill}${rows.length ? `<dl>${rows.map(([label, value]) => `<dt>${shelfEsc(label)}</dt><dd>${shelfEsc(value)}</dd>`).join("")}</dl>` : ""}<span class="cw-shelfv-pop-hint">Click for all details</span>`;
+  }
+
+  function shelfPopShow(anchor, html, target = anchor) {
+    if (!anchor || !html || shelfPopState.anchor === anchor) return;
+    if (!shelfPopState.node) {
+      shelfPopState.node = document.createElement("div");
+      shelfPopState.node.className = "cw-shelfv-pop";
+      shelfPopState.node.setAttribute("aria-hidden", "true");
+      document.body.appendChild(shelfPopState.node);
+      window.addEventListener("scroll", shelfPopHide, { passive: true, capture: true });
+      window.addEventListener("resize", shelfPopHide, { passive: true });
+    }
+    shelfPopState.anchor = anchor;
+    const pop = shelfPopState.node;
+    const art = (target || anchor).querySelector?.(".cw-case-art");
+    const poster = art?.currentSrc || art?.src || "";
+    pop.innerHTML = `${poster ? `<span class="cw-shelfv-pop-bg" aria-hidden="true"><img src="${shelfEsc(poster)}" alt="" decoding="async"></span>` : ""}${html}`;
+    const rect = (target || anchor).getBoundingClientRect();
+    const width = pop.offsetWidth || 220;
+    const height = pop.offsetHeight || 200;
+    const base = anchor.querySelector?.(".cw-shelfv-base")?.getBoundingClientRect();
+    const left = Math.max(12, Math.min(rect.left + (rect.width - width) / 2, window.innerWidth - width - 12));
+    const above = rect.top - height - 12;
+    const below = Math.max(rect.bottom, base?.bottom || 0) + 12;
+    const top = Math.max(12, Math.min(above >= 12 ? above : below, window.innerHeight - height - 12));
+    pop.style.left = `${Math.round(left)}px`;
+    pop.style.top = `${Math.round(top)}px`;
+    pop.classList.add("is-open");
+  }
+
+  window.CW.Shelf = {
+    load: shelfLoad, peek: shelfPeek, set: shelfSet, pill: shelfPill, caseHtml: shelfCase, sceneHtml: shelfScene, caseKind: shelfCaseKind, casesOn: shelfCasesOn, setCases: shelfSetCases, casesSwitch: shelfCasesSwitch, date: shelfDate, popHtml: shelfPopHtml, popShow: shelfPopShow, popHide: shelfPopHide, label: shelfLabel, money: shelfMoney, discUrl: shelfDiscUrl, logoUrl: shelfLogoUrl, formats: SHELF_FORMATS, statuses: SHELF_STATUSES,
+    currency: () => shelfIndex.currency,
+    setCurrency: (value) => { shelfIndex.currency = String(value || ""); window.dispatchEvent(new CustomEvent("cw:shelf-changed", { detail: { currency: shelfIndex.currency } })); },
+  };
 })();

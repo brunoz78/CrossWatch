@@ -12,6 +12,7 @@
   let viewAllBound = false;
   let configCheck = null;
   let recentItems = [];
+  let recentRequest = null;
 
   function esc(value) {
     return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({
@@ -154,7 +155,7 @@
     const meta = window.CW?.Meta;
     const tmdb = meta?.tmdbId(item);
     const kind = meta?.kind(item) === "movie" ? "movie" : "tv";
-    const poster = /^\d+$/.test(tmdb || "") ? `/art/tmdb/${kind}/${tmdb}?fallback=2&size=w185` : "";
+    const poster = /^\d+$/.test(tmdb || "") ? `/art/tmdb/${kind}/${tmdb}?fallback=2&size=w185${window.CW?.ArtChoice?.param?.(kind, tmdb) || ""}` : "";
     const thumbnail = poster
       ? `<picture><source media="(max-width:760px)" srcset="${esc(poster)}"><img src="/assets/img/placeholder_poster.svg?v=2" alt="" loading="lazy" decoding="async"></picture>`
       : `<span class="material-symbols-rounded" aria-hidden="true">${kind === "movie" ? "movie" : "tv"}</span>`;
@@ -258,6 +259,15 @@
   }
 
   async function refreshRecentActivity() {
+    if (document.hidden || (document.documentElement.dataset.tab && document.documentElement.dataset.tab !== "main")) return;
+    if (recentRequest) return recentRequest;
+    const pending = loadRecentActivity();
+    recentRequest = pending;
+    try { await pending; }
+    finally { if (recentRequest === pending) recentRequest = null; }
+  }
+
+  async function loadRecentActivity() {
     bindViewAllButton();
 
     const block = $("#recent-activity-block");
@@ -308,14 +318,26 @@
       if (userProfile) params.set("user_profile", userProfile);
       await loadSyncUserLabels();
       const data = await fetchJSON(`/api/activity/recent?${params.toString()}`);
+      if (userProfile !== String(window.CW?.OverviewProfile?.id || "").trim()) {
+        scheduleRetry();
+        return;
+      }
       if (!data || data.ok !== true || !Array.isArray(data.items)) {
         throw new Error("invalid_activity_response");
       }
       const items = data.items;
       recentItems = items;
-      host.innerHTML = items.length
+      const html = items.length
         ? items.map((item, index) => rowHTML(item, true, index)).join("")
         : `<div class="activity-empty">${display.mode === "hours" ? `No recent scrobble in the last ${display.hours} hours.` : "No recent scrobble yet."}</div>`;
+      const template = document.createElement("template");
+      template.innerHTML = html;
+      const previous = [...host.children], next = [...template.content.children];
+      for (let index = 0; index < Math.max(previous.length, next.length); index++) {
+        if (!next[index]) previous[index].remove();
+        else if (!previous[index]) host.append(next[index]);
+        else if (!previous[index].isEqualNode(next[index])) previous[index].replaceWith(next[index]);
+      }
     } catch {
       if (!host.children.length || host.textContent.trim() === "Loading scrobble...") {
         host.innerHTML = `<div class="activity-empty">Recent scrobble could not be loaded.</div>`;
@@ -470,4 +492,5 @@
     if (state.modal && !state.modal.classList.contains("hidden")) loadActivityPage(true);
   });
   window.refreshRecentActivity = refreshRecentActivity;
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshRecentActivity(); });
 })();

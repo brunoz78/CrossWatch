@@ -639,6 +639,10 @@ function pairSupportsLibraryOnly(state, src = state?.src, dst = state?.dst, twoW
   if(!src || !dst) return false;
   return providerSupportsLibraryOnly(state, dst, feature) || (twoWay && providerSupportsLibraryOnly(state, src, feature));
 }
+function pairSupportsContinueWatching(state, src = state?.src, dst = state?.dst){
+  if(!src || !dst) return false;
+  return !!byName(state, src)?.capabilities?.continue_watching && !!byName(state, dst)?.capabilities?.continue_watching;
+}
 function libraryOnlyOn(state, opts, feature = "history", src = state?.src, dst = state?.dst, twoWay = isTwoWayMode(state)){
   if(!pairSupportsLibraryOnly(state, src, dst, twoWay, feature)) return false;
   return typeof opts?.library_only === "boolean" ? opts.library_only : true;
@@ -1098,7 +1102,7 @@ function applySubDisable(feature){
     ],
     history: ["#plx-marked-watched", "#plx-cloud-read", "#plx-discover-fallback", "#cx-hs-add", "#cx-hs-remove", "#cx-hs-rewatches", "#cx-hs-specials", "#cx-hs-library-only", "#cx-hs-undated-today", "#cx-hs-all-copies", "#cx-hs-trakt-resets", "#cx-hs-anime-map", "#cx-hs-source-status", "#cx-tr-hs-col", "#cx-tr-hs-col-movies", "#cx-tr-hs-col-shows", "#cx-hs-dropped"],
     playlists:["#cx-pl-add","#cx-pl-remove"],
-    progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance","#cx-pr-specials","#cx-pr-library-only","#cx-pr-anime-map"],
+    progress:["#cx-pr-add","#cx-pr-remove","#cx-pr-min","#cx-pr-delta","#cx-pr-maxp","#cx-pr-replay","#cx-pr-tolerance","#cx-pr-specials","#cx-pr-library-only","#cx-pr-cw-removals","#cx-pr-anime-map"],
     collection:["#cx-co-add","#cx-co-remove","#cx-co-type-all","#cx-co-type-movies","#cx-co-type-shows","#cx-co-type-seasons","#cx-co-type-episodes","#cx-co-media","#cx-co-media-upd"]
   };
   const on=ID(feature==="ratings"?"cx-rt-enable":feature==="watchlist"?"cx-wl-enable":feature==="history"?"cx-hs-enable":feature==="progress"?"cx-pr-enable":feature==="collection"?"cx-co-enable":"cx-pl-enable")?.checked;
@@ -1931,7 +1935,7 @@ left.innerHTML = `
           </label>
         </div>` : ""}
         ${undatedAsTodayAllowed(state) ? `<div class="opt-row" style="grid-column:1/-1">
-          <label for="cx-hs-undated-today" data-tip-id="cx-hs-undated-today">Undated watches as today (SIMKL)</label>
+          <label for="cx-hs-undated-today" data-tip-id="cx-hs-undated-today">Replace unknown watch dates with today (SIMKL)</label>
           <label class="switch">
             <input id="cx-hs-undated-today" type="checkbox" ${hs.undated_as_today ? "checked" : ""}>
             <span class="slider"></span>
@@ -1963,7 +1967,7 @@ left.innerHTML = `
       ${animeRow}`];
 
     if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex</div><div class="opt-row"><label for="plx-marked-watched">Marked Watched</label><label class="switch"><input id="plx-marked-watched" type="checkbox" ${getPairMarkedWatchedValue(state)?"checked":""}><span class="slider"></span></label></div><div class="muted">Include watched items from your Plex library, even when no playback-history entry is available. Applies only to this pair.</div>`);
-    if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex cloud history</div>`);
+    if (hasPlex(state)) parts.push(`<div class="panel-title small">Plex cloud history <span class="pill">Beta</span></div>`);
     if (same(state.src,"plex") || (isTwoWayMode(state) && same(state.dst,"plex"))) parts.push(`<div class="opt-row"><label for="plx-cloud-read" data-tip-id="plx-cloud-read">${isTwoWayMode(state) || (same(state.src,"plex") && same(state.dst,"plex")) ? "Read cloud history" : "Include Plex cloud history"}</label><label class="switch"><input id="plx-cloud-read" type="checkbox" ${state.pairProviders?.plex?.history?.read_cloud_history === true ? "checked" : ""}><span class="slider"></span></label></div>`);
     if (same(state.dst,"plex") || (isTwoWayMode(state) && same(state.src,"plex"))) parts.push(`<div class="opt-row"><label for="plx-discover-fallback" data-tip-id="plx-discover-fallback">${isTwoWayMode(state) || (same(state.src,"plex") && same(state.dst,"plex")) ? "Write cloud fallback" : "Include Plex cloud history"}</label><label class="switch"><input id="plx-discover-fallback" type="checkbox" ${state.pairProviders?.plex?.history?.discover_fallback === true ? "checked" : ""}><span class="slider"></span></label></div>`);
 
@@ -2024,7 +2028,8 @@ left.innerHTML = `
     const co = getOpts(state, "collection");
     const hasType=t=>Array.isArray(co.types)&&co.types.includes(t);
     const mediaRead=["plex","emby","jellyfin","silo","tofa"].some(p=>same(state.src,p));
-    const mediaUpdates=["trakt","floppy","crosswatch","flicklist","mdblist"].some(p=>same(state.dst,p));
+    const mediaUpdates=["trakt","floppy","crosswatch","flicklist","mdblist","wetrakr"].some(p=>same(state.dst,p));
+    const copyDetails=same(state.dst,"wetrakr")||(isTwoWayMode(state)&&same(state.src,"wetrakr"));
     left.innerHTML = `<div class="panel-title">Collections | Basics</div>
       <div class="opt-row">
         <label for="cx-co-enable">Enable</label>
@@ -2049,7 +2054,7 @@ left.innerHTML = `
         <div class="opt-row"><label for="cx-co-type-seasons">Seasons</label><label class="switch"><input id="cx-co-type-seasons" type="checkbox" ${hasType("seasons")?"checked":""}><span class="slider"></span></label></div>
         <div class="opt-row"><label for="cx-co-type-episodes">Episodes</label><label class="switch"><input id="cx-co-type-episodes" type="checkbox" ${hasType("episodes")?"checked":""}><span class="slider"></span></label></div>
       </div>
-      ${mediaRead||mediaUpdates ? `<div class="panel-title small">Media info</div>` : ""}
+      ${mediaRead||mediaUpdates||copyDetails ? `<div class="panel-title small">Media info</div>` : ""}
       ${mediaRead ? `<div class="opt-row">
         <label for="cx-co-media" data-tip-id="cx-co-media">Read from media server</label>
         <label class="switch"><input id="cx-co-media" type="checkbox" ${co.media_info ? "checked" : ""}><span class="slider"></span></label>
@@ -2057,6 +2062,10 @@ left.innerHTML = `
       ${mediaUpdates ? `<div class="opt-row">
         <label for="cx-co-media-upd" data-tip-id="cx-co-media-upd">Update existing items</label>
         <label class="switch"><input id="cx-co-media-upd" type="checkbox" ${co.media_updates ? "checked" : ""}><span class="slider"></span></label>
+      </div>` : ""}
+      ${copyDetails ? `<div class="opt-row">
+        <label for="cx-co-copy-details" data-tip-id="cx-co-copy-details">Send private copy details</label>
+        <label class="switch"><input id="cx-co-copy-details" type="checkbox" ${co.copy_details ? "checked" : ""}><span class="slider"></span></label>
       </div>` : ""}`;
     applySubDisable("collection");
     applyCollectionTypeRules(state);
@@ -2107,6 +2116,8 @@ left.innerHTML = `
           <label class="switch"><input id="cx-pr-specials" type="checkbox" ${pr.include_specials !== false ? "checked" : ""}><span class="slider"></span></label></div>
         ${pairSupportsLibraryOnly(state, state?.src, state?.dst, isTwoWayMode(state), "progress") ? `<div class="opt-row" style="grid-column:1/-1"><label for="cx-pr-library-only" data-tip-id="cx-pr-library-only">Only items in destination library</label>
           <label class="switch"><input id="cx-pr-library-only" type="checkbox" ${libraryOnlyOn(state, pr, "progress") ? "checked" : ""}><span class="slider"></span></label></div>` : ""}
+        ${pairSupportsContinueWatching(state) ? `<div class="opt-row" style="grid-column:1/-1"><label for="cx-pr-cw-removals" data-tip-id="cx-pr-cw-removals">Sync Continue Watching removals <span class="pill">Beta</span></label>
+          <label class="switch"><input id="cx-pr-cw-removals" type="checkbox" ${pr.continue_watching_removals ? "checked" : ""}><span class="slider"></span></label></div>` : ""}
       </div>
       ${prAnime}
       ${progressRecommendation ?`<div class="muted" style="margin-top:10px">${escHTML(progressRecommendation)}</div>` : ""}
@@ -2489,7 +2500,8 @@ function bindChangeHandlers(state,root){
         replay_enabled:!!ID("cx-pr-replay")?.checked,
         timestamp_tolerance_seconds:Number.isFinite(tolerance)?Math.max(0,Math.min(300,tolerance)):30,
         include_specials:ID("cx-pr-specials")?!!ID("cx-pr-specials").checked:prev.include_specials!==false,
-        library_only:ID("cx-pr-library-only")?!!ID("cx-pr-library-only").checked:prev.library_only
+        library_only:ID("cx-pr-library-only")?!!ID("cx-pr-library-only").checked:prev.library_only,
+        continue_watching_removals:ID("cx-pr-cw-removals")?!!ID("cx-pr-cw-removals").checked:!!prev.continue_watching_removals
       });
       state.visited.add("progress");
     }
@@ -2514,6 +2526,7 @@ function bindChangeHandlers(state,root){
         remove:!!ID("cx-co-remove")?.checked,
         media_info:ID("cx-co-media")?!!ID("cx-co-media").checked:!!prev.media_info,
         media_updates:ID("cx-co-media-upd")?!!ID("cx-co-media-upd").checked:!!prev.media_updates,
+        copy_details:ID("cx-co-copy-details")?!!ID("cx-co-copy-details").checked:!!prev.copy_details,
         types
       });
       syncCollectionModeLock(state);

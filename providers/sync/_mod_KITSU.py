@@ -17,7 +17,13 @@ from ._mod_common import build_op_result, build_session
 from ._log import log
 from .kitsu import _history, _ratings, _watchlist
 
-__VERSION__ = "0.2"
+_UNKNOWN_DATES = {
+    "read": True, "write": True,
+    "rewatches": {"read": False, "write": False},
+    "multiple": {"read": False, "write": False},
+}
+
+__VERSION__ = "1.0"
 _MANUAL_RATING_SCALE = {"step": 1}
 __all__ = ["get_manifest", "KITSUModule", "OPS"]
 _FEATURES = {"watchlist": _watchlist, "ratings": _ratings, "history": _history}
@@ -45,13 +51,19 @@ def capabilities() -> dict[str, Any]:
             "watchlist": {"types": titles, "remove": True},
             "ratings": {"manual_scale": _MANUAL_RATING_SCALE, "types": titles, "upsert": True, "unrate": True, "from_date": False},
             "history": {"types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
-                        "upsert": False, "remove": True, "observed_deletes": False,
+                        "upsert": False, "remove": True, "observed_deletes": False, "unknown_dates": _UNKNOWN_DATES,
                         "rewatches": {"read": False, "write": False}}}
 
 
 def get_manifest() -> dict[str, Any]:
     return {"name": "KITSU", "label": "Kitsu", "version": __VERSION__, "type": "sync", "experimental": True,
             "bidirectional": True, "features": supported_features(), "capabilities": capabilities(), "requires": []}
+
+
+class KitsuHTTPError(RuntimeError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class KitsuClient:
@@ -68,7 +80,7 @@ class KitsuClient:
         if response.status_code == 401:
             raise auth.KitsuAuthError("Kitsu reconnect required")
         if response.status_code >= 300:
-            raise RuntimeError(f"Kitsu HTTP {response.status_code}")
+            raise KitsuHTTPError(f"Kitsu HTTP {response.status_code}", response.status_code)
         if response.status_code == 204:
             return {}
         data = response.json()

@@ -37,17 +37,17 @@
     chipNav={pairs:{target:"pairs",label:"Open sync pair settings"},sched:{target:"scheduling",label:"Open scheduler settings"},watch:{target:"watcher",label:"Open watcher settings"},hook:{target:"webhook",label:"Open webhook settings"},health:{target:"maintenance",label:"Open Maintenance tools"}},
     S={cfg:null,pairs:{total:0,active:0},sched:{enabled:false,running:false,next:0,advanced:false,captures:0,webhooks:false,webhookLabel:"",warning:false,warnings:[]},evt:{enabled:false,count:0},watch:{...blank(),alive:false},hook:blank(),system:{health:{known:false,ok:false,status:"checking"}},timers:{sched:null,scrob:null,health:null,wait:null,rotate:null},debounce:null,last:{watcher:"",webhook:""}};
   const SHARED_WATCH_KEY="__CW_CURRENT_WATCHING_SHARED__",SHARED_WATCH_TTL_MS=3000,WATCHER_UNAVAILABLE_GRACE_MS=35000;
-  let scrobPollSeq=0, lastSync=null;
+  let scrobPollSeq=0;
   const isManaged=()=>document.documentElement?.dataset?.cwRole==="user";
 
   if (!$("#sched-banner-css")) {
     const st=document.createElement("style");
     st.id="sched-banner-css";
-    st.textContent=`#ops-card .action-row{display:flex;align-items:center;justify-content:flex-start;gap:12px;flex-wrap:nowrap}#ops-card .action-buttons{display:flex;gap:10px;flex:0 0 auto;min-width:0;align-items:center;flex-wrap:nowrap;order:1}#ops-card .cw-status-dock{flex:1 1 auto;width:auto;min-width:0;justify-content:flex-end;align-items:center;margin-left:auto;order:2}#ops-card .cw-status-dock:not(:has(.sched)){display:none}#sched-inline-log{position:static;z-index:2;pointer-events:none;display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap;max-width:100%;width:100%}#sched-inline-log .sched,#sched-inline-log .sched *,#sched-inline-log .sched *::before,#sched-inline-log .sched *::after{box-sizing:border-box}#sched-inline-log .sched{--chip-accent:#ef4444;position:relative;display:inline-flex;align-items:center;gap:10px;min-height:34px;max-width:min(420px,100%);padding:5px 12px;border-radius:999px;background:linear-gradient(180deg,rgba(17,21,29,.96),rgba(10,13,20,.98));backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 8px 18px rgba(0,0,0,.24);overflow:hidden;pointer-events:auto;white-space:nowrap}#sched-inline-log .sched.ok,#sched-inline-log .sched.live{--chip-accent:#22c55e}#sched-inline-log .sched.idle{--chip-accent:#ef4444;background:linear-gradient(180deg,rgba(17,21,29,.94),rgba(10,13,20,.96));border-color:rgba(255,255,255,.07)}#sched-inline-log .sched.warn{--chip-accent:#ef4444;background:linear-gradient(180deg,rgba(30,16,18,.96),rgba(18,10,12,.98));border-color:rgba(211,106,106,.18)}#sched-inline-log .ic{position:relative;display:inline-flex!important;align-items:center!important;justify-content:center!important;align-self:center!important;flex:0 0 auto;z-index:1}#sched-inline-log .ic.dot{width:10px;height:10px;border-radius:50%;background:var(--chip-accent);box-shadow:0 0 0 1px rgba(0,0,0,.48),0 0 10px color-mix(in srgb,var(--chip-accent) 40%,transparent)}#sched-inline-log .sched.live .ic.dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:1px solid color-mix(in srgb,var(--chip-accent) 42%,transparent);opacity:.7;animation:ringPulse 1.7s ease-out infinite}#sched-inline-log .copy{position:relative;z-index:1;display:inline-flex!important;align-items:center!important;align-self:center!important;gap:7px;min-width:0;max-width:100%;height:20px;line-height:20px;overflow:hidden}#sched-inline-log .label{display:inline-flex!important;align-items:center!important;align-self:center!important;vertical-align:middle!important;height:20px;line-height:20px;margin:0!important;padding:0!important;position:relative;top:0!important;bottom:auto!important;transform:none!important;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:rgba(181,190,208,.76);flex:0 0 auto}#sched-inline-log .value,#sched-inline-log .meta,#sched-inline-log .badges{position:relative;top:-1.5px!important}#sched-inline-log .value,#sched-inline-log .meta{display:inline-flex!important;align-items:center!important;align-self:center!important;vertical-align:middle!important;height:20px;line-height:20px;margin:0!important;padding:0!important;bottom:auto!important;transform:none!important}#sched-inline-log .value{font-size:12px;font-weight:800;letter-spacing:.02em;color:#eef3ff;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}#sched-inline-log .meta{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:12px;font-weight:700;color:rgba(188,197,214,.68)}#sched-inline-log .badges{display:inline-flex!important;align-items:center!important;align-self:center!important;gap:6px;flex:0 0 auto;height:20px}#sched-inline-log .badge{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:18px;padding:0 6px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.05);color:rgba(232,238,250,.82);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;line-height:18px}#sched-inline-log .sched[data-tip]{cursor:help;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease,background .16s ease}#sched-inline-log .sched[data-tip]:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(20,24,32,.98),rgba(12,15,22,.99));box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 10px 22px rgba(0,0,0,.28)}#sched-inline-log .sched.warn[data-tip]:hover{background:linear-gradient(180deg,rgba(34,18,21,.98),rgba(22,11,14,.99))}#sched-inline-log .sched[data-tip]::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%) translateY(4px);opacity:0;pointer-events:none;min-width:180px;max-width:min(320px,72vw);padding:8px 10px;border-radius:12px;background:rgba(10,13,20,.98);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 30px rgba(0,0,0,.34);color:#edf4ff;font-size:11px;font-weight:700;line-height:1.35;white-space:pre-line;text-align:left;transition:opacity .16s ease,transform .16s ease}#sched-inline-log .sched[data-tip]:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}@keyframes ringPulse{0%{transform:scale(.72);opacity:.8}80%{transform:scale(1.28);opacity:0}100%{transform:scale(1.28);opacity:0}}@media (max-width:640px){#ops-card .action-row{flex-wrap:wrap}#ops-card .action-buttons{width:100%;flex-wrap:wrap}#ops-card .cw-status-dock{width:100%;margin-left:0}#sched-inline-log{gap:8px}#sched-inline-log .sched{min-height:32px;padding:4px 10px;max-width:100%}#sched-inline-log .copy{gap:6px;height:18px;line-height:18px}#sched-inline-log .label,#sched-inline-log .value,#sched-inline-log .meta{height:18px;line-height:18px}#sched-inline-log .label{font-size:9px}#sched-inline-log .value,#sched-inline-log .meta{font-size:11px}#sched-inline-log .value,#sched-inline-log .meta,#sched-inline-log .badges{top:-1px!important}#sched-inline-log .badges{height:18px}#sched-inline-log .badge{height:17px;min-width:22px;padding:0 5px;font-size:9px;line-height:17px}}`;
+    st.textContent=`#ops-card .action-row{display:flex;align-items:center;justify-content:flex-start;gap:12px;flex-wrap:nowrap}#ops-card .cw-status-dock{flex:1 1 auto;width:auto;min-width:0;justify-content:flex-end;align-items:center;margin-left:auto;order:2}#ops-card .cw-status-dock:not(:has(.sched)){display:none}#sched-inline-log{position:static;z-index:2;pointer-events:none;display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap;max-width:100%;width:100%}#sched-inline-log .sched,#sched-inline-log .sched *,#sched-inline-log .sched *::before,#sched-inline-log .sched *::after{box-sizing:border-box}#sched-inline-log .sched{--chip-accent:#ef4444;position:relative;display:inline-flex;align-items:center;gap:10px;min-height:34px;max-width:min(420px,100%);padding:5px 12px;border-radius:999px;background:linear-gradient(180deg,rgba(17,21,29,.96),rgba(10,13,20,.98));backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 8px 18px rgba(0,0,0,.24);overflow:hidden;pointer-events:auto;white-space:nowrap}#sched-inline-log .sched.ok,#sched-inline-log .sched.live{--chip-accent:#22c55e}#sched-inline-log .sched.idle{--chip-accent:#ef4444;background:linear-gradient(180deg,rgba(17,21,29,.94),rgba(10,13,20,.96));border-color:rgba(255,255,255,.07)}#sched-inline-log .sched.warn{--chip-accent:#ef4444;background:linear-gradient(180deg,rgba(30,16,18,.96),rgba(18,10,12,.98));border-color:rgba(211,106,106,.18)}#sched-inline-log .ic{position:relative;display:inline-flex!important;align-items:center!important;justify-content:center!important;align-self:center!important;flex:0 0 auto;z-index:1}#sched-inline-log .ic.dot{width:10px;height:10px;border-radius:50%;background:var(--chip-accent);box-shadow:0 0 0 1px rgba(0,0,0,.48),0 0 10px color-mix(in srgb,var(--chip-accent) 40%,transparent)}#sched-inline-log .sched.live .ic.dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:1px solid color-mix(in srgb,var(--chip-accent) 42%,transparent);opacity:.7;animation:ringPulse 1.7s ease-out infinite}#sched-inline-log .copy{position:relative;z-index:1;display:inline-flex!important;align-items:center!important;align-self:center!important;gap:7px;min-width:0;max-width:100%;height:20px;line-height:20px;overflow:hidden}#sched-inline-log .label{display:inline-flex!important;align-items:center!important;align-self:center!important;vertical-align:middle!important;height:20px;line-height:20px;margin:0!important;padding:0!important;position:relative;top:0!important;bottom:auto!important;transform:none!important;font-size:10px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:rgba(181,190,208,.76);flex:0 0 auto}#sched-inline-log .value,#sched-inline-log .meta,#sched-inline-log .badges{position:relative;top:-1.5px!important}#sched-inline-log .value,#sched-inline-log .meta{display:inline-flex!important;align-items:center!important;align-self:center!important;vertical-align:middle!important;height:20px;line-height:20px;margin:0!important;padding:0!important;bottom:auto!important;transform:none!important}#sched-inline-log .value{font-size:12px;font-weight:800;letter-spacing:.02em;color:#eef3ff;flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis}#sched-inline-log .meta{min-width:0;overflow:hidden;text-overflow:ellipsis;font-size:12px;font-weight:700;color:rgba(188,197,214,.68)}#sched-inline-log .badges{display:inline-flex!important;align-items:center!important;align-self:center!important;gap:6px;flex:0 0 auto;height:20px}#sched-inline-log .badge{display:inline-flex;align-items:center;justify-content:center;min-width:24px;height:18px;padding:0 6px;border-radius:999px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.05);color:rgba(232,238,250,.82);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;line-height:18px}#sched-inline-log .sched[data-tip]{cursor:help;transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease,background .16s ease}#sched-inline-log .sched[data-tip]:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(20,24,32,.98),rgba(12,15,22,.99));box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 10px 22px rgba(0,0,0,.28)}#sched-inline-log .sched.warn[data-tip]:hover{background:linear-gradient(180deg,rgba(34,18,21,.98),rgba(22,11,14,.99))}#sched-inline-log .sched[data-tip]::after{content:attr(data-tip);position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%) translateY(4px);opacity:0;pointer-events:none;min-width:180px;max-width:min(320px,72vw);padding:8px 10px;border-radius:12px;background:rgba(10,13,20,.98);border:1px solid rgba(255,255,255,.08);box-shadow:0 10px 30px rgba(0,0,0,.34);color:#edf4ff;font-size:11px;font-weight:700;line-height:1.35;white-space:pre-line;text-align:left;transition:opacity .16s ease,transform .16s ease}#sched-inline-log .sched[data-tip]:hover::after{opacity:1;transform:translateX(-50%) translateY(0)}@keyframes ringPulse{0%{transform:scale(.72);opacity:.8}80%{transform:scale(1.28);opacity:0}100%{transform:scale(1.28);opacity:0}}@media (max-width:640px){#ops-card .action-row{flex-wrap:wrap}#ops-card .cw-status-dock{width:100%;margin-left:0}#sched-inline-log{gap:8px}#sched-inline-log .sched{min-height:32px;padding:4px 10px;max-width:100%}#sched-inline-log .copy{gap:6px;height:18px;line-height:18px}#sched-inline-log .label,#sched-inline-log .value,#sched-inline-log .meta{height:18px;line-height:18px}#sched-inline-log .label{font-size:9px}#sched-inline-log .value,#sched-inline-log .meta{font-size:11px}#sched-inline-log .value,#sched-inline-log .meta,#sched-inline-log .badges{top:-1px!important}#sched-inline-log .badges{height:18px}#sched-inline-log .badge{height:17px;min-width:22px;padding:0 5px;font-size:9px;line-height:17px}}`;
     st.textContent+=`
 #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e06470;--hub-service-disabled:#788291;--hub-action-bg:rgba(255,255,255,.035);--hub-action-hover:rgba(255,255,255,.065);--hub-card-bg:linear-gradient(180deg,rgba(20,24,34,.96),rgba(12,15,23,.98));--hub-card-border:rgba(255,255,255,.09);--hub-text:#eef3ff;--hub-muted:rgba(188,198,217,.68);}
 #ops-card .action-row{display:flex!important;align-items:center!important;justify-content:flex-start!important;flex-wrap:nowrap!important;gap:14px!important;margin-top:14px!important;padding:14px!important;}
-#ops-card .action-buttons{display:flex!important;flex:0 0 auto!important;min-width:0!important;width:auto!important;align-items:center!important;justify-content:flex-start!important;gap:10px!important;order:1!important;flex-wrap:nowrap!important;}
+
 #ops-card .action-buttons .cw-hub-action{display:inline-flex!important;align-items:center!important;justify-content:center!important;gap:9px!important;flex:0 0 auto!important;min-width:132px!important;min-height:46px!important;height:46px!important;padding:0 16px!important;border-radius:14px!important;background:var(--hub-action-bg)!important;border:1px solid var(--hub-card-border)!important;color:var(--hub-text)!important;box-shadow:inset 0 1px 0 rgba(255,255,255,.035)!important;white-space:nowrap!important;line-height:1!important;}
 #ops-card .action-buttons .cw-hub-action:hover{background:var(--hub-action-hover)!important;border-color:rgba(255,255,255,.16)!important;transform:translateY(-1px)!important;}
 #ops-card .action-buttons .cw-action-icon{font-size:21px!important;line-height:1!important;font-variation-settings:"FILL" 0,"wght" 450,"GRAD" 0,"opsz" 24;}
@@ -126,7 +126,7 @@ html[data-cw-theme="flat-dark"] #ops-card{--hub-service-good:#57b58a;--hub-servi
 html[data-cw-theme="flat-light"] #ops-card{--hub-service-good:#276348;--hub-service-bad:#a93f4d;--hub-service-disabled:#98a2b3;--hub-action-bg:#fff;--hub-action-hover:#eef2f7;--hub-card-bg:#fff;--hub-card-border:rgba(16,24,40,.16);--hub-text:#172033;--hub-muted:#667085;}
 html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e06470;--hub-service-disabled:#77808f;--hub-action-bg:rgba(255,255,255,.035);--hub-action-hover:rgba(255,255,255,.065);--hub-card-bg:linear-gradient(180deg,rgba(20,24,34,.96),rgba(12,15,23,.98));--hub-card-border:rgba(255,255,255,.09);--hub-text:#eef3ff;--hub-muted:rgba(188,198,217,.68);}
 @keyframes cwHubSyncSpin{to{transform:rotate(360deg)}}
-@media(max-width:760px){#ops-card .action-buttons{width:100%!important;flex-wrap:wrap!important;}#ops-card .action-buttons>.cw-split-run,#ops-card .action-buttons>.cw-hub-action{flex:1 1 150px!important;}#sched-inline-log{flex-wrap:wrap!important;}#ops-card #sched-inline-log .hub-group-system{margin-left:0;}}
+@media(max-width:760px){#ops-card .action-buttons>.cw-split-run,#ops-card .action-buttons>.cw-hub-action{flex:1 1 150px!important;}#sched-inline-log{flex-wrap:wrap!important;}#ops-card #sched-inline-log .hub-group-system{margin-left:0;}}
 @media(max-width:480px){#ops-card .action-buttons>.cw-split-run,#ops-card .action-buttons>.cw-hub-action{flex:1 1 100%!important;}#ops-card #sched-inline-log .sched[data-tip]::after{left:0!important;transform:translateX(0) translateY(4px)!important;}#ops-card #sched-inline-log .sched[data-tip]:hover::after,#ops-card #sched-inline-log .sched[data-tip]:focus-visible::after{transform:translateX(0) translateY(0)!important;}}
 `;
     document.head.appendChild(st);
@@ -207,15 +207,22 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
     return seconds<60?"Just now":new Intl.RelativeTimeFormat(undefined,{numeric:"auto"}).format(-amount,unit);
   }
 
-  function lastSyncTip(summary, now=Date.now()) {
-    if (!summary) return "Last sync: Unavailable";
+  function lastSyncState(summary, now=Date.now()) {
     const running=!!summary.running, raw=running?(summary.started_at||summary.raw_started_ts):(summary.finished_at||summary.started_at||summary.raw_started_ts);
-    if (!raw) return "Last sync: No runs recorded";
     const number=Number(raw), date=new Date(Number.isFinite(number)?(number<1e12?number*1000:number):raw);
-    if (!Number.isFinite(date.getTime())||date.getTime()<=0) return "Last sync: No runs recorded";
-    const relative=runAge(date,now),
-      exact=date.toLocaleString([],{year:"numeric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",timeZoneName:"short"});
-    return `${running?"Sync started":"Last sync"}: ${relative}\n${exact}`;
+    const valid=!!raw&&Number.isFinite(date.getTime())&&date.getTime()>0,
+      failed=valid&&!running&&summary.exit_code!=null&&summary.exit_code!==0;
+    return {label:running?"Sync started":"Last sync",date:valid?date:null,failed,text:valid?`${runAge(date,now)}${failed?" \u00b7 Failed":""}`:"No runs recorded"};
+  }
+
+  function sharedLastSync(){
+    const summary=CW().getRunSummary?.();
+    return summary?lastSyncState(summary):{label:"Last sync",date:null,failed:false,text:"Unavailable"};
+  }
+
+  function lastSyncTip(state) {
+    const exact=state.date?.toLocaleString([],{year:"numeric",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",timeZoneName:"short"});
+    return `${state.label}: ${state.text}${exact?`\n${exact}`:""}`;
   }
 
   const sourceLabel=(src)=>{
@@ -357,7 +364,7 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
     aria?(el.chip.dataset.tip=aria,el.chip.setAttribute("aria-label",aria)):(el.chip.removeAttribute("data-tip"),el.chip.removeAttribute("aria-label"));
   }
 
-  function renderMobileSchedule(){
+  function renderMobileSchedule(state){
     const row=$("#ops-card .action-row");
     if (!row) return;
     let line=$("#cw-mobile-last-schedule");
@@ -365,17 +372,17 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
       line=document.createElement("div");
       line.id="cw-mobile-last-schedule";
       line.className="cw-mobile-last-schedule";
-      line.innerHTML='<span class="material-symbols-rounded" aria-hidden="true">schedule</span><span class="cw-mobile-last-schedule-copy"><span>Last scheduled run</span><time></time></span>';
+      line.innerHTML='<span class="material-symbols-rounded" aria-hidden="true">schedule</span><span class="cw-mobile-last-schedule-copy"><span>Last sync</span><time></time></span>';
       row.insertAdjacentElement("afterend",line);
     }
     line.hidden=isManaged()||!S.sched.enabled;
-    const date=new Date(Number(S.sched.lastAt||0)*1000), valid=Number.isFinite(date.getTime())&&date.getTime()>0;
-    const failed=valid&&S.sched.lastOk===false;
+    const {date,failed}=state;
+    $(".cw-mobile-last-schedule-copy > span",line).textContent=state.label;
     line.classList.toggle("is-failed",failed);
     $(".material-symbols-rounded",line).textContent=failed?"error_outline":"schedule";
     const time=$("time",line);
-    time.textContent=valid?`${runAge(date)}${failed?" \u00b7 Failed":""}`:"No runs yet";
-    if (valid) {
+    time.textContent=state.text;
+    if (date) {
       time.dateTime=date.toISOString();
       time.title=date.toLocaleString();
     } else {
@@ -387,7 +394,8 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
   function render(){
     const host=ensureBanner();
     if (!host) return;
-    renderMobileSchedule();
+    const lastSync=sharedLastSync();
+    renderMobileSchedule(lastSync);
     const E=k=>{const chip=$(`#chip-${k}`,host);return {chip,icon:chip?$(".service-icon",chip):null,value:$(`#${k}-value`,host),meta:$(`#${k}-meta`,host),badges:$(`#${k}-badges`,host),tip:chip?$(".cw-hub-tip",chip):null,progress:["watch","hook"].includes(k)&&chip?$(".watch-progress",chip):null,progressValue:["watch","hook"].includes(k)?$(`#${k}-progress-value`,host):null};},
       pairs=E("pairs"), sched=E("sched"), watch=E("watch"), hook=E("hook"), health=E("health"),
       managed=isManaged(),
@@ -500,17 +508,10 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
     clear("sched");
     if (document.hidden) return scheduleSched();
     try {
-      const [st, summary]=await Promise.all([
-        API().Scheduling.status(force),
-        fetch("/api/run/summary",{cache:"no-store"}).then(r=>{if(!r.ok) throw new Error("Sync history unavailable");return r.json();}).catch(()=>null)
-      ]), sc=st?.config||S.cfg?.scheduling||{};
-      lastSync=summary;
+      const st=await API().Scheduling.status(force), sc=st?.config||S.cfg?.scheduling||{};
       const adv=advancedOn(sc), captures=adv?activeCaptureJobs(sc):0, events=adv?activeEventRules(sc):0, wh=webhookState(sc);
       const warnings=(Array.isArray(st?.scheduling_warnings)?st.scheduling_warnings:(Array.isArray(st?.warnings)?st.warnings:[])).map(x=>String(x||"").trim()).filter(Boolean);
       S.sched={enabled:schedulingOn(sc),standard:!!sc.enabled&&sc.mode!=="disabled",advanced:adv,running:!!st?.running,next:+(st?.next_run_at||st?.next_run||0)||0,captures:captures,webhooks:!!wh.active,webhookLabel:wh.label||"",warning:!!st?.warning||warnings.length>0,warnings};
-      const latest=[st,...Object.values(st?.profiles||{})].filter(row=>Number.isFinite(Number(row?.last_run_at))&&Number(row.last_run_at)>0).sort((a,b)=>Number(b.last_run_at)-Number(a.last_run_at))[0];
-      S.sched.lastAt=Number(latest?.last_run_at)||0;
-      S.sched.lastOk=latest?.last_run_ok;
       S.evt={enabled:adv&&events>0,count:events};
     } catch { S.sched={enabled:false,running:false,next:0,advanced:false,captures:0,webhooks:false,webhookLabel:"",warning:false,warnings:[]}; S.evt={enabled:false,count:0}; }
     render();
@@ -597,7 +598,19 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
     },30000);
   }
 
+  let refreshPending=null, lastRefresh=0;
   async function refresh(forceCfg=false){
+    if (refreshPending) {
+      await refreshPending;
+      if (!forceCfg) return;
+    }
+    const pending=refreshState(forceCfg);
+    refreshPending=pending;
+    try { await pending; lastRefresh=Date.now(); }
+    finally { if(refreshPending===pending) refreshPending=null; }
+  }
+
+  async function refreshState(forceCfg=false){
     stop();
     [S.cfg]=await Promise.all([readConfig(forceCfg),pollPairs(forceCfg),pollHealth()]);
     if ((isManaged()||!schedulingOn(S.cfg?.scheduling)) && !S.cfg?.scrobble?.enabled) {
@@ -621,20 +634,22 @@ html.cw-theme-original #ops-card{--hub-service-good:#57b58a;--hub-service-bad:#e
   }
 
   const refreshPairs=()=>pollPairs(true).then(render).catch(()=>{});
+  const resume=()=>{if(!document.hidden&&Date.now()-lastRefresh>=15000) queueRefresh(false);};
 
   function boot(){
     if (window.__SCHED_BANNER_STARTED__) return;
     window.__SCHED_BANNER_STARTED__=true;
     queueRefresh(true);
-    document.addEventListener("visibilitychange",()=>!document.hidden&&queueRefresh(false),{passive:true});
+    document.addEventListener("visibilitychange",resume,{passive:true});
     document.addEventListener("config-saved",()=>queueRefresh(true));
     window.addEventListener("cx:pairs:changed",refreshPairs);
     document.addEventListener("cx-state-change",refreshPairs);
     window.addEventListener("auth-changed",()=>queueRefresh(true));
+    window.addEventListener("cw:run-summary-changed",render);
     document.addEventListener("scheduling-status-refresh",()=>!isManaged()&&pollSched(true));
     document.addEventListener("watcher-status-refresh",()=>pollScrob(true));
     document.addEventListener("tab-changed",e=>["main","settings"].includes(e?.detail?.id)&&queueRefresh(false));
-    window.addEventListener("focus",()=>queueRefresh(false));
+    window.addEventListener("focus",resume);
     window.refreshSchedulingBanner=queueRefresh;
     S.timers.visual=setInterval(()=>{
       if (document.hidden) return;

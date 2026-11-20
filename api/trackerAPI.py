@@ -172,7 +172,24 @@ def _row(key: str, item: Any, feature: str | None = None) -> dict[str, Any]:
         "ids": dict(_map(data.get("ids"))),
         "show_ids": dict(_map(data.get("show_ids"))),
         "art": _art(data),
+        **_row_media(data, feature),
     }
+
+
+def _row_media(data: Mapping[str, Any], feature: str | None) -> dict[str, Any]:
+    if feature != "collection":
+        return {}
+    out: dict[str, Any] = {}
+    if data.get("format"):
+        out["format"] = str(data["format"])
+    if isinstance(data.get("media_info"), Mapping) and data["media_info"]:
+        out["media_info"] = dict(data["media_info"])
+    if data.get("media_manual") is True:
+        out["media_manual"] = True
+    copies = data.get("copies")
+    if isinstance(copies, list) and copies:
+        out["copies"] = [dict(row) for row in copies if isinstance(row, Mapping)]
+    return out
 
 
 def _error(code: str, status: int, **extra: Any) -> JSONResponse:
@@ -284,6 +301,56 @@ def _id_map(current: Any, changes: Any) -> dict[str, Any]:
     return out
 
 
+def _edited_copies(out: dict[str, Any], value: Any) -> None:
+    from services.shelf_store import ShelfError, clean_copies
+
+    try:
+        copies = clean_copies(value)
+    except ShelfError as exc:
+        raise ValueError("invalid_copies") from exc
+    if copies:
+        out["copies"] = copies
+    else:
+        out.pop("copies", None)
+
+
+def _edited_media(out: dict[str, Any], value: Any) -> None:
+    from cw_platform.collection_media import AUDIOS, CHANNELS, FORMATS, HDRS, RESOLUTIONS
+
+    if value is None:
+        for field in ("media_manual", "format", "media_info"):
+            out.pop(field, None)
+        return
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid_media")
+    fmt = str(value.get("format") or "").strip().lower()
+    if fmt and fmt not in FORMATS:
+        raise ValueError("invalid_media")
+    info: dict[str, Any] = {}
+    for key, allowed in (("resolution", RESOLUTIONS), ("hdr", HDRS), ("audio", AUDIOS), ("audio_channels", CHANNELS)):
+        text = str(value.get(key) or "").strip().lower()
+        if not text:
+            continue
+        if text not in allowed:
+            raise ValueError("invalid_media")
+        info[key] = text
+    if value.get("is_3d") is True:
+        info["is_3d"] = True
+    if not fmt and not info:
+        for field in ("media_manual", "format", "media_info"):
+            out.pop(field, None)
+        return
+    if fmt:
+        out["format"] = fmt
+    else:
+        out.pop("format", None)
+    if info:
+        out["media_info"] = info
+    else:
+        out.pop("media_info", None)
+    out["media_manual"] = True
+
+
 def _edited(feature: str, item: Mapping[str, Any], changes: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(item)
     typ = str(item.get("type") or "").lower()
@@ -322,6 +389,14 @@ def _edited(feature: str, item: Mapping[str, Any], changes: Mapping[str, Any]) -
                 out["show_ids"] = show_ids
             else:
                 out.pop("show_ids", None)
+        elif field == "media":
+            if feature != "collection":
+                raise ValueError("invalid_media")
+            _edited_media(out, value)
+        elif field == "copies":
+            if feature != "collection":
+                raise ValueError("invalid_copies")
+            _edited_copies(out, value)
         elif field == "title":
             title = str(value or "").strip()
             if not title or len(title) > 300:
@@ -361,6 +436,19 @@ def _item_key(feature: str, key: str, before: Mapping[str, Any], after: Mapping[
 def _user(request: Request | None) -> Mapping[str, Any] | None:
     user = request_user(request) if request is not None else None
     return None if not user or bool(user.get("is_admin")) else user
+
+
+def _shelf_keys(request: Request) -> list[str]:
+    from api import profileAPI
+    from services import shelf_store
+
+    ctx = profileAPI._profile_context(request)
+    if isinstance(ctx, JSONResponse):
+        return []
+    try:
+        return list(shelf_store.entries(profileAPI._shelf_owner(ctx)))
+    except Exception:
+        return []
 
 
 def _store(provider_instance: Any, request: Request | None = None, *, fallback: bool = False) -> tuple[dict[str, Any], str, TrackerStore]:
@@ -637,12 +725,14 @@ def tracker_items(
     attention: bool = Query(False),
     health: str = Query(""),
     month: str = Query("", pattern=r"^(\d{4}-(0[1-9]|1[0-2]))?$"),
+    shelf: bool = Query(False),
 ) -> Any:
     if status and status not in (*NOTE_STATUSES, "none"):
         return _error("invalid_status", 400)
     if feature not in FEATURES:
         return _error("unknown_feature", 400)
     _, inst, store = _store(provider_instance, request)
+    shelf_keys = _shelf_keys(request) if shelf and feature == "collection" else None
     try:
         with store.session():
             total, rows = store.query(
@@ -658,6 +748,7 @@ def tracker_items(
                 attention=attention,
                 health=health if health in ("ok", "attention", "unchecked") else "",
                 until=_month_end(month),
+                shelf=shelf_keys,
             )
             checks = store.checks_for(feature, [key for key, _ in rows])
             note_keys = {key: _title_key(_identity_of(item, key)) for key, item in rows}
@@ -665,12 +756,7 @@ def tracker_items(
             ratings = {}
             if feature != "ratings":
                 for key, item in rows:
-                    matches = store.related(**_identity_of(item, key), feature="ratings")
-                    candidates = [data for _, _, data in matches if data.get("type") in ("movie", "show", "anime") or (
-                        data.get("type") == item.get("type") and data.get("season") == item.get("season") and data.get("episode") == item.get("episode")
-                    )]
-                    candidates.sort(key=lambda data: (data.get("type") == item.get("type"), str(data.get("rated_at") or "")), reverse=True)
-                    ratings[key] = candidates[0].get("rating") if candidates else None
+                    ratings[key] = _user_rating(store, item, key)
     except TrackerUnreadable:
         return _unreadable()
     items = []
@@ -688,6 +774,46 @@ def tracker_items(
         "offset": offset,
         "items": items,
     }
+
+
+@router.get("/history/titles", dependencies=_READY)
+def tracker_history_titles(
+    request: Request,
+    provider_instance: str | None = Query("default"),
+    q: str = Query("", max_length=200),
+    status: str = Query(""),
+    tag: str = Query("", max_length=40),
+    sort: str = Query("recent"),
+    media: str = Query(""),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(60, ge=1, le=200),
+) -> Any:
+    if status and status not in (*NOTE_STATUSES, "none"):
+        return _error("invalid_status", 400)
+    if media not in ("", "movie", "show"):
+        return _error("invalid_media", 400)
+    _, inst, store = _store(provider_instance, request)
+    try:
+        with store.session():
+            total, rows = store.history_titles(text=q, status=status, tag=tag, sort=sort, media=media, offset=offset, limit=limit)
+            notes = store.notes_for(title_key for _, _, title_key, _ in rows)
+            items = []
+            for key, item, title_key, plays in rows:
+                row = _row(key, item, "history")
+                row["title_key"] = title_key
+                row["plays"] = plays
+                if title_key.startswith("show:"):
+                    row.update(type="show", title=row.get("series_title") or row.get("title"), year=row.get("series_year") or row.get("year"))
+                    row["ids"] = row.get("show_ids") or {}
+                    row["season"] = None
+                    row["episode"] = None
+                    row["episode_title"] = None
+                row["user_rating"] = _user_rating(store, row, key)
+                row["status"] = (notes.get(title_key) or {}).get("status")
+                items.append(row)
+    except TrackerUnreadable:
+        return _unreadable()
+    return {"ok": True, "provider_instance": inst, "total": total, "offset": offset, "items": items}
 
 
 def _month_end(month: str) -> str:
@@ -1414,6 +1540,15 @@ def tracker_shows(
     return {"ok": True, "provider_instance": inst, "total": total, "offset": offset, "shows": shows}
 
 
+def _user_rating(store: TrackerStore, item: Mapping[str, Any], key: str) -> Any:
+    matches = store.related(**_identity_of(item, key), feature="ratings")
+    candidates = [data for _, _, data in matches if data.get("type") in ("movie", "show", "anime") or (
+        data.get("type") == item.get("type") and data.get("season") == item.get("season") and data.get("episode") == item.get("episode")
+    )]
+    candidates.sort(key=lambda data: (data.get("type") == item.get("type"), str(data.get("rated_at") or "")), reverse=True)
+    return candidates[0].get("rating") if candidates else None
+
+
 def _overview_hero(store: TrackerStore, recent: list[dict[str, Any]], continuing: list[dict[str, Any]], instance: str) -> dict[str, Any] | None:
     candidates = list(continuing)
     _, watching = store.notes(status="watching", limit=1)
@@ -1489,7 +1624,7 @@ def tracker_overview(request: Request, provider_instance: str | None = Query("de
                     recent[-1]["plays"] += 1
                     continue
                 previous = group
-                recent.append({**_row(key, item, "history"), "status": (history_notes.get(_title_key(ident)) or {}).get("status"), "ref": {"feature": "history", "key": key}, "plays": 1})
+                recent.append({**_row(key, item, "history"), "user_rating": _user_rating(store, item, key), "status": (history_notes.get(_title_key(ident)) or {}).get("status"), "ref": {"feature": "history", "key": key}, "plays": 1})
             seen = set()
             for key, item in progress:
                 ident = identities[key]

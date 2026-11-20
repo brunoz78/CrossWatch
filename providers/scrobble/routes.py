@@ -21,6 +21,7 @@ ROUTE_SINGLE_ACCOUNT_PROVIDERS = {"stremio"}
 ROUTE_PROFILE_NAME_PROVIDERS = {"kodi"}
 ROUTE_SINKS = {"myanimelist", "kitsu", "plex", "jellyfin", "emby", "kodi", "trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "bingebase", "flicklist", "wetrakr", "anilist", "scrob", "silo", "tofa"}
 ROUTE_MEDIA_SINKS = {"plex", "jellyfin", "emby", "kodi"}
+LIVE_TV_FILTER_PROVIDERS = {"plex", "jellyfin", "emby"}
 ROUTE_RATING_SINKS = {"kitsu", "myanimelist", "trakt", "simkl", "mdblist", "crosswatch", "floppy", "punchplay", "flicklist", "wetrakr", "anilist", "scrob", "silo"}
 ROUTE_OPTION_STATES = {"inherit", "on", "off"}
 ROUTE_RATINGS_MODES = {"off", "custom"}
@@ -47,11 +48,24 @@ ROUTE_WATCH_POLICY_RANGES = {
     "suppress_start_at": (0, 100),
     "poll_seconds": (5, 60),
     "idle_poll_seconds": (5, 120),
+    "crosswatch_rewatch_window_hours": (1, 168),
 }
+REWATCH_WINDOW_HOURS = 12
 ROUTE_POLL_KEYS = ("poll_seconds", "idle_poll_seconds")
 ROUTE_POLL_PROVIDERS = {"emby", "jellyfin", "kodi", "scrob", "silo"}
-ROUTE_WATCH_BOOLEAN_KEYS = {"unresolved_user_fallback", "anime_mapping", "simkl_rewatches", "plexkodiconnect_support", "manual_marks"}
-ROUTE_WATCH_STRICT_BOOLEAN_KEYS = {"simkl_rewatches", "plexkodiconnect_support"}
+ROUTE_WATCH_BOOLEAN_KEYS = {"unresolved_user_fallback", "anime_mapping", "simkl_rewatches", "crosswatch_rewatches", "plexkodiconnect_support", "manual_marks"}
+ROUTE_WATCH_STRICT_BOOLEAN_KEYS = {"simkl_rewatches", "crosswatch_rewatches", "plexkodiconnect_support"}
+
+
+def rewatch_window_hours(value: Any) -> int:
+    low, high = ROUTE_WATCH_POLICY_RANGES["crosswatch_rewatch_window_hours"]
+    if isinstance(value, bool):
+        return REWATCH_WINDOW_HOURS
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return REWATCH_WINDOW_HOURS
+    return number if low <= number <= high else REWATCH_WINDOW_HOURS
 
 
 def same_scrobble_endpoint(provider: Any, provider_instance: Any, sink: Any, sink_instance: Any) -> bool:
@@ -279,7 +293,7 @@ def normalize_route(route: dict[str, Any], fallback_id: str) -> dict[str, Any]:
 
     prov = str(r.get("provider") or "").strip().lower() or "plex"
     if prov not in ROUTE_PROVIDERS:
-        prov = "plex"
+        enabled = False
     prov_inst = str(r.get("provider_instance") or r.get("providerInstance") or DEFAULT_INSTANCE_ID).strip() or DEFAULT_INSTANCE_ID
 
     prov_inst = normalize_instance_id(prov_inst)
@@ -292,6 +306,8 @@ def normalize_route(route: dict[str, Any], fallback_id: str) -> dict[str, Any]:
     filters = r.get("filters")
     if not isinstance(filters, dict):
         filters = {}
+    if prov in LIVE_TV_FILTER_PROVIDERS and sink and "ignore_live_tv_dvr" not in filters:
+        filters = {**filters, "ignore_live_tv_dvr": True}
     raw_options = r.get("options")
     options = normalize_route_options(raw_options)
     if prov == "plex" and not route_options_has_watch_key(raw_options, "unresolved_user_fallback"):

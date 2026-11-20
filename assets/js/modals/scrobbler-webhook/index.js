@@ -454,7 +454,7 @@ function endpointBlock(current) {
     <div class="scrm-provider-card scwm-endpoint-card">
       <div class="scrm-card-head"><span class="scrm-provider-mark"><span class="material-symbols-rounded">link</span></span><div><strong>Endpoint URL</strong><small>Use this URL in ${esc(label(current.provider))}</small></div></div>
       <div class="scrm-endpoint scwm-endpoint">
-        <code title="${esc(current.endpoint_url || "")}">${esc(current.endpoint_url || "Saved instance will receive a URL")}</code>
+        ${current.endpoint_url ? `<input type="text" readonly value="${esc(current.endpoint_url)}" title="${esc(current.endpoint_url)}" aria-label="Endpoint URL" spellcheck="false" data-copy-field>` : "<code>Saved instance will receive a URL</code>"}
         <button type="button" class="btn small sc2-icon-btn material-symbols-rounded" data-copy="${esc(current.endpoint_url || "")}" title="Copy URL">content_copy</button>
         <button type="button" class="btn small danger sc2-icon-btn cw-danger-confirm" data-regenerate title="Regeneration is destructive for the old endpoint URL."><span class="material-symbols-rounded">sync_lock</span></button>
       </div>
@@ -615,6 +615,8 @@ function optionsPanel() {
       </div>
       ${animeMapping}
       ${sink === "simkl" ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">replay</span><span><strong>Track rewatches</strong><small>Allow repeat watches for this destination. Requires SIMKL Pro or VIP. SIMKL applies a 48-hour gap per movie or episode. Your watched threshold still applies, with a minimum of 80%.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scw-simkl-rewatches" ${settings().simkl_rewatches === true ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>` : ""}
+      ${sink === "crosswatch" ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">replay</span><span><strong>Track rewatches</strong><small>Save every completed watch as its own play. When off, a new watch replaces the latest play of that title.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scw-cw-rewatches" ${settings().crosswatch_rewatches === true ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>
+      <div class="scrm-fields two">${field("Rewatch window (h)", `<input class="input" id="scw-cw-rewatch-window" type="number" min="1" max="168" value="${esc(settings().crosswatch_rewatch_window_hours ?? "")}" placeholder="12">`)}</div>` : ""}
     </section>
   `;
 }
@@ -811,6 +813,11 @@ function payload() {
   }
   if (animeMappingSinks.has(sink)) body[`anime_mapping_${sink}`] = !!root.querySelector("#scw-anime-mapping")?.checked;
   if (sink === "simkl") body.simkl_rewatches = !!root.querySelector("#scw-simkl-rewatches")?.checked;
+  if (sink === "crosswatch") {
+    body.crosswatch_rewatches = !!root.querySelector("#scw-cw-rewatches")?.checked;
+    const rewatchWindow = root.querySelector("#scw-cw-rewatch-window")?.value ?? "";
+    if (rewatchWindow !== "") body.crosswatch_rewatch_window_hours = Number(rewatchWindow);
+  }
   const sinkInstValue = (body.sink_instances || {})[sink] || "default";
   if (webhookMatchUsersSupported(sink, sinkInstValue) && identityMap) {
     const v = identityMap.value;
@@ -1023,8 +1030,8 @@ export async function mount(shell, incoming = {}) {
     const copy = e.target.closest("[data-copy]");
     if (copy?.dataset.copy) {
       e.preventDefault();
-      await navigator.clipboard?.writeText(copy.dataset.copy);
-      flashCopied(copy);
+      if (await window.cwCopyText?.(copy.dataset.copy)) flashCopied(copy);
+      else window.cwSelectCopyField?.(copy.parentElement?.querySelector("[data-copy-field]"));
       return;
     }
     const add = e.target.closest("[data-add-filter]");

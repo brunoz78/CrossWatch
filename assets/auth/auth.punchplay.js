@@ -126,16 +126,7 @@
     const code = ((el("punchplay_qc_code") && el("punchplay_qc_code").textContent) || (el("punchplay_device_code") && el("punchplay_device_code").value) || "").replace(/\s+/g, "").trim();
     if (!code || /^-+$/.test(code.replace(/–/g, "-"))) return;
     let ok = false;
-    try { if (navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(code); ok = true; } } catch (_) {}
-    if (!ok) {
-      try {
-        const ta = document.createElement("textarea");
-        ta.value = code; ta.style.position = "fixed"; ta.style.opacity = "0";
-        document.body.appendChild(ta); ta.focus(); ta.select();
-        ok = document.execCommand("copy");
-        document.body.removeChild(ta);
-      } catch (_) {}
-    }
+    ok = (await window.cwCopyText?.(code)) === true;
     if (!ok) { note("Copy failed"); return; }
     btn.classList.add("copied"); btn.innerHTML = PP_ICON_CHECK; btn.title = "Copied!";
     if (ppQcCopyRevert) clearTimeout(ppQcCopyRevert);
@@ -239,8 +230,7 @@
     const startBtn = el("punchplay_device_start");
     if (startBtn) { startBtn.disabled = true; startBtn.classList.add("busy"); }
 
-    let win = null;
-    try { win = window.open("about:blank", "_blank"); } catch (_) {}
+    const win = Shared.openWaitWindow("PunchPlay", "Requesting a PunchPlay code...", "PUNCHPLAY");
     try {
       const r = await fetchJSON(ppApi("/api/punchplay/device/start"), {
         method: "POST",
@@ -265,18 +255,7 @@
       setConn(false, "Waiting for approval");
       startPoll(Math.max(5, Number(data.interval || 5)));
 
-      if (win && !win.closed) {
-        try {
-          win.document.write(
-            '<!doctype html><meta charset="utf-8"><title>CrossWatch → PunchPlay</title>' +
-            '<body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0d12;color:#e9eefb;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;text-align:center">' +
-            '<div><div style="font-size:14px;opacity:.7;margin-bottom:12px">Opening the PunchPlay approval page…</div>' +
-            '<div style="font-size:36px;font-weight:700;letter-spacing:.18em;color:#ff9d6a">' + code + '</div>' +
-            '<div style="font-size:12px;opacity:.6;margin-top:12px">Redirecting in a moment…</div></div></body>'
-          );
-        } catch (_) {}
-        setTimeout(function () { try { if (win && !win.closed) win.location.href = url; } catch (_) {} }, 3000);
-      } else {
+      if (!Shared.showWaitCode(win, { key: "PUNCHPLAY", label: "PunchPlay", code, url })) {
         note("Popup blocked - open punchplay.tv/link and enter the code.");
       }
     } catch (e) {

@@ -27,12 +27,17 @@
   const artType = (item) => (kindOf(item) === "movie" ? "movie" : "tv");
   const isMovie = () => kindOf(state.item) === "movie";
   const tmdbImage = (path, size) => (path ? `/art/tmdb/image?fallback=2&path=${encodeURIComponent(path)}&size=${encodeURIComponent(size)}` : "");
-  const posterUrl = (item) => `/art/tmdb/${artType(item)}/${encodeURIComponent(tmdbOf(item))}?fallback=2&size=w500`;
-  const backdropUrl = (item) => `/art/tmdb/${artType(item)}/${encodeURIComponent(tmdbOf(item))}?fallback=2&kind=backdrop&size=w1280`;
+  const artChoice = (item) => window.CW?.ArtChoice?.param?.(artType(item), tmdbOf(item)) || "";
+  const posterUrl = (item) => `/art/tmdb/${artType(item)}/${encodeURIComponent(tmdbOf(item))}?fallback=2&size=w500${artChoice(item)}`;
+  const backdropUrl = (item) => `/art/tmdb/${artType(item)}/${encodeURIComponent(tmdbOf(item))}?fallback=2&kind=backdrop&av=${document.documentElement.dataset.cwArt || "t"}&size=w1280${artChoice(item)}`;
   const stillUrl = (season, episode) => `/art/tmdb/tv/${encodeURIComponent(tmdbOf(state.item))}?fallback=2&kind=still&season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}&size=w300`;
   const icon = (name) => `<span class="material-symbols-rounded" aria-hidden="true">${esc(name)}</span>`;
   const plural = (count, word) => `${numberFmt.format(Number(count) || 0)} ${word}${Number(count) === 1 ? "" : "s"}`;
   const placeholder = "this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'";
+  const assetVersion = (() => { try { return new URL(document.currentScript?.src || location.href).searchParams.get("v") || ""; } catch { return ""; } })();
+  const canChangeArt = () => document.documentElement.dataset.cwRole !== "user" && document.documentElement.dataset.cwViewAs !== "1";
+  const canEditShelf = () => document.documentElement.dataset.cwViewAs !== "1" && (document.documentElement.dataset.cwRole !== "user" || document.documentElement.dataset.cwPermWrite === "on");
+  const lazyScripts = new Map();
 
   function fmtIso(value) {
     const raw = String(value || "").trim();
@@ -144,7 +149,7 @@
 
   function openProgressActions(node) {
     const actions = itemActions();
-    const rows = Array.isArray(state.progress) ? state.progress : [];
+    const rows = scopedProgressRows() || [];
     if (!actions || !rows.length) return;
     const movie = isMovie();
     const progressRows = rows.filter((row) => row.record).map((row) => {
@@ -298,6 +303,13 @@
     }, true);
     document.addEventListener("keydown", (event) => {
       if (root.hidden || event.key !== "Escape") return;
+      const overlay = ["ArtworkPicker", "ShelfEditor"].map((name) => window.CW?.[name]).find((tool) => tool?.isOpen?.());
+      if (overlay) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        overlay.close();
+        return;
+      }
       if (document.getElementById("cw-trailer")?.classList.contains("show")) return;
       const statusMenu = root.querySelector("[data-mm-status-picker][open]");
       if (statusMenu) {
@@ -314,6 +326,14 @@
     }, true);
     window.addEventListener("cw:manual-watched-saved", () => {
       if (!root.hidden && !personView) void refreshPresence();
+    });
+    window.addEventListener("cw:shelf-changed", (event) => {
+      if (root.hidden || personView || !state.item) return;
+      if (event.detail?.loaded || event.detail?.id) void loadCollectionInfo(state.item, state.seq);
+      void scheduleRender();
+    });
+    window.addEventListener("cw:shelf-cases", () => {
+      if (!root.hidden && !personView && state.item) void scheduleRender();
     });
     return root;
   }
@@ -342,7 +362,8 @@
       try {
         const tmdb = tmdbOf(item);
         const movie = kindOf(item) === "movie";
-        const query = movie ? `tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=50` : `show_tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=250`;
+        let query = movie ? `tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=50` : `show_tmdb=${encodeURIComponent(tmdb)}&page=1&page_size=250`;
+        if (state.tracker) query += `&provider=crosswatch&instance_id=${encodeURIComponent(trackerData()?.provider_instance || "default")}`;
         const res = await fetch((window.CW?.ProfileViewAs?.scope || String)(`/api/playback_progress/items?${query}`), { credentials: "same-origin", cache: "no-store" });
         const data = await res.json().catch(() => null);
         const items = Array.isArray(data?.items) ? data.items : [];
@@ -395,6 +416,9 @@
   async function open(item, options = {}) {
     if (!canOpen(item)) return false;
     ensure();
+    window.CW?.ArtworkPicker?.close?.();
+    window.CW?.ShelfEditor?.close?.();
+    void window.CW?.Shelf?.load?.();
     const host = options.host || document.body;
     if (root.parentNode !== host) host.appendChild(root);
     state.host = options.host || null;
@@ -426,6 +450,8 @@
       seasonEpisodesExpanded: false,
       episode: null,
       progress: null,
+      collection: null,
+      collectionCopy: 0,
     });
     if (root.hidden) state.lastFocus = document.activeElement;
     root.querySelectorAll("details[open]").forEach((details) => { details.open = false; });
@@ -448,6 +474,7 @@
         if (seq !== state.seq || root.hidden) return;
         state.presence = presence;
         state.presenceLoading = false;
+        void (window.CW?.Shelf?.load?.() || Promise.resolve()).then(() => loadCollectionInfo(item, seq));
         if (!isMovie()) {
           const latest = watchedEpisodes().sort((a, b) => Number(b.season) - Number(a.season) || Number(b.episode) - Number(a.episode))[0];
           if (latest) void loadSeason(latest.season);
@@ -472,6 +499,8 @@
   }
 
   function close() {
+    window.CW?.ArtworkPicker?.close?.();
+    window.CW?.ShelfEditor?.close?.();
     if (!root || root.hidden) return;
     state.seq += 1;
     root.hidden = true;
@@ -554,7 +583,7 @@
       patchContent(body, episodeDetail());
       return;
     }
-    patchContent(body, `${tagline()}${top()}${livesCard()}${tabs()}<div class="cw-mm-panel" role="tabpanel">${panel()}</div>`);
+    patchContent(body, `${tagline()}${top()}${livesCard()}${collectionSection()}${tabs()}<div class="cw-mm-panel" role="tabpanel">${panel()}</div>`);
     const logo = body.querySelector(".cw-mm-title-logo");
     const label = body.querySelector(".cw-mm-title-text");
     if (logo && label && logo.getAttribute("src") !== logo.dataset.src) {
@@ -601,7 +630,7 @@
     return `<div class="cw-mm-top">
       <img class="cw-mm-poster" src="${esc(posterUrl(item))}" alt="" decoding="async" onerror="${placeholder}">
       <div class="cw-mm-heading">
-        <h2 id="cw-mm-title" aria-label="${esc(title)}"><span class="cw-mm-title-text">${esc(title)}</span>${tmdb ? `<img class="cw-mm-title-logo" data-src="/art/tmdb/${artType(item)}/${encodeURIComponent(tmdb)}?kind=logo&size=w500" alt="" hidden>` : ""}</h2>
+        <h2 id="cw-mm-title" aria-label="${esc(title)}"><span class="cw-mm-title-text">${esc(title)}</span>${tmdb ? `<img class="cw-mm-title-logo" data-src="/art/tmdb/${artType(item)}/${encodeURIComponent(tmdb)}?kind=logo&av=${document.documentElement.dataset.cwArt || "t"}&size=w500${artChoice(item)}" alt="" hidden>` : ""}</h2>
         <p class="cw-mm-sub">${esc([year, movie ? "Movie" : "TV Series"].filter(Boolean).join(" • "))}</p>
         <div class="cw-mm-chips">${chips.map((chip) => `<span class="cw-mm-chip">${esc(chip)}</span>`).join("")}${genres.map((genre) => `<span class="cw-mm-chip is-genre">${esc(genre)}</span>`).join("")}</div>
         <div class="cw-mm-actions">${actions()}</div>
@@ -615,10 +644,15 @@
     const tmdb = tmdbOf(item);
     const imdb = meta?.ids?.imdb || item?.ids?.imdb || "";
     const out = [];
-    if (window.CW?.Trailer?.has?.(meta)) out.push(`<button class="cw-mm-btn" type="button" data-mm-trailer>${icon("play_arrow")}Watch trailer</button>`);
+    if (window.CW?.Trailer?.has?.(meta)) out.push(`<button class="cw-mm-btn" type="button" data-mm-trailer aria-label="Watch trailer">${icon("play_arrow")}<span class="cw-mm-btn-label">Watch trailer</span></button>`);
     out.push(`<a class="cw-mm-btn" href="https://www.themoviedb.org/${artType(item)}/${encodeURIComponent(tmdb)}" target="_blank" rel="noopener">TMDB</a>`);
     if (imdb) out.push(`<a class="cw-mm-btn" href="https://www.imdb.com/title/${encodeURIComponent(imdb)}/" target="_blank" rel="noopener">IMDb</a>`);
-    if (removable()) out.push(`<button type="button" class="cw-mm-btn is-danger" data-mm-clear-all aria-haspopup="dialog" title="Remove from everything" aria-label="Remove from everything">${icon("delete")}Remove</button>`);
+    if (tmdb && canChangeArt()) out.push(`<button type="button" class="cw-mm-btn" data-mm-artwork title="Change poster, logo or background" aria-label="Artwork" aria-haspopup="dialog">${icon("image")}<span class="cw-mm-btn-label">Artwork</span></button>`);
+    const onShelf = tmdb ? window.CW?.Shelf?.peek?.(artType(item), tmdb) : null;
+    if (tmdb && canEditShelf() && !onShelf && !collectionAdds()) {
+      out.push(`<button type="button" class="cw-mm-btn" data-mm-shelf title="Your copies of this title" aria-label="Add to shelf" aria-haspopup="dialog">${icon("shelves")}<span class="cw-mm-btn-label">Add to shelf</span></button>`);
+    }
+    if (removable()) out.push(`<button type="button" class="cw-mm-btn is-danger" data-mm-clear-all aria-haspopup="dialog" title="Remove from everything" aria-label="Remove from everything">${icon("delete")}<span class="cw-mm-btn-label">Remove</span></button>`);
     const score = Number(meta?.detail?.vote_average) || (Number(meta?.score) || 0) / 10;
     if (score > 0) {
       const votes = Number(meta?.vote_count) || 0;
@@ -644,6 +678,91 @@
     if (key === "synced" && !isMovie() && Array.isArray(entry.episodes)) return plural(entry.episodes.length, "episode");
     if (key === "synced") return plural(entry.count, "play");
     return `${have} of ${total}`;
+  }
+
+  const COLL_PACKAGING = { keep_case: "Keep case", steelbook: "Steelbook", digipak: "Digipak", mediabook: "Mediabook", slipcover: "Slipcover", box_set: "Box set", other: "Other" };
+  const COLL_CONDITIONS = { mint: "Mint", like_new: "Like new", good: "Good", fair: "Fair", poor: "Poor" };
+  const COLL_RES = { uhd_4k: "4K", hd_1080p: "1080p", hd_1080i: "1080i", hd_720p: "720p", sd_576p: "576p", sd_576i: "576i", sd_480p: "480p", sd_480i: "480i" };
+  const COLL_HDR = { dolby_vision: "Dolby Vision", hdr10_plus: "HDR10+", hdr10: "HDR10", hlg: "HLG" };
+  const COLL_AUDIO = { dolby_atmos: "Dolby Atmos", dolby_digital_plus_atmos: "Dolby Digital Plus Atmos", dolby_truehd: "Dolby TrueHD", dolby_digital_plus: "Dolby Digital Plus", dolby_digital: "Dolby Digital", dts_x: "DTS:X", dts_ma: "DTS-HD MA", dts_hr: "DTS-HD HRA", dts: "DTS", lpcm: "LPCM", flac: "FLAC", aac: "AAC" };
+
+  function inCollection() {
+    return (state.presence?.collection?.present || []).length > 0;
+  }
+
+  function collectionAdds() {
+    const info = state.collection;
+    return Boolean(info && (info.entry || info.synced) && info.canEdit && canEditShelf());
+  }
+
+  async function loadCollectionInfo(item, seq) {
+    const tmdb = tmdbOf(item);
+    const onShelf = tmdb ? window.CW?.Shelf?.peek?.(artType(item), tmdb) : null;
+    if (!tmdb || (!onShelf && !inCollection())) {
+      state.collection = null;
+      return;
+    }
+    try {
+      const res = await fetch(`/api/profile/shelf/${artType(item)}/${encodeURIComponent(tmdb)}`, { credentials: "same-origin", cache: "no-store" });
+      const data = await res.json().catch(() => null);
+      if (seq !== state.seq || state.item !== item) return;
+      state.collection = res.ok && data?.ok ? { entry: data.entry || null, synced: data.synced || null, canEdit: data.can_edit === true } : null;
+    } catch {
+      if (seq !== state.seq) return;
+      state.collection = null;
+    }
+    void scheduleRender();
+  }
+
+  function collectionRows(rows) {
+    const shown = rows.filter(([, value]) => value !== "" && value != null);
+    return shown.length ? shown.map(([label, value]) => `<div class="cw-mm-coll-row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join("") : "";
+  }
+
+  function collectionDate(value) {
+    const parts = String(value || "").split("-").map(Number);
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return "";
+    return dateFmt.format(new Date(parts[0], parts[1] - 1, parts[2]));
+  }
+
+  function collectionSection() {
+    const info = state.collection;
+    if (!info || (!info.entry && !info.synced)) return "";
+    const copies = info.entry?.copies || [];
+    const index = Math.min(Math.max(0, Number(state.collectionCopy) || 0), Math.max(0, copies.length - 1));
+    const copy = copies[index] || null;
+    const media = info.synced?.media_info || {};
+    const format = copy?.format || info.synced?.format || "";
+    const shelf = window.CW?.Shelf || {};
+    const tmdb = tmdbOf(state.item);
+    const disc = shelf.discUrl?.(artType(state.item), tmdb, format) || "";
+    const caseKind = shelf.caseKind?.(format, copy?.packaging || "") || "plain";
+    const cover = shelf.caseHtml?.({ format, packaging: copy?.packaging || "", poster: posterUrl(state.item) }) || `<span class="cw-case" data-case="plain"><img class="cw-case-art" src="${esc(posterUrl(state.item))}" alt=""></span>`;
+    const status = info.entry ? shelf.statuses?.[info.entry.status] || "Owned" : "In your collection";
+    const statusLine = [status, copies.length ? `${copies.length} ${copies.length === 1 ? "copy" : "copies"}` : ""].filter(Boolean).join(" · ");
+    const pill = shelf.pill?.({ format, media, service: copy?.service }) || "";
+    const tabs = copies.length > 1 ? `<div class="cw-mm-coll-tabs" role="tablist" aria-label="Copies">${copies.map((row, i) => `<button type="button" role="tab" aria-selected="${i === index}" class="cw-mm-coll-tab${i === index ? " is-active" : ""}" data-mm-coll-copy="${i}">${esc([shelf.formats?.[row.format] || row.format, row.edition || COLL_PACKAGING[row.packaging]].filter(Boolean).join(" · "))}</button>`).join("")}</div>` : "";
+    const scope = state.item && !isMovie() ? [["Season", copy?.season != null ? `Season ${copy.season}` : ""], ["Volume", copy?.volume || ""]] : [];
+    const groups = [
+      ["Picture and sound", collectionRows([["Format", shelf.formats?.[format] || ""], ["Resolution", COLL_RES[media.resolution] || ""], ["HDR", COLL_HDR[media.hdr] || ""], ["Audio", [COLL_AUDIO[media.audio], media.audio_channels].filter(Boolean).join(" ")]])],
+      ["Edition", copy ? collectionRows([["Edition", copy.edition || ""], ["Packaging", COLL_PACKAGING[copy.packaging] || ""], ["Region", copy.region || ""], ["Discs", copy.discs || ""], ...scope]) : ""],
+      ["Purchase", copy ? collectionRows([["Acquired", collectionDate(copy.purchased)], ["Store", copy.store || ""], ["Price", copy.price != null ? shelf.money?.(copy.price) || String(copy.price) : ""], ["Service", copy.service?.name || ""]]) : ""],
+      ["Shelf", copy ? collectionRows([["Location", copy.shelf || ""], ["Condition", COLL_CONDITIONS[copy.condition] || ""], ["Lent to", copy.lent_to || ""]]) : ""],
+    ].filter(([, rows]) => rows);
+    const actions = collectionAdds()
+      ? `${copy ? `<button type="button" class="cw-mm-btn" data-mm-coll-edit="${index}">${icon("edit")}Edit copy</button>` : ""}<button type="button" class="cw-mm-btn" data-mm-coll-add>${icon("add")}${info.entry ? "Add copy" : "Add to shelf"}</button>`
+      : "";
+    return `<section class="cw-mm-coll" aria-label="Collection">
+      <div class="cw-mm-coll-art${disc ? " has-disc" : ""}${info.entry?.status === "wishlist" ? " is-wishlist" : ""}" data-case="${esc(caseKind)}" aria-hidden="true">
+        ${shelf.sceneHtml?.({ cover, disc }) || cover}
+      </div>
+      <div class="cw-mm-coll-main">
+        <div class="cw-mm-coll-head"><h3>Collection</h3><span>${esc(statusLine)}</span>${pill}</div>
+        ${tabs}
+        ${groups.length ? `<div class="cw-mm-coll-grid">${groups.map(([title, rows]) => `<dl class="cw-mm-coll-group"><span>${esc(title)}</span>${rows}</dl>`).join("")}</div>` : ""}
+        ${actions ? `<div class="cw-mm-coll-actions">${actions}</div>` : ""}
+      </div>
+    </section>`;
   }
 
   function livesCard() {
@@ -819,6 +938,12 @@
   };
   const episodeCode = (row) => (row.season != null && row.episode != null ? `S${row.season}E${row.episode}` : "Episode");
 
+  function scopedProgressRows() {
+    if (!Array.isArray(state.progress) || !state.tracker) return state.progress;
+    const instance = String(trackerData()?.provider_instance || "default");
+    return state.progress.filter(row => String(row.provider).toLowerCase() === "crosswatch" && String(row.instance || "default") === instance);
+  }
+
   function progressRowsHtml(records, episodes = false) {
     const editable = !!itemActions() && records.some((row) => row.record?.can_mark_watched || row.record?.can_remove_progress);
     const list = records.map((row) => {
@@ -845,7 +970,7 @@
   }
 
   function showResumePoints() {
-    const rows = Array.isArray(state.progress) ? state.progress : [];
+    const rows = scopedProgressRows() || [];
     if (!rows.length) return "";
     const groups = new Map();
     rows.forEach((row) => {
@@ -865,7 +990,7 @@
     const local = trackerData();
     const history = local ? null : state.presence?.synced;
     const scrobble = local ? null : state.presence?.scrobble;
-    const rows = state.progress;
+    const rows = scopedProgressRows();
     const records = Array.isArray(rows) ? [...rows].sort((a, b) => b.pct - a.pct) : [];
     const best = records[0] || null;
     const watched = local ? (local.plays || []).length : Math.max(Number(history?.count) || 0, Number(scrobble?.count) || 0);
@@ -995,7 +1120,7 @@
       counts.set(Number(row.season), (counts.get(Number(row.season)) || 0) + 1);
     }
     const watchedEpisodes = watchedMap();
-    const progress = Array.isArray(state.progress) ? state.progress : [];
+    const progress = scopedProgressRows() || [];
     const shown = seasons.filter((row, index) => index < 3 || Number(row.season) === state.overviewChosenSeason);
     const rows = shown.map((row) => {
       const number = Number(row.season);
@@ -1266,6 +1391,45 @@
     return `<section class="cw-person-view">${back}<div class="cw-person-heading">${person.profile_path ? `<img src="${esc(tmdbImage(person.profile_path, "w185"))}" alt="">` : `<span class="cw-mm-initials">${esc(initialsOf(person.name))}</span>`}<div><small>CAST &amp; FILMOGRAPHY</small><h2 id="cw-mm-title" tabindex="-1">${esc(person.name)}</h2></div></div>${person.biography ? `<details class="cw-person-bio"><summary>About ${esc(person.name)}</summary><p>${esc(person.biography)}</p></details>` : ""}<h3>Also appears in</h3><div class="cw-person-films">${(person.credits || []).filter(row => String(row.id) !== tmdbOf(state.item) || row.type !== kindOf(state.item)).map(row => `<button type="button" data-mm-credit="${esc(row.type)}:${esc(row.id)}"><img src="${esc(tmdbImage(row.poster_path, "w92") || "/assets/img/placeholder_poster.svg?v=2")}" alt="" loading="lazy" onerror="${placeholder}"><span><strong>${esc(row.title)}</strong><small>${esc([String(row.date || "").slice(0, 4), row.type === "movie" ? "Movie" : "Series", row.character].filter(Boolean).join(" · "))}</small></span>${icon("chevron_right")}</button>`).join("") || empty("No other credits available.")}</div></section>`;
   }
 
+  function lazyScript(file, name) {
+    if (window.CW?.[name]) return Promise.resolve(window.CW[name]);
+    if (!lazyScripts.has(file)) {
+      lazyScripts.set(file, new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = `/assets/js/${file}${assetVersion ? `?v=${encodeURIComponent(assetVersion)}` : ""}`;
+        script.onload = () => (window.CW?.[name] ? resolve(window.CW[name]) : reject(new Error("missing")));
+        script.onerror = () => { lazyScripts.delete(file); reject(new Error("load failed")); };
+        document.head.appendChild(script);
+      }));
+    }
+    return lazyScripts.get(file);
+  }
+
+  const loadArtPicker = () => lazyScript("artwork-picker.js", "ArtworkPicker");
+
+  async function openShelf(start = null) {
+    const item = state.item;
+    const tmdb = tmdbOf(item);
+    if (!tmdb) return;
+    try {
+      const editor = await lazyScript("shelf-editor.js", "ShelfEditor");
+      if (root.hidden || state.item !== item) return;
+      const ids = { ...(item?.ids || {}), ...(state.meta?.ids || {}), tmdb };
+      editor.open({ type: artType(item), id: tmdb, title: state.meta?.title || item?.title || "", year: state.meta?.year || item?.year || "", ids, canEdit: canEditShelf(), host: root, start });
+    } catch {}
+  }
+
+  async function openArtwork() {
+    const item = state.item;
+    const tmdb = tmdbOf(item);
+    if (!tmdb) return;
+    try {
+      const picker = await loadArtPicker();
+      if (root.hidden || state.item !== item) return;
+      picker.open({ type: artType(item), id: tmdb, title: state.meta?.title || item?.title || "", host: root });
+    } catch {}
+  }
+
   function onClick(event) {
     const target = event.target;
     const actionNode = target?.closest?.("[data-ia-chip],[data-ia-cover]");
@@ -1276,6 +1440,29 @@
     const clearAll = target?.closest?.("[data-mm-clear-all]");
     if (clearAll) {
       openEverything(clearAll);
+      return;
+    }
+    if (target?.closest?.("[data-mm-artwork]")) {
+      void openArtwork();
+      return;
+    }
+    if (target?.closest?.("[data-mm-shelf]")) {
+      void openShelf();
+      return;
+    }
+    const collTab = target?.closest?.("[data-mm-coll-copy]");
+    if (collTab) {
+      state.collectionCopy = Number(collTab.dataset.mmCollCopy) || 0;
+      void scheduleRender();
+      return;
+    }
+    const collEdit = target?.closest?.("[data-mm-coll-edit]");
+    if (collEdit) {
+      void openShelf(Number(collEdit.dataset.mmCollEdit));
+      return;
+    }
+    if (target?.closest?.("[data-mm-coll-add]")) {
+      void openShelf("new");
       return;
     }
     if (target?.closest?.("[data-mm-person-back]")) {

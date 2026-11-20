@@ -15,6 +15,8 @@ from urllib.parse import parse_qsl, urlencode, quote
 import sys
 sys.modules.setdefault("crosswatch", sys.modules[__name__])
 import os
+from _backup_bootstrap import apply_pending as _apply_pending_backup
+_apply_pending_backup()
 import re
 import socket
 import threading
@@ -1122,6 +1124,15 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         except Exception:
             pass
     try:
+        from services.pair_state_maintenance import start as _start_pair_state_cleanup
+
+        _start_pair_state_cleanup(load_config, CONFIG_DIR)
+    except Exception as e:
+        try:
+            _UIHostLogger("SYNC")(f"pair state cleanup startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
         from cw_platform.anime_mapping.auto_update import refresh_from_config as _anime_mapping_refresh_auto_update
 
         _anime_mapping_refresh_auto_update(load_config)
@@ -1148,9 +1159,12 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
             _UIHostLogger("SYNC")(f"health alerts worker startup error: {e}", level="ERROR")
         except Exception:
             pass
+    from services import backup_manager
+    backup_manager.start()
     try:
         yield
     finally:
+        backup_manager.stop()
         try:
             from services.tracker_storage_maintenance import stop as _stop_tracker_storage
             from services.tracker_month import stop as _stop_tracker_month
@@ -1159,6 +1173,12 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
             _stop_tracker_storage()
             _stop_tracker_month()
             _stop_tracker_automation()
+        except Exception:
+            pass
+        try:
+            from services.pair_state_maintenance import stop as _stop_pair_state_cleanup
+
+            _stop_pair_state_cleanup()
         except Exception:
             pass
         try:
@@ -1423,7 +1443,13 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
     scheduler_mode = str(p.get("scheduler_mode") or "").strip().lower()
     if backup_job_id or scheduler_mode == "advanced_backup" or backup:
         try:
-            from services.backups import create_backup, enforce_backup_retention, render_backup_label_template
+            if backup.get("managed"):
+                from services.backup_manager import enqueue
+
+                enqueue("scheduler")
+                return True
+            from services.backups import create_backup, render_backup_label_template
+            from services.backup_manager import prune_local
 
             scope = str(backup.get("scope") or "app_state").strip().lower()
             label_template = str(backup.get("label_template") or backup.get("labelTemplate") or "").strip()
@@ -1458,6 +1484,7 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
                 include_reports=bool(backup.get("include_reports")),
                 include_cache=bool(backup.get("include_cache")),
                 trigger="scheduler",
+                job_id=backup_job_id,
             ) or {}
             _append_log(
                 "SYNC",
@@ -1465,10 +1492,12 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
             )
             BACKUP_LOG.success(f"scheduled backup completed scope={scope} path={res.get('path') or 'backup created'}")
             if auto_delete_old:
-                cleanup = enforce_backup_retention(
+                cleanup = prune_local(
                     retention_days=retention_days,
                     max_backups=max_backups,
                     auto_delete_old=True,
+                    job_id=backup_job_id,
+                    trigger="scheduler",
                 ) or {}
                 deleted = cleanup.get("deleted") or []
                 if deleted:
@@ -1506,6 +1535,12 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
             auto_delete_old = capture.get("auto_delete_old") is True
             if not provider or not feature:
                 _append_log("SYNC", "[!] Scheduler capture: missing provider or feature")
+                try:
+                    from cw_platform.event_archive import record_capture
+
+                    record_capture(provider, instance, feature, trigger="scheduler", ok=False, reason="Capture schedule has no provider or feature")
+                except Exception:
+                    pass
                 return False
 
             label = render_capture_label_template(
@@ -1514,7 +1549,7 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
                 instance=instance,
                 feature=feature,
             )
-            res = create_snapshot(provider, feature, label=label, instance_id=instance) or {}
+            res = create_snapshot(provider, feature, label=label, instance_id=instance, trigger="scheduler") or {}
             _append_log(
                 "SYNC",
                 f"[i] Scheduler capture: saved {provider} {feature} ({instance}) -> {res.get('path') or 'capture created'}",
@@ -1527,6 +1562,7 @@ def _start_sync_from_scheduler(payload: dict[str, Any] | None = None) -> bool:
                     retention_days=retention_days,
                     max_captures=max_captures,
                     auto_delete_old=True,
+                    trigger="scheduler",
                 ) or {}
                 deleted = cleanup.get("deleted") or []
                 if deleted:

@@ -81,9 +81,11 @@
     }
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data?.ok === false) throw new Error(data?.error || (typeof data?.detail === "string" ? data.detail : "") || `HTTP ${res.status}`);
+    if (opt.method && opt.method !== "GET") invalidateLists();
     return data;
   };
   const OVERVIEW_CACHE_TTL_MS = 10 * 60 * 1000;
+  const SNAPSHOT_RETENTION_MS = 24 * 60 * 60 * 1000;
   const profileCacheKey = (name) => {
     const shell = $(".cw-profile-shell");
     const auth = window.CW?.AuthState?.read?.();
@@ -102,6 +104,46 @@
   const writeCache = (key, payload) => {
     try { localStorage.setItem(key, JSON.stringify({ t: Date.now(), payload })); } catch {}
   };
+  function invalidateLists() {
+    try { sessionStorage.removeItem("cw.hub.lists.v1"); sessionStorage.removeItem("cw.tracker.lists.v1"); } catch {}
+  }
+  const listPaints = new WeakMap();
+  function listSnapshot(url, paint, host) {
+    const scope = profileCacheKey("lists");
+    const key = `${scope}:${url}`;
+    const read = () => {
+      try {
+        const entries = JSON.parse(sessionStorage.getItem("cw.hub.lists.v1") || "[]");
+        return Array.isArray(entries) ? entries.filter(entry => entry?.data && Date.now() - entry.t < SNAPSHOT_RETENTION_MS).slice(-12) : [];
+      } catch { return []; }
+    };
+    const saved = read().find(entry => entry.key === key);
+    if (!saved && host) listPaints.delete(host);
+    const fingerprint = data => JSON.stringify({...data, refreshed_at:undefined});
+    let signature = saved ? fingerprint(saved.data) : "";
+    const render = data => {
+      const value = fingerprint(data);
+      const previous = host && listPaints.get(host);
+      if (!previous || previous.key !== key || previous.value !== value || previous.content !== host?.innerHTML) paint(data);
+      if (host) listPaints.set(host, {key, value, content:host.innerHTML});
+    };
+    if (saved) render(saved.data);
+    return {
+      restored: !!saved,
+      current: () => scope === profileCacheKey("lists"),
+      update(data) {
+        if (scope !== profileCacheKey("lists")) return;
+        const fresh = fingerprint(data);
+        if (fresh !== signature) render(data);
+        signature = fresh;
+        try {
+          const entries = read().filter(entry => entry.key !== key);
+          entries.push({key, t:Date.now(), data});
+          sessionStorage.setItem("cw.hub.lists.v1", JSON.stringify(entries.slice(-12)));
+        } catch {}
+      },
+    };
+  }
   const profileRouteSegment = (value) => {
     try {
       value = decodeURIComponent(String(value || ""));
@@ -189,7 +231,7 @@
     const nestedShowIds = objectOf(show.ids);
     const idsShowIds = objectOf(ids.show_ids);
     if (mediaValue(item) === "movie") return item?.tmdb || item?.tmdb_id || ids.tmdb || ids.id || "";
-    return showIds.tmdb || nestedShowIds.tmdb || objectOf(item?.show_ids).tmdb || idsShowIds.tmdb || show.tmdb || show.tmdb_id || ids.tmdb_show || item?.tmdb_show || ids.show_tmdb || item?.show_tmdb || item?.tmdb || item?.tmdb_id || ids.tmdb || "";
+    return showIds.tmdb || nestedShowIds.tmdb || objectOf(item?.show_ids).tmdb || idsShowIds.tmdb || show.tmdb || show.tmdb_id || ids.tmdb_show || item?.tmdb_show || ids.show_tmdb || item?.show_tmdb || item?.tmdb || item?.tmdb_id || (isEpisodeItem(item) ? "" : ids.tmdb) || "";
   };
   const showTmdbId = (item) => {
     const ids = objectOf(item?.ids);
@@ -226,7 +268,7 @@
     const kind = mediaType(item) ? "tv" : "movie";
     const title = !isEpisodeItem(item) && (item?.series_title || item?.title) ? `&title=${encodeURIComponent(String(item?.series_title || item?.title))}` : "";
     const year = !mediaType(item) && item?.year ? `&year=${encodeURIComponent(String(item.year))}` : "";
-    return `/art/tmdb/${kind}/${encodeURIComponent(id)}?fallback=2&kind=poster&size=${encodeURIComponent(size)}${title}${year}`;
+    return `/art/tmdb/${kind}/${encodeURIComponent(id)}?fallback=2&kind=poster&size=${encodeURIComponent(size)}${title}${year}${window.CW?.ArtChoice?.param?.(kind, id) || ""}`;
   };
   const watchlistArtEvidence = (item) => {
     const title = item?.title ? `&title=${encodeURIComponent(String(item.title))}` : "";
@@ -237,7 +279,7 @@
     const id = tmdbId(item);
     if (!id) return "";
     const kind = mediaType(item) ? "tv" : "movie";
-    return `/art/tmdb/${kind}/${encodeURIComponent(id)}?fallback=2&kind=backdrop&size=w1280`;
+    return `/art/tmdb/${kind}/${encodeURIComponent(id)}?fallback=2&kind=backdrop&av=${document.documentElement.dataset.cwArt || "t"}&size=w1280${window.CW?.ArtChoice?.param?.(kind, id) || ""}`;
   };
   const backdrop = (item) => {
     const direct = String(item?.backdrop_url || item?.background_url || item?.background || item?.fanart || "").trim();
@@ -255,7 +297,7 @@
     }
     const kind = mediaType(item) ? "tv" : "movie";
     const locale = encodeURIComponent(window.__CW_LOCALE || navigator.language || "en-US");
-    return `/art/tmdb/${kind}/${encodeURIComponent(String(id))}?fallback=2&kind=backdrop&size=${encodeURIComponent(size)}&locale=${locale}${watchlistArtEvidence(item)}`;
+    return `/art/tmdb/${kind}/${encodeURIComponent(String(id))}?fallback=2&kind=backdrop&av=${document.documentElement.dataset.cwArt || "t"}&size=${encodeURIComponent(size)}&locale=${locale}${watchlistArtEvidence(item)}${window.CW?.ArtChoice?.param?.(kind, id) || ""}`;
   };
   const heroBackdrop = (item) => tmdbBackdrop(item) || backdrop(item);
   const relTime = (value) => {
@@ -333,6 +375,8 @@
     if (kind === "webhook") return "Webhook";
     if (kind === "watcher") return "Watcher";
     if (kind === "playlist") return "Playlist";
+    if (kind === "capture") return "Capture";
+    if (kind === "backup") return "Backup";
     return "Sync";
   };
   const activityTone = (row) => {
@@ -1006,7 +1050,7 @@
     bindLastWatchedPreview(host);
     const id = item ? tmdbId(item) : "";
     const show = item && (mediaType(item) || isEpisodeItem(item));
-    const url = id ? `/art/tmdb/${show ? "tv" : "movie"}/${encodeURIComponent(id)}?kind=logo&size=w500` : "";
+    const url = id ? `/art/tmdb/${show ? "tv" : "movie"}/${encodeURIComponent(id)}?kind=logo&av=${document.documentElement.dataset.cwArt || "t"}&size=w500${window.CW?.ArtChoice?.param?.(show ? "tv" : "movie", id) || ""}` : "";
     if (logo.dataset.url !== url) {
       logo.dataset.url = url;
       logo.hidden = true;
@@ -1258,6 +1302,9 @@
   let overviewPayload = null;
   let overviewPagingDirty = false;
   let overviewRequest = 0;
+  let overviewLoadingTimer = null;
+  let overviewProgressResume = null;
+  let overviewStartedAt = 0;
   let overviewHeroSignature = "";
 
   function renderOverview(payload = {}) {
@@ -1285,9 +1332,12 @@
   }
 
   async function loadOverview() {
+    clearTimeout(overviewLoadingTimer);
+    overviewStartedAt = Date.now();
+    overviewProgressResume = null;
     const request = ++overviewRequest;
     const cacheKey = profileCacheKey(mobilePaging.matches ? "overview.mobile" : "overview");
-    const cached = readCache(cacheKey);
+    const cached = readCache(cacheKey, SNAPSHOT_RETENTION_MS);
     if (cached) renderOverview(cached);
     else paintOverviewSkeletons();
     const next = { ...cached };
@@ -1316,9 +1366,31 @@
       api("/api/insights?limit_samples=0&history=0&runtime=0&include_events=0").then(value => update("insights", value)),
       api("/api/status").then(value => update("status", value)),
       api("/api/profile/collection?page=1&page_size=1").then(value => update("collection", {counts:value?.counts || {}, total:Number(value?.total) || 0})),
-      api(`/api/playback_progress/items?page=1&page_size=${mobilePaging.matches ? 3 : 8}`).then(value => update("progress", value || {items:[]})),
+      refreshOverviewProgress(current, update),
     ]);
     if (current()) renderOverview({...next, widgets:next.widgets || {}, wall:next.wall || {items:[]}});
+  }
+
+  async function refreshOverviewProgress(current, update) {
+    const value = await api(`/api/playback_progress/items?page=1&page_size=${mobilePaging.matches ? 3 : 8}&progressive=true`);
+    if (!current()) return;
+    update("progress", value || {items:[]});
+    overviewProgressResume = value?.loading?.length ? () => {
+      if (current() && !document.hidden && $("#profile-panel-overview")?.classList.contains("active")) {
+        overviewProgressResume = null;
+        void refreshOverviewProgress(current, update).catch(() => {});
+      }
+    } : null;
+    if (overviewProgressResume) overviewLoadingTimer = setTimeout(() => overviewProgressResume?.(), 1500);
+  }
+
+  async function loadHeroPreview() {
+    const key = profileCacheKey(mobilePaging.matches ? "overview.mobile" : "overview");
+    const cached = readCache(key, SNAPSHOT_RETENTION_MS);
+    if (cached?.widgets) renderHero(cached.widgets.recent_scrobble?.items || [], cached.widgets.recent_history?.items || []);
+    const widgets = await api("/api/dashboard/widgets?include=history,scrobble&history_limit=1&scrobble_limit=1");
+    if (key !== profileCacheKey(mobilePaging.matches ? "overview.mobile" : "overview") || $("#profile-panel-overview")?.classList.contains("active")) return;
+    renderHero(widgets.recent_scrobble?.items || [], widgets.recent_history?.items || []);
   }
 
   mobilePaging.addEventListener("change", () => {
@@ -1333,6 +1405,13 @@
 
   const COLLECTION_PREFS_KEY = "cw.profile.collection";
   const COLLECTION_PAGE_SIZES = [24, 48, 72, 96];
+  const COLLECTION_SHELF_MODES = ["synced", "shelf", "all", "unwatched", "not_on_server", "not_on_shelf"];
+  const COLLECTION_SHELF_EMPTY = {
+    shelf: "Nothing on your shelf yet. Open a title and choose Add to shelf.",
+    unwatched: "Every title on your shelf has been watched.",
+    not_on_server: "Every title on your shelf is also on a media server.",
+    not_on_shelf: "Every title on your media servers is also on your shelf.",
+  };
 
   function readCollectionPrefs() {
     try {
@@ -1358,6 +1437,12 @@
     provider: "",
     search: "",
     sort: "collected_at",
+    shelf: COLLECTION_SHELF_MODES.includes(collectionPrefs.shelf) ? collectionPrefs.shelf : "synced",
+    display: collectionPrefs.display === "shelf" ? "shelf" : "poster",
+    statsOpen: collectionPrefs.statsOpen === true,
+    shelfStats: null,
+    shelfFilter: "",
+    shelfLocations: [],
     items: [],
     total: 0,
     pageCount: 1,
@@ -1369,7 +1454,7 @@
 
   function saveCollectionPrefs() {
     try {
-      window.localStorage?.setItem(COLLECTION_PREFS_KEY, JSON.stringify({ view: collectionState.view, pageSize: collectionState.desktopPageSize, mobilePageSize: collectionState.mobilePageSize, cols: collectionState.cols, timeline: collectionState.timeline, zoom: collectionState.zoom }));
+      window.localStorage?.setItem(COLLECTION_PREFS_KEY, JSON.stringify({ view: collectionState.view, pageSize: collectionState.desktopPageSize, mobilePageSize: collectionState.mobilePageSize, cols: collectionState.cols, timeline: collectionState.timeline, zoom: collectionState.zoom, shelf: collectionState.shelf, display: collectionState.display, statsOpen: collectionState.statsOpen }));
     } catch {}
   }
 
@@ -1470,22 +1555,25 @@
     const when = added ? relTime(added) : "";
     const art = poster(item, "w342");
     const providerStrip = collectionProviderStrip(item);
-    const meta = [kind, episode || year, when, collectionLibrarySummary(item)].filter(Boolean).join(" · ");
-    const quality = collectionQuality(item);
+    const shelfInfo = item?.shelf && typeof item.shelf === "object" ? item.shelf : null;
+    const shelfStatus = shelfInfo?.status && shelfInfo.status !== "owned" ? window.CW?.Shelf?.statuses?.[shelfInfo.status] || shelfInfo.status : "";
+    const meta = [kind, episode || year, shelfStatus, shelfInfo?.edition, when, collectionLibrarySummary(item)].filter(Boolean).join(" · ");
+    const shelfPill = shelfInfo ? window.CW?.Shelf?.pill?.({ format: (shelfInfo.formats || [])[0] || "", media: item?.media_info || {}, copies: Number(shelfInfo.copies) || 0, service: shelfInfo.service }) || "" : "";
+    const quality = shelfPill ? null : collectionQuality(item);
     const ariaTitle = quality?.label ? `${title}, ${quality.label}` : title;
-    const inner = `<span class="cw-collection-poster${quality ? " has-quality" : ""}">
+    const inner = `<span class="cw-collection-poster${quality || shelfPill ? " has-quality" : ""}">
         <img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'">
-        <span class="cw-collection-badge"><span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span>${esc(kind)}</span>
-        ${quality ? quality.html : ""}
+        <span class="cw-collection-badge" title="${esc(kind)}"><span class="material-symbols-rounded" aria-hidden="true">${esc(icon)}</span></span>
+        ${shelfPill || (quality ? quality.html : "")}
       </span>
       <span class="cw-collection-info">
         <strong class="cw-collection-name">${esc(title)}</strong>
         <span class="cw-collection-meta">${esc(meta)}</span>
       </span>`;
     const selectKey = String(item?.key || key);
-    return `<article class="cw-collection-card cw-tl-card${collectionState.selected.has(selectKey) ? " is-selected" : ""}" data-collection-key="${esc(selectKey)}">
+    return `<article class="cw-collection-card cw-tl-card${collectionState.selected.has(selectKey) ? " is-selected" : ""}${shelfInfo?.status === "wishlist" ? " is-wishlist" : ""}" data-collection-key="${esc(selectKey)}">
       <button class="cw-collection-open" type="button" data-profile-poster-key="${esc(key)}" aria-label="Show details for ${esc(ariaTitle)}">${inner}</button>
-      ${collectionSelectable() ? collectionSelectBox(selectKey) : ""}
+      ${collectionSelectable() && !item?.shelf_only ? collectionSelectBox(selectKey) : ""}
       <span class="cw-collection-card-foot"><span class="cw-collection-sources">${providerStrip}</span>${cardActionsButton(`data-collection-actions="${esc(selectKey)}"`, `Actions for ${title}`)}</span>
     </article>`;
   }
@@ -1648,6 +1736,14 @@
     return list.map((g) => (typeof g === "string" ? g : (g?.name || g?.title || ""))).map((g) => String(g).trim()).filter(Boolean).slice(0, 3).join(", ");
   };
 
+  function collectionShelfPill(item) {
+    const info = item?.shelf && typeof item.shelf === "object" ? item.shelf : null;
+    if (!info) return "";
+    const pill = window.CW?.Shelf?.pill?.({ format: (info.formats || [])[0] || "", copies: Number(info.copies) || 0, service: info.service }) || "";
+    const status = info.status && info.status !== "owned" ? `<span class="cw-collection-pill">${esc(window.CW?.Shelf?.statuses?.[info.status] || info.status)}</span>` : "";
+    return `${pill}${status}`;
+  }
+
   function collectionListRow(item, index) {
     const key = storePosterItem(item);
     const [icon, kind] = collectionKind(item);
@@ -1664,9 +1760,10 @@
     const selectKey = String(item?.key || key);
     const img = `<img src="${esc(art)}" alt="" loading="lazy" onerror="this.onerror=null;this.src='/assets/img/placeholder_poster.svg?v=2'">`;
     const cells = `<span class="cw-collection-cell cw-collection-cell--title">
-        ${collectionSelectable() ? collectionSelectBox(selectKey) : ""}
+        ${collectionSelectable() && !item?.shelf_only ? collectionSelectBox(selectKey) : ""}
         <strong>${esc(title)}</strong>
         ${stamp ? `<span class="cw-collection-pill">${esc(stamp)}</span>` : ""}
+        ${collectionShelfPill(item)}
       </span>
       <span class="cw-collection-cell cw-collection-cell--rel">${esc(release || "—")}</span>
       <span class="cw-collection-cell cw-collection-cell--genre">${esc(genres || "—")}</span>
@@ -1847,9 +1944,54 @@
     });
   }
 
+  function enhanceCollectionShelfSelect(select = $("#profile-collection-shelf")) {
+    if (!select || typeof window.CW?.IconSelect?.enhance !== "function") return;
+    const shelfIcons = { synced: "sync", shelf: "shelves", all: "library_books", unwatched: "visibility_off", not_on_server: "cloud_off", not_on_shelf: "dns" };
+    window.CW.IconSelect.enhance(select, {
+      className: "cw-profile-collection-select",
+      menuClassName: "cw-profile-collection-menu",
+      menuMinWidth: 220,
+      getOptionData: (value, option) => ({
+        label: option?.textContent?.trim() || "Synced",
+        icons: [{ symbol: shelfIcons[value] || "sync" }],
+      }),
+    });
+  }
+
+  function renderShelfFilter() {
+    const select = $("#profile-collection-shelf-filter");
+    if (!select) return;
+    const hide = collectionState.shelf === "synced" || collectionState.shelf === "not_on_shelf";
+    const formats = window.CW?.Shelf?.formats || {};
+    const present = Object.keys(collectionState.shelfStats?.formats || {});
+    const wanted = collectionState.shelfFilter;
+    const formatKeys = [...new Set([...Object.keys(formats).filter((key) => present.includes(key)), ...(wanted.startsWith("format:") ? [wanted.slice(7)] : [])])];
+    const locations = [...new Set([...collectionState.shelfLocations, ...(wanted.startsWith("location:") ? [wanted.slice(9)] : [])])];
+    const options = [["", "Whole shelf"], ["lent", "Lent out"], ["price", "No price yet"], ...formatKeys.map((key) => [`format:${key}`, formats[key] || key]), ...locations.map((name) => [`location:${name}`, `Shelf: ${name}`])];
+    select.innerHTML = options.map(([value, label]) => `<option value="${esc(value)}"${value === wanted ? " selected" : ""}>${esc(label)}</option>`).join("");
+    select.value = wanted;
+    select.hidden = hide;
+    if (typeof window.CW?.IconSelect?.enhance === "function") {
+      const icons = { lent: "handshake", price: "money_off" };
+      window.CW.IconSelect.enhance(select, {
+        className: "cw-profile-collection-select",
+        menuClassName: "cw-profile-collection-menu",
+        menuMinWidth: 220,
+        getOptionData: (value, option) => ({
+          label: option?.textContent?.trim() || "Whole shelf",
+          icons: [{ symbol: icons[value] || (String(value).startsWith("format:") ? "album" : String(value).startsWith("location:") ? "shelves" : "filter_alt") }],
+        }),
+      });
+    }
+    const wrap = select.nextElementSibling;
+    if (wrap?.classList?.contains("cw-icon-select")) wrap.style.display = hide ? "none" : "";
+  }
+
   function enhanceCollectionSortSelect(select = $("#profile-collection-sort")) {
     if (!select || typeof window.CW?.IconSelect?.enhance !== "function") return;
     const sortIcons = {
+      price_desc: "payments",
+      purchased_desc: "shopping_bag",
       collected_at: "schedule",
       collected_at_asc: "history",
       title: "sort_by_alpha",
@@ -1882,14 +2024,157 @@
     host.innerHTML = values.map(([label, value]) => `<span class="cw-hub-records-stat"><strong>${esc(numberFmt.format(Number(value) || 0))}</strong><span>${esc(label)}</span></span>`).join("");
   }
 
+  function collectionPageSize() {
+    return shelfViewOn() ? 120 : collectionState.pageSize;
+  }
+
+  function shelfViewOn() {
+    return collectionState.display === "shelf" && collectionState.shelf !== "synced" && collectionState.view !== "list";
+  }
+
+  function shelfStatsHtml() {
+    const stats = collectionState.shelfStats;
+    if (!stats || !stats.titles) return "";
+    const formats = window.CW?.Shelf?.formats || {};
+    const status = stats.status || {};
+    const byCount = (obj) => Object.entries(obj || {}).sort((a, b) => b[1] - a[1]);
+    const spent = Number(stats.spent) > 0 ? window.CW?.Shelf?.money?.(stats.spent, stats.currency || "") || String(stats.spent) : "";
+    const pct = Math.round((Number(stats.uhd) || 0) / stats.titles * 100);
+    const facts = [
+      [numberFmt.format(stats.titles), stats.titles === 1 ? "title" : "titles"],
+      [numberFmt.format(stats.copies), stats.copies === 1 ? "copy" : "copies"],
+      ...(spent ? [[spent, "spent"]] : []),
+      [`${pct}%`, "in 4K"],
+    ];
+    const mix = byCount(stats.formats).map(([key, count]) => [formats[key] || key, count]);
+    const list = (rows) => rows.map(([label, count]) => `${label} ${numberFmt.format(count)}`).join(" · ");
+    const statusText = [["owned", "owned"], ["ordered", "ordered"], ["wishlist", "on the wishlist"]].filter(([key]) => status[key]).map(([key, label]) => `${numberFmt.format(status[key])} ${label}`).join(", ");
+    const details = [
+      ["Picture and sound", list(byCount(stats.picture))],
+      ["Decades", list(Object.entries(stats.decades || {}).sort((a, b) => b[0].localeCompare(a[0])))],
+      ["Status", statusText],
+      ["Lent out", stats.lent ? `${numberFmt.format(stats.lent)} ${stats.lent === 1 ? "title" : "titles"}` : "Nothing"],
+    ].filter(([, value]) => value);
+    const note = spent && !stats.currency ? `<p class="cw-shelf-sum-note">Prices show without a currency. Pick one in the details of any copy.</p>` : "";
+    return `<details class="cw-shelf-sum"${collectionState.statsOpen ? " open" : ""}>
+      <summary><span class="material-symbols-rounded" aria-hidden="true">shelves</span><span class="cw-shelf-sum-facts">${facts.map(([value, label]) => `<span><b>${esc(value)}</b> ${esc(label)}</span>`).join("")}</span><span class="cw-shelf-sum-toggle"><span>${collectionState.statsOpen ? "Hide" : "More"}</span><span class="material-symbols-rounded" aria-hidden="true">expand_more</span></span></summary>
+      <div class="cw-shelf-sum-body">
+        ${mix.length ? `<div class="cw-shelf-mix" aria-label="Formats"><div class="cw-shelf-mix-bar">${mix.map(([label, count], i) => `<span data-i="${Math.min(i, 5)}" style="flex:${count}" title="${esc(`${label} ${count}`)}"></span>`).join("")}</div><div class="cw-shelf-mix-key">${mix.map(([label, count], i) => `<span data-i="${Math.min(i, 5)}">${esc(label)} <b>${esc(numberFmt.format(count))}</b></span>`).join("")}</div></div>` : ""}
+        ${details.length ? `<dl class="cw-shelf-sum-list">${details.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>` : ""}
+        ${note}
+      </div>
+    </details>`;
+  }
+
+  function shelfItem(item) {
+    const info = item?.shelf || {};
+    const title = titleOf(item);
+    const type = mediaType(item) ? "tv" : "movie";
+    const format = (info.formats || [])[0] || "";
+    const shelf = window.CW?.Shelf || {};
+    const disc = shelf.discUrl?.(type, tmdbId(item), format) || "";
+    const statusLabel = info.status && info.status !== "owned" ? shelf.statuses?.[info.status] || info.status : "";
+    const pill = shelf.pill?.({ format, media: item?.media_info || {}, service: info.service }) || "";
+    const copyCount = Number(info.copies) || 0;
+    const note = [yearOf(item), info.edition, copyCount > 1 ? `${copyCount} copies` : "", info.lent ? "Lent out" : ""].filter(Boolean).join(" · ");
+    const label = [title, shelf.label?.(info), statusLabel].filter(Boolean).join(", ");
+    const kind = shelf.caseKind?.(format, info.packaging) || "plain";
+    const cover = shelf.caseHtml?.({ format, packaging: info.packaging, poster: poster(item, "w342") }) || `<span class="cw-case" data-case="plain"><img class="cw-case-art" src="${esc(poster(item, "w342"))}" alt=""></span>`;
+    return `<div class="cw-shelfv-item${disc ? " has-disc" : ""}${info.status === "wishlist" ? " is-wishlist" : ""}" data-case="${esc(kind)}" data-shelf-pop="${collectionState.items.indexOf(item)}">
+      <button type="button" class="cw-shelfv-art" data-profile-poster-key="${esc(storePosterItem(item))}" aria-label="${esc(label)}">
+        ${shelf.sceneHtml?.({ cover, disc, reflection: true }) || cover}
+        ${statusLabel ? `<span class="cw-shelfv-status" data-status="${esc(info.status)}">${esc(statusLabel)}</span>` : ""}
+      </button>
+      <span class="cw-shelfv-base" aria-hidden="true"></span>
+      <span class="cw-shelfv-cap"><strong title="${esc(title)}">${esc(title)}</strong>${note ? `<small>${esc(note)}</small>` : ""}${pill ? `<span>${pill}</span>` : ""}</span>
+    </div>`;
+  }
+
+  function shelfViewHtml() {
+    const groups = new Map();
+    for (const item of collectionState.items) {
+      const name = String(item?.shelf?.shelves?.[0] || "").trim();
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push(item);
+    }
+    const ordered = [...groups.entries()].sort(([a], [b]) => (!a ? 1 : !b ? -1 : a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" })));
+    const rows = ordered.map(([name, items], rowIndex) => {
+      const copies = items.reduce((sum, item) => sum + (Number(item?.shelf?.copies) || 0), 0);
+      const summary = [`${numberFmt.format(items.length)} ${items.length === 1 ? "title" : "titles"}`, `${numberFmt.format(copies)} ${copies === 1 ? "copy" : "copies"}`].join(" · ");
+      return `<section class="cw-shelfv-row">
+        <div class="cw-shelfv-head"><span class="material-symbols-rounded" aria-hidden="true">shelves</span><h3>${esc(name || "No shelf set")}</h3><span>${esc(summary)}</span>${rowIndex === 0 ? window.CW?.Shelf?.casesSwitch?.() || "" : ""}</div>
+        <div class="cw-shelfv-rack">${items.map(shelfItem).join("")}</div>
+      </section>`;
+    }).join("");
+    return `<div class="cw-shelfv">${rows}</div>`;
+  }
+
+  function shelfPopHtml(item) {
+    const sub = [yearOf(item), mediaType(item) ? "Show" : "Movie"].filter(Boolean).join(" · ");
+    return window.CW?.Shelf?.popHtml?.({ title: titleOf(item), sub, info: item?.shelf || {}, media: item?.media_info || {} }) || "";
+  }
+
+  function hideShelfPop() {
+    window.CW?.Shelf?.popHide?.();
+  }
+
+  function showShelfPop(itemNode) {
+    const item = collectionState.items[Number(itemNode?.dataset.shelfPop)];
+    if (item) window.CW?.Shelf?.popShow?.(itemNode, shelfPopHtml(item), itemNode.querySelector(".cw-shelfv-art") || itemNode);
+  }
+
+  function wireShelfPop() {
+    const grid = $("#profile-collection-grid");
+    if (!grid || grid.dataset.shelfPopWired) return;
+    grid.dataset.shelfPopWired = "1";
+    grid.addEventListener("pointerover", (event) => {
+      if (event.pointerType && event.pointerType !== "mouse") return;
+      const itemNode = event.target?.closest?.(".cw-shelfv-item[data-shelf-pop]");
+      if (itemNode) showShelfPop(itemNode);
+    });
+    grid.addEventListener("pointerout", (event) => {
+      const itemNode = event.target?.closest?.(".cw-shelfv-item[data-shelf-pop]");
+      if (itemNode && !itemNode.contains(event.relatedTarget)) hideShelfPop();
+    });
+    grid.addEventListener("focusin", (event) => {
+      const itemNode = event.target?.closest?.(".cw-shelfv-item[data-shelf-pop]");
+      if (itemNode) showShelfPop(itemNode);
+    });
+    grid.addEventListener("focusout", hideShelfPop);
+    grid.addEventListener("click", hideShelfPop);
+  }
+
+  function renderShelfStats() {
+    const host = $("#profile-collection-shelfstats");
+    if (!host) return;
+    const html = collectionState.shelf !== "synced" ? shelfStatsHtml() : "";
+    host.hidden = !html;
+    host.innerHTML = html;
+    host.querySelector(".cw-shelf-sum")?.addEventListener("toggle", (event) => {
+      collectionState.statsOpen = event.target.open;
+      const label = event.target.querySelector(".cw-shelf-sum-toggle>span:first-child");
+      if (label) label.textContent = event.target.open ? "Hide" : "More";
+      saveCollectionPrefs();
+    });
+  }
+
   function paintCollectionItems() {
     const grid = $("#profile-collection-grid");
     if (!grid) return;
     const list = collectionState.view === "list";
     grid.dataset.view = list ? "list" : "grid";
+    if (collectionState.items.length && shelfViewOn()) {
+      grid.dataset.view = "shelf";
+      grid.classList.remove("is-grouped");
+      hideShelfPop();
+      wireShelfPop();
+      grid.innerHTML = shelfViewHtml();
+      syncCollectionSelection();
+      return;
+    }
     grid.classList.remove("is-grouped");
     if (!collectionState.items.length) {
-      grid.innerHTML = empty("No collection items match this view.");
+      grid.innerHTML = empty(!collectionState.search && COLLECTION_SHELF_EMPTY[collectionState.shelf] || "No collection items match this view.");
       syncCollectionSelection();
       return;
     }
@@ -1943,6 +2228,19 @@
       btn.classList.toggle("active", active);
       btn.setAttribute("aria-pressed", String(active));
     });
+    document.querySelectorAll("[data-collection-display]").forEach((btn) => {
+      const on = shelfViewOn();
+      btn.hidden = false;
+      btn.classList.toggle("active", on);
+      btn.setAttribute("aria-pressed", String(on));
+      btn.title = on ? "Back to your collection" : "Show my shelf";
+      btn.setAttribute("aria-label", btn.title);
+    });
+    const shelfSelect = $("#profile-collection-shelf");
+    if (shelfSelect && shelfSelect.value !== collectionState.shelf) {
+      shelfSelect.value = collectionState.shelf;
+      enhanceCollectionShelfSelect(shelfSelect);
+    }
     document.querySelectorAll("[data-collection-timeline]").forEach((btn) => {
       btn.classList.toggle("active", collectionState.timeline);
       btn.setAttribute("aria-pressed", String(collectionState.timeline));
@@ -1955,6 +2253,10 @@
     const grid = $("#profile-collection-grid");
     if (!grid) return;
     collectionState.total = Number(data.total || 0);
+    collectionState.shelfStats = data.shelf_stats && typeof data.shelf_stats === "object" ? data.shelf_stats : null;
+    collectionState.shelfLocations = Array.isArray(data.shelf_locations) ? data.shelf_locations : [];
+    renderShelfFilter();
+    renderShelfStats();
     renderCollectionMetrics(data);
     renderCollectionTypeChips(data.counts || {});
     renderCollectionProviders(data.providers || []);
@@ -2014,43 +2316,48 @@
   async function loadCollection({ reset = false, month = "", quiet = false } = {}) {
     if (collectionState.loading) return;
     if (reset) collectionState.page = 1;
-    collectionState.items = [];
     const skeletonGrid = $("#profile-collection-grid");
-    if (skeletonGrid && !quiet) {
-      skeletonGrid.dataset.view = collectionState.view === "list" ? "list" : "grid";
-      skeletonGrid.innerHTML = collectionState.view === "list" ? skeleton("collectionRow", 6) : skeleton("collection", 7);
-    }
     collectionState.loading = true;
-    lockCollectionPager();
     const params = new URLSearchParams({
       type: collectionState.type,
       provider: collectionState.provider,
       search: collectionState.search,
       sort: collectionState.sort,
       page: String(collectionState.page),
-      page_size: String(collectionState.pageSize),
+      page_size: String(collectionPageSize()),
     });
+    if (collectionState.shelf !== "synced") params.set("shelf", collectionState.shelf);
+    if (collectionState.shelf !== "synced" && collectionState.shelfFilter) params.set("shelf_filter", collectionState.shelfFilter);
     if (month) params.set("month", month);
-    try {
-      const data = await api(`/api/profile/collection?${params.toString()}`);
-      if (Number(params.get("page_size")) !== collectionState.pageSize) return;
+    const url = `/api/profile/collection?${params.toString()}`;
+    const snapshot = listSnapshot(`${url}&layout=${collectionState.view}`, data => {
       collectionState.items = Array.isArray(data.items) ? data.items : [];
       collectionState.loaded = true;
       renderCollection(data);
       collectionState.months = Array.isArray(data.months) ? data.months : [];
       renderCollectionTimeline();
+    }, skeletonGrid);
+    if (skeletonGrid && !quiet && !snapshot.restored) {
+      skeletonGrid.dataset.view = collectionState.view === "list" ? "list" : "grid";
+      skeletonGrid.innerHTML = collectionState.view === "list" ? skeleton("collectionRow", 6) : skeleton("collection", 7);
+    }
+    if (!snapshot.restored) lockCollectionPager();
+    try {
+      const data = await api(url);
+      if (Number(params.get("page_size")) !== collectionPageSize() || !snapshot.current()) return;
+      snapshot.update(data);
       if (month) {
         const grid = $("#profile-collection-grid");
         (grid?.querySelector(`[data-timeline-month="${month}"]`) || grid)?.scrollIntoView({ block: "start", behavior: "auto" });
       }
     } catch (e) {
       const grid = $("#profile-collection-grid");
-      if (grid) grid.innerHTML = empty("Collections could not be loaded.");
+      if (grid && !snapshot.restored && snapshot.current()) grid.innerHTML = empty("Collections could not be loaded.");
       renderCollectionPager({ total: collectionState.total, page: collectionState.page, page_size: collectionState.pageSize });
       toast(e.message || "Collections could not be loaded", true);
     } finally {
       collectionState.loading = false;
-      if (Number(params.get("page_size")) !== collectionState.pageSize) {
+      if (Number(params.get("page_size")) !== collectionPageSize()) {
         collectionState.loaded = false;
         if ($("#profile-panel-collection")?.classList.contains("active")) void loadCollection({reset:true});
       }
@@ -2090,13 +2397,34 @@
         if (!item) return;
         const card = action.closest("[data-collection-key]");
         const entries = [{ label: "View media details", icon: "info", run: () => card?.querySelector("[data-profile-poster-key]")?.click() }];
-        if (collectionSelectable() && window.CW?.ItemActions) entries.unshift({ label: "Manage providers", icon: "edit", run: () => window.CW.ItemActions.openMenu({ anchor: action, feature: "collection", item: { ...collectionSelectionEntry(item), tmdb: item.tmdb }, refs: { present: timelineEndpoints(collectionSelectionEntry(item).present), missing: [] }, fillMissing: true, scope: () => [card], onChanged: () => loadCollection({ quiet: true }) }) });
+        if (collectionSelectable() && !item.shelf_only && window.CW?.ItemActions) entries.unshift({ label: "Manage providers", icon: "edit", run: () => window.CW.ItemActions.openMenu({ anchor: action, feature: "collection", item: { ...collectionSelectionEntry(item), tmdb: item.tmdb }, refs: { present: timelineEndpoints(collectionSelectionEntry(item).present), missing: [] }, fillMissing: true, scope: () => [card], onChanged: () => { invalidateLists(); return loadCollection({ quiet: true }); } }) });
         openCardActions(action, entries, {title:item.title});
         return;
       }
       const pick = event.target?.closest?.("[data-collection-select]");
       if (pick) {
         void selectCollection(pick.dataset.collectionSelect);
+        return;
+      }
+      const displayBtn = event.target?.closest?.("[data-collection-display]");
+      if (displayBtn) {
+        const before = { size: collectionPageSize(), shelf: collectionState.shelf };
+        if (shelfViewOn()) {
+          collectionState.display = "poster";
+          if (collectionState.shelf === "shelf") collectionState.shelf = "synced";
+        } else {
+          collectionState.display = "shelf";
+          collectionState.view = "grid";
+          if (collectionState.shelf === "synced") collectionState.shelf = "shelf";
+        }
+        if (collectionState.shelf !== before.shelf) {
+          collectionState.shelfFilter = "";
+          collectionState.selected.clear();
+        }
+        saveCollectionPrefs();
+        syncCollectionViewButtons();
+        if (collectionPageSize() !== before.size || collectionState.shelf !== before.shelf) void loadCollection({ reset: true });
+        else paintCollectionItems();
         return;
       }
       if (event.target?.closest?.("[data-collection-timeline]")) {
@@ -2150,6 +2478,32 @@
     });
     enhanceCollectionProviderSelect();
     enhanceCollectionSortSelect();
+    const shelfSelect = $("#profile-collection-shelf");
+    if (shelfSelect) {
+      shelfSelect.value = collectionState.shelf;
+      enhanceCollectionShelfSelect(shelfSelect);
+      shelfSelect.addEventListener("change", (event) => {
+        collectionState.shelf = COLLECTION_SHELF_MODES.includes(event.target?.value) ? event.target.value : "synced";
+        collectionState.shelfFilter = "";
+        collectionState.selected.clear();
+        saveCollectionPrefs();
+        syncCollectionViewButtons();
+        void loadCollection({ reset: true });
+      });
+    }
+    $("#profile-collection-shelf-filter")?.addEventListener("change", (event) => {
+      collectionState.shelfFilter = String(event.target?.value || "");
+      void loadCollection({ reset: true });
+    });
+    renderShelfFilter();
+    window.addEventListener("cw:shelf-cases", () => {
+      if (shelfViewOn()) paintCollectionItems();
+    });
+    window.addEventListener("cw:shelf-changed", (event) => {
+      if (event.detail?.loaded || !collectionState.loaded) return;
+      collectionState.loaded = false;
+      if ($("#profile-panel-collection")?.classList.contains("active")) void loadCollection({ quiet: true });
+    });
     $("#profile-collection-types")?.addEventListener("click", (event) => {
       const btn = event.target?.closest?.("[data-collection-type]");
       if (!btn) return;
@@ -2957,7 +3311,7 @@
       const [provider, ...instance] = String(node.dataset.iaRef || "").split(":");
       const entry = { ...selectionEntry(item), tmdb: item.tmdb };
       const tmdb = String(item.ids?.tmdb || item.tmdb || "");
-      const reload = () => load({ quiet: true });
+      const reload = () => { invalidateLists(); return load({ quiet: true }); };
       const movie = String(item.type || "").toLowerCase() === "movie";
       void actions.openMenu({
         anchor: node.hidden ? node.closest(".cw-provider-strip")?.querySelector("[data-provider-overflow]") || node : node,
@@ -2970,7 +3324,7 @@
         scope: () => [card],
         onChanged: reload,
         openHistory: feature === "history" && movie && tmdb
-          ? () => actions.openHistory({ item: entry, poster: `/art/tmdb/movie/${encodeURIComponent(tmdb)}?fallback=2&size=w342`, onChanged: reload })
+          ? () => actions.openHistory({ item: entry, poster: `/art/tmdb/movie/${encodeURIComponent(tmdb)}?fallback=2&size=w342${window.CW?.ArtChoice?.param?.("movie", tmdb) || ""}`, onChanged: reload })
           : null,
         openDetails: card.querySelector("[data-profile-poster-key]") ? () => card.querySelector("[data-profile-poster-key]")?.click() : null,
       });
@@ -3372,17 +3726,10 @@
       if (reset) state.page = 1;
       const seq = ++state.seq;
       const host = q("list");
-      if (host && !quiet) {
-        timelineImages.release(host);
-        host.dataset.view = state.view;
-        host.innerHTML = `<div class="cw-hist-day-body">${state.view === "list" ? skeleton("collectionRow", 6) : skeleton("historyCard", 8)}</div>`;
-      }
-      q("pages")?.querySelectorAll("button").forEach((btn) => { btn.disabled = true; });
       const params = baseParams();
       if (month) params.set("month", month);
-      try {
-        const data = await api(`${cfg.endpoint}?${params.toString()}`);
-        if (seq !== state.seq) return;
+      const url = `${cfg.endpoint}?${params.toString()}`;
+      const snapshot = listSnapshot(`${url}&layout=${state.view}&timeline=${state.timeline}`, data => {
         state.items = Array.isArray(data.items) ? data.items : [];
         state.total = Number(data.total || 0);
         state.loaded = true;
@@ -3394,6 +3741,17 @@
         paintItems();
         state.months = Array.isArray(data.months) ? data.months : [];
         renderTimeline(state.months);
+      }, host);
+      if (host && !quiet && !snapshot.restored) {
+        timelineImages.release(host);
+        host.dataset.view = state.view;
+        host.innerHTML = `<div class="cw-hist-day-body">${state.view === "list" ? skeleton("collectionRow", 6) : skeleton("historyCard", 8)}</div>`;
+      }
+      if (!snapshot.restored) q("pages")?.querySelectorAll("button").forEach((btn) => { btn.disabled = true; });
+      try {
+        const data = await api(url);
+        if (seq !== state.seq || !snapshot.current()) return;
+        snapshot.update(data);
         if (month) {
           const target = q("list")?.querySelector(`[data-timeline-month="${month}"]`) || q("list");
           target?.scrollIntoView({ block: "start", behavior: "auto" });
@@ -3401,8 +3759,8 @@
           panel()?.scrollIntoView({ block: "start", behavior: "smooth" });
         }
       } catch (e) {
-        if (seq !== state.seq) return;
-        if (host) host.innerHTML = empty(`${meta().title} could not be loaded.`);
+        if (seq !== state.seq || !snapshot.current()) return;
+        if (host && !snapshot.restored) host.innerHTML = empty(`${meta().title} could not be loaded.`);
         renderPager({ total: state.total, page: state.page, page_size: state.pageSize });
         toast(e.message || `${meta().title} could not be loaded`, true);
       }
@@ -3766,6 +4124,7 @@
         const data = await res.json().catch(() => ({}));
         const payload = data && typeof data === "object" ? data : {};
         if (!res.ok) payload.ok = false;
+        if (method !== "GET" && res.ok && payload.ok !== false) invalidateLists();
         return payload;
       } catch (error) {
         return { ok: false, message: String(error?.message || error || "Request failed") };
@@ -3817,12 +4176,7 @@
       }
       return label || String(p?.instance_id || "").trim() || "Default";
     };
-    const settingsLabel = (p) => {
-      const id = String(p?.instance_id || "default");
-      if (id === "default") return "Default";
-      if (String(p.provider || "").toLowerCase() === "crosswatch" && /^CW-P\d+$/i.test(id)) return id.toUpperCase();
-      return profileLabel(p);
-    };
+    const settingsLabel = (p) => profileLabel(p);
     const providerOrder = (provider) => {
       const key = String(provider || "").toLowerCase();
       const index = PLAYBACK_PROVIDER_KEYS.indexOf(key);
@@ -4245,39 +4599,56 @@
       state.busy = !background;
       renderSync();
       const host = q("list");
-      if (host && !state.loaded) {
+      const snapshot = listSnapshot(`/api/playback_progress/items?${query({month})}&layout=${state.view}&timeline=${state.timeline}`, data => {
+        state.items = Array.isArray(data.items) ? data.items : [];
+        if (Array.isArray(data.providers)) state.providers = data.providers;
+        state.errors = Array.isArray(data.errors) ? data.errors : [];
+        state.loading = Array.isArray(data.loading) ? data.loading : [];
+        if (data.ok === false && !state.errors.length) {
+          state.errors = [{ provider: "", provider_label: "Playback", message: data.message || data.error || "Request failed.", retryable: true }];
+        }
+        state.failed = data.ok === false;
+        if (data.summary && typeof data.summary === "object") state.summary = data.summary;
+        state.total = Number(data.total || 0);
+        state.page = Number(data.page || state.page) || 1;
+        state.loaded = true;
+        renderMetrics();
+        renderTypes();
+        renderProviders();
+        renderErrors();
+        renderPager();
+        paint();
+        state.months = Array.isArray(data.months) ? data.months : [];
+        renderTimeline();
+        renderSync();
+      }, host);
+      if (host && !state.loaded && !snapshot.restored) {
         timelineImages.release(host);
         host.dataset.view = state.view;
         host.innerHTML = `<div class="cw-hist-day-body">${state.view === "list" ? skeleton("collectionRow", 6) : skeleton("historyCard", 8)}</div>`;
       }
       if (!background) host?.setAttribute("aria-busy", "true");
       const data = await request(`/api/playback_progress/items?${query({ force, month })}&progressive=true`);
-      if (seq !== state.seq) return;
+      if (seq !== state.seq || !snapshot.current()) return;
       state.busy = false;
       host?.removeAttribute("aria-busy");
-      state.items = Array.isArray(data.items) ? data.items : [];
-      if (Array.isArray(data.providers)) state.providers = data.providers;
-      state.errors = Array.isArray(data.errors) ? data.errors : [];
-      state.loading = Array.isArray(data.loading) ? data.loading : [];
-      if (state.loading.length) state.loadingTimer = setTimeout(() => void load({ background: true }), 1500);
-      if (data.ok === false && !state.errors.length) {
-        state.errors = [{ provider: "", provider_label: "Playback", message: data.message || data.error || "Request failed.", retryable: true }];
+      if (data.ok === false && snapshot.restored) {
+        state.failed = true;
+        renderSync();
+        return;
       }
-      state.failed = data.ok === false;
-      if (!state.failed) state.syncedAt = Date.now();
-      if (data.summary && typeof data.summary === "object") state.summary = data.summary;
-      state.total = Number(data.total || 0);
-      state.page = Number(data.page || state.page) || 1;
-      state.loaded = true;
-      renderMetrics();
-      renderTypes();
-      renderProviders();
-      renderErrors();
-      renderPager();
-      paint();
-      state.months = Array.isArray(data.months) ? data.months : [];
-      renderTimeline();
+      if (data.ok === false) {
+        state.errors = [{provider:"", provider_label:"Playback", message:data.message || data.error || "Request failed.", retryable:true}];
+        state.failed = true;
+        if (host) host.innerHTML = empty("Playback could not be loaded.");
+        renderErrors();
+      } else {
+        snapshot.update(data);
+        state.syncedAt = Date.now();
+        state.failed = false;
+      }
       renderSync();
+      if (data.loading?.length) state.loadingTimer = setTimeout(() => void load({ background: true }), 1500);
       if (month) {
         (q("list")?.querySelector(`[data-timeline-month="${month}"]`) || q("list"))?.scrollIntoView({ block: "start", behavior: "auto" });
       } else if (scroll) {
@@ -4303,7 +4674,7 @@
       const panel = q("filters-panel");
       const btn = q("filters-btn");
       if (!panel || !btn) return;
-      if (panel.closest(".cw-hub-mobile-sheet")) return;
+      if (panel.closest(".cw-hub-mobile-sheet,.cw-hub-filterpop")) return;
       const open = typeof force === "boolean" ? force : panel.hidden;
       panel.hidden = !open;
       btn.setAttribute("aria-expanded", String(open));
@@ -4469,12 +4840,10 @@
       syncSelection();
     }
 
+    let settingsProfiles = [];
+
     function settingsMarkup(data) {
       const profiles = Array.isArray(data?.profiles) ? data.profiles : [];
-      const hidden = profiles
-        .filter((p) => !(p.configured && p.read))
-        .map((p) => `<input type="checkbox" hidden disabled data-provider="${esc(p.provider || "")}" data-instance="${esc(p.instance_id || "default")}" data-included="${p.included !== false}">`)
-        .join("");
       const groups = new Map();
       profiles.filter((p) => p.configured && p.read).forEach((p) => {
         const key = String(p.provider || "").toLowerCase();
@@ -4487,11 +4856,11 @@
         .map(([provider, rows]) => {
           const label = visibleProviderLabel(provider) || provider.toUpperCase();
           const logo = providerLogLogo(provider);
-          const pills = rows.map((p) => `<label class="cw-play-pill"><input type="checkbox" data-provider="${esc(p.provider || provider)}" data-instance="${esc(p.instance_id || "default")}"${p.included !== false ? " checked" : ""}><span><span class="material-symbols-rounded" aria-hidden="true">check</span>${esc(settingsLabel(p))}</span></label>`).join("");
-          return `<section class="cw-play-provider"><span class="cw-play-provider-head">${logo ? `<img src="${esc(logo)}" alt="" onerror="this.remove()">` : ""}<strong>${esc(label)}</strong></span><span class="cw-play-provider-pills">${pills}</span></section>`;
+          const pills = rows.map((p) => `<label class="pf-option"><input type="checkbox" data-provider="${esc(p.provider || provider)}" data-instance="${esc(p.instance_id || "default")}"${p.included !== false ? " checked" : ""}><span>${esc(settingsLabel(p))}</span></label>`).join("");
+          return `<section class="pf-provider"><div class="pf-provider-head"><h4>${logo ? `<img src="${esc(logo)}" alt="" onerror="this.remove()">` : ""}${esc(label)}</h4></div><span class="pf-options">${pills}</span></section>`;
         })
         .join("");
-      return sections ? `${sections}${hidden}` : `<div class="cw-tl-dialog-note">No connected playback providers were found.</div>${hidden}`;
+      return sections || `<div class="cw-tl-dialog-note">No connected playback providers were found.</div>`;
     }
 
     async function openSettings() {
@@ -4502,16 +4871,30 @@
       const error = q("providers-error");
       if (!dialog?.showModal || !list || !timeout) return;
       if (error) error.textContent = "";
+      const submit = dialog.querySelector('[type="submit"]');
+      submit.disabled = true;
+      settingsProfiles = [];
       list.innerHTML = `<div class="cw-tl-dialog-note">Loading provider profiles...</div>`;
       dialog.showModal();
       const data = await request("/api/playback_progress/settings");
+      if (!dialog.open) return;
+      if (data.ok === false) {
+        list.innerHTML = empty("Playback settings could not be loaded.");
+        return;
+      }
+      settingsProfiles = Array.isArray(data.profiles) ? data.profiles : [];
+      q("grouping").value = data.grouping === "separate" ? "separate" : "automatic";
+      q("grouping").dispatchEvent(new Event("change", {bubbles:true}));
       timeout.value = String(Math.round(Number(data.provider_timeout_seconds || DEFAULT_TIMEOUT)));
       list.innerHTML = settingsMarkup(data);
+      submit.disabled = false;
     }
 
     function resetSettings() {
       const timeout = q("timeout");
       if (timeout) timeout.value = String(DEFAULT_TIMEOUT);
+      q("grouping").value = "automatic";
+      q("grouping").dispatchEvent(new Event("change", {bubbles:true}));
       q("provider-list")?.querySelectorAll("input[type=checkbox][data-provider]").forEach((input) => {
         input.checked = !input.disabled;
         if (input.disabled) input.dataset.included = "false";
@@ -4526,19 +4909,20 @@
         if (error) error.textContent = "Use a timeout between 3 and 60 seconds.";
         return;
       }
-      const profiles = [...(q("provider-list")?.querySelectorAll("input[type=checkbox][data-provider]") || [])].map((input) => ({
+      const profiles = settingsProfiles.filter(p => !(p.configured && p.read)).map(p => ({provider:p.provider, instance_id:p.instance_id, included:p.included !== false})).concat([...(q("provider-list")?.querySelectorAll("input[type=checkbox][data-provider]") || [])].map((input) => ({
         provider: input.dataset.provider,
         instance_id: input.dataset.instance,
         included: input.disabled ? input.dataset.included !== "false" : input.checked,
-      }));
-      const res = await postJson("/api/playback_progress/settings", { profiles, provider_timeout_seconds: seconds });
+      })));
+      const res = await postJson(scopeUrl("/api/playback_progress/settings"), { profiles, provider_timeout_seconds: seconds, grouping:q("grouping")?.value || "automatic" });
       if (!res.ok) {
         if (error) error.textContent = res.message || res.error || "Settings could not be saved.";
         return;
       }
       dialog?.close();
-      toast("Playback providers saved");
+      toast("Playback settings saved");
       state.selected.clear();
+      if ($("#profile-panel-overview")) void loadOverview().catch(() => {});
       await load({ force: true });
     }
 
@@ -4599,7 +4983,7 @@
               progressRows: progressRowsOf(item),
               focusRow: chip.dataset.iaPlay ?? null,
               scope: () => [card],
-              onChanged: () => load({ background: true }),
+              onChanged: () => { invalidateLists(); return load({ background: true }); },
             });
           }
           return;
@@ -4756,11 +5140,12 @@
       document.querySelectorAll(".cw-profile-panel").forEach((panel) => panel.classList.toggle("active", panel.id === `profile-panel-${key}`));
       document.body.dataset.profileView = key;
       if (mobilePaging.matches && tabs) tabs.scrollLeft = Math.max(0, btn.offsetLeft - tabs.offsetLeft - 12);
-      if (key === "overview" && overviewPagingDirty) {
+      if (key === "overview" && (!overviewPayload || overviewPagingDirty || Date.now() - overviewStartedAt >= 60000)) {
         overviewPagingDirty = false;
         void loadOverview().catch(() => {});
         void loadProfileActivity({preserve:true}).catch(() => {});
       }
+      if (key === "overview" && overviewProgressResume) { clearTimeout(overviewLoadingTimer); overviewProgressResume(); }
       if (key === "collection" && !collectionState.loaded) void loadCollection({ reset: true });
       if (key === "history") historyPanel.open(opts);
       if (key === "ratings") ratingsPanel.open(opts);
@@ -4783,7 +5168,7 @@
       if (key) selectTab(key, { fromHash: true });
     });
     const initial = tabFromHash();
-    if (initial) selectTab(initial, { fromHash: true });
+    selectTab(initial || "overview", { fromHash: true });
   }
 
   function wireAvatar() {
@@ -5355,6 +5740,17 @@
       trigger.setAttribute("aria-haspopup", "dialog");
       trigger.innerHTML = '<span class="material-symbols-rounded" aria-hidden="true">tune</span><span hidden></span>';
       toolbar.append(trigger);
+      const pop = document.createElement("div");
+      pop.className = "cw-hub-filterpop";
+      pop.id = `profile-${key}-filterpop`;
+      pop.hidden = true;
+      pop.setAttribute("role", "group");
+      pop.setAttribute("aria-label", "Filters");
+      toolbar.after(pop);
+      const tail = document.createElement("div");
+      tail.className = "cw-hub-records-tail";
+      panel.querySelectorAll(".cw-hub-records-controls > .cw-hub-records-views, .cw-hub-records-controls > [data-timeline-refresh], .cw-hub-records-controls > [data-collection-refresh], .cw-hub-records-controls > [data-playback-open-settings], .cw-hub-records-controls > [data-playback-retry]").forEach((node) => tail.append(node));
+      toolbar.append(tail);
       const dialog = document.createElement("dialog");
       dialog.className = "cw-hub-mobile-sheet";
       dialog.id = `profile-${key}-mobile-tools`;
@@ -5365,11 +5761,13 @@
       const body = dialog.querySelector(".cw-hub-mobile-sheet-body");
       const moved = [];
       let enabled = false;
+      let mode = "";
       let signature = "";
-      const defaults = { coverage: "all", sort: key === "collection" ? "collected_at" : "last_updated" };
+      const holder = () => (mode === "desktop" ? pop : body);
+      const defaults = { coverage: "all", sort: key === "collection" ? "collected_at" : "last_updated", shelf: "synced" };
       const selectedFilters = () => {
         const entries = [];
-        body.querySelectorAll("select").forEach((select) => {
+        holder().querySelectorAll("select").forEach((select) => {
           if (select.closest("[hidden]")) return;
           const field = select.id.replace(`profile-${key}-`, "");
           const fallback = defaults[field] || "";
@@ -5379,25 +5777,25 @@
             select.dispatchEvent(new Event("change", { bubbles: true }));
           } });
         });
-        const types = [...body.querySelectorAll(typeSelector)];
+        const types = [...holder().querySelectorAll(typeSelector)];
         const active = types.find((button) => button.getAttribute("aria-pressed") === "true");
         if (active && active !== types[0]) entries.push({ label: active.querySelector("span:not(.material-symbols-rounded)")?.textContent || active.textContent, clear: () => types[0]?.click() });
-        const rating = body.querySelector('[data-timeline-rating]:not([data-timeline-rating=""])[aria-pressed="true"]');
+        const rating = holder().querySelector('[data-timeline-rating]:not([data-timeline-rating=""])[aria-pressed="true"]');
         if (rating) entries.push({ label: `${rating.dataset.timelineRating}/10`, clear: () => rating.click() });
         return entries;
       };
       const sync = () => {
-        if (!enabled) return;
+        if (!mode) return;
         if (dialog.open && !panel.classList.contains("active")) dialog.close();
         const stats = [...metrics?.querySelectorAll(".cw-hub-records-stat") || []];
         const stat = key === "collection" ? stats.at(-1) : stats[0];
         const text = stat ? `${stat.querySelector("strong")?.textContent || "0"} ${stat.querySelector("span")?.textContent.toLowerCase() || "items"}` : "";
         if (total.textContent !== text) total.textContent = text;
         source.value = panel.dataset.source || sources[0]?.dataset.timelineSource || "";
-        const coverage = body.querySelector(".cw-hub-records-filters");
+        const coverage = holder().querySelector(".cw-hub-records-filters");
         if (coverage && coverage.hidden !== (panel.dataset.coverage !== "on")) coverage.hidden = panel.dataset.coverage !== "on";
         const entries = selectedFilters();
-        const status = body.querySelector(".cw-play-status");
+        const status = panel.querySelector(".cw-play-status");
         const warning = status?.dataset.issues;
         const next = JSON.stringify([entries.map((entry) => entry.label), warning]);
         if (signature !== next) {
@@ -5437,6 +5835,12 @@
       const close = () => { if (dialog.open) dialog.close(); };
       trigger.addEventListener("click", () => {
         window.CW?.IconSelect?.closeAll?.();
+        if (mode === "desktop") {
+          pop.hidden = !pop.hidden;
+          trigger.setAttribute("aria-expanded", String(!pop.hidden));
+          sync();
+          return;
+        }
         relocateMenus(dialog);
         sync();
         dialog.showModal();
@@ -5459,30 +5863,55 @@
       panel.addEventListener("change", sync);
       const observer = new MutationObserver(sync);
       observer.observe(body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-pressed", "data-issues", "hidden"] });
+      observer.observe(pop, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-pressed", "hidden"] });
+      pop.addEventListener("keydown", (event) => {
+        if (event.key !== "Escape" || mode !== "desktop") return;
+        pop.hidden = true;
+        trigger.setAttribute("aria-expanded", "false");
+        trigger.focus();
+      });
       observer.observe(panel, { attributes: true, attributeFilter: ["data-source", "data-coverage", "class"] });
+      const moveInto = (selectors, destination) => selectors.forEach((selector) => {
+        const node = panel.querySelector(selector);
+        if (!node || destination.contains(node)) return;
+        const marker = document.createTextNode("");
+        node.before(marker);
+        moved.push({ node, marker });
+        destination.append(node);
+      });
       const adapt = () => {
-        if (enabled === narrow.matches) return;
-        enabled = narrow.matches;
+        const next = narrow.matches ? "mobile" : "desktop";
+        if (mode === next) return;
+        close();
+        relocateMenus(document.body);
+        moved.splice(0).forEach(({ node, marker }) => marker.replaceWith(node));
+        pop.hidden = true;
+        panel.querySelectorAll(".cw-hub-records-filters,.cw-play-filterpanel").forEach((node) => { node.hidden = true; });
+        panel.querySelectorAll("[data-timeline-filters-toggle],[data-playback-filters-toggle]").forEach((button) => button.setAttribute("aria-expanded", "false"));
+        mode = next;
+        enabled = mode === "mobile";
         panel.classList.toggle("has-mobile-tools", enabled);
+        panel.classList.toggle("has-desktop-tools", !enabled);
         if (enabled) {
-          [".cw-hub-records-chips", ".cw-hist-scores", ".cw-hub-records-controls", ".cw-hub-records-filters", ".cw-hub-records-tiles", ".cw-hub-progress-summary", ".cw-play-status"].forEach((selector) => {
-            const node = panel.querySelector(selector);
-            if (!node) return;
-            const marker = document.createTextNode("");
-            node.before(marker);
-            moved.push({ node, marker });
-            body.append(node);
-          });
-          const filters = body.querySelector(".cw-play-filterpanel");
-          if (filters) filters.hidden = false;
-          sync();
+          trigger.firstElementChild.textContent = "tune";
+          trigger.setAttribute("aria-label", "Filters and display options");
+          trigger.setAttribute("aria-haspopup", "dialog");
+          trigger.setAttribute("aria-controls", dialog.id);
+          trigger.removeAttribute("aria-expanded");
+          toolbar.append(trigger);
+          moveInto([".cw-hub-records-chips", ".cw-hist-scores", ".cw-hub-records-controls", ".cw-hub-records-tail", ".cw-hub-records-filters", ".cw-hub-records-tiles", ".cw-hub-progress-summary", ".cw-play-status"], body);
         } else {
-          close();
-          relocateMenus(document.body);
-          moved.splice(0).forEach(({ node, marker }) => marker.replaceWith(node));
-          panel.querySelectorAll(".cw-hub-records-filters,.cw-play-filterpanel").forEach((node) => { node.hidden = true; });
-          panel.querySelectorAll("[data-timeline-filters-toggle],[data-playback-filters-toggle]").forEach((button) => button.setAttribute("aria-expanded", "false"));
+          trigger.firstElementChild.textContent = "filter_list";
+          trigger.setAttribute("aria-label", "Filters");
+          trigger.removeAttribute("aria-haspopup");
+          trigger.setAttribute("aria-controls", pop.id);
+          trigger.setAttribute("aria-expanded", "false");
+          (panel.querySelector(".cw-hub-records-search") || toolbar).append(trigger);
+          moveInto([".cw-hist-scores", ".cw-hub-records-chips", ".cw-hub-records-controls", ".cw-hub-records-filters"], pop);
         }
+        const filters = holder().querySelector(".cw-play-filterpanel");
+        if (filters) filters.hidden = false;
+        sync();
       };
       narrow.addEventListener("change", adapt);
       adapt();
@@ -5515,17 +5944,19 @@
     nowTimer = setInterval(() => {
       if (document.visibilityState === "visible") refreshNowPlaying();
     }, 15000);
-    const [overviewResult, activityResult] = await Promise.allSettled([
-      loadOverview(),
-      loadProfileActivity(),
-    ]);
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      void refreshNowPlaying();
+      if (!$("#profile-panel-overview")?.classList.contains("active")) return;
+      if (Date.now() - overviewStartedAt >= 60000) {
+        void loadOverview().catch(() => {});
+        void loadProfileActivity({preserve:true}).catch(() => {});
+      } else if (overviewProgressResume) { clearTimeout(overviewLoadingTimer); overviewProgressResume(); }
+    });
+    void refreshNowPlaying();
+    if (!$("#profile-panel-overview")?.classList.contains("active")) void loadHeroPreview().catch(() => {});
     void refreshPlexStatus();
     void refreshOidcStatus();
-    if (overviewResult.status === "rejected") toast(overviewResult.reason?.message || "Profile overview could not be loaded", true);
-    if (activityResult.status === "rejected") {
-      const host = $("#profile-activity");
-      if (host) host.innerHTML = empty("Recent activity could not be loaded.");
-    }
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init, { once: true });

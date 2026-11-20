@@ -48,6 +48,7 @@
     { key: "MYANIMELIST", paths: [["myanimelist"]], keys: ["access_token"] },
     { key: "WETRAKR", paths: [["wetrakr"]], keys: ["access_token"] },
     { key: "PUNCHPLAY", paths: [["punchplay"], ["auth", "punchplay"]], keys: ["access_token"] },
+    { key: "MOVIEPARADISE", paths: [["movieparadise"], ["auth", "movieparadise"]], keys: ["access_token"] },
     { key: "BINGEBASE", paths: [["bingebase"], ["auth", "bingebase"]], keys: ["access_token", "webhook_url"] },
     { key: "FLICKLIST", paths: [["flicklist"], ["auth", "flicklist"]], keys: ["api_key", "access_token", "token"] },
     { key: "NUVIO", paths: [["nuvio"], ["auth", "nuvio"]], keys: ["access_token", "refresh_token"] },
@@ -66,7 +67,7 @@
   };
   let mainRefreshStarted = false;
   const AUTO_STATUS = false;
-  const STATUS_MIN_INTERVAL = 24 * 60 * 60 * 1000;
+  const STATUS_MIN_INTERVAL = 60 * 1000;
   const UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
   const UPDATE_CHECK_RETRY_MS = 5 * 60 * 1000;
   const PAIRS_CACHE_KEY = "cw.pairs.v1";
@@ -75,7 +76,7 @@
   const statusCacheKey = () => `${STATUS_CACHE_KEY}.${String(window.CW?.OverviewProfile?.id || "").trim() || "all"}`;
   const DETAILS_MAX_LINES = 300;
   const authSetupPending = () => window.cwIsAuthSetupPending?.() === true;
-  const ROUTE_TABS = new Set(["main", "snapshots", "capture_compare", "playlists", "tracker", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
+  const ROUTE_TABS = new Set(["main", "snapshots", "capture_compare", "playlists", "tracker", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "backups", "settings"]);
   const SETTINGS_PANES = new Set(["overview", "providers", "sync", "scrobbler", "scheduling", "app", "maintenance"]);
   let routeSyncing = false;
 
@@ -334,6 +335,7 @@
     if ([cfg?.tracearr, cfg?.auth?.tracearr].some((block) => hasAnyConfigValue(block, ["api_key", "server_url", "server"]))) set.add("TRACEARR");
 
     if ([cfg?.crosswatch, cfg?.CrossWatch].some(hasCrosswatchConfig)) set.add("CROSSWATCH");
+    for (const key of [...set]) if (window.CW?.ProviderMeta?.isHidden?.(key)) set.delete(key);
     return set;
   }
 
@@ -678,6 +680,8 @@
       tag = `<span class="tag vip" title="Trakt ${label}">${svgCheck()}${label}</span>`;
     } else if (providerKey === "WETRAKR" && (info?.vip || info?.plan === "vip")) {
       tag = `<span class="tag vip" title="WeTrakr VIP">${svgCrown()}VIP</span>`;
+    } else if (providerKey === "MOVIEPARADISE" && (info?.vip || info?.plan === "premium")) {
+      tag = `<span class="tag vip" title="Movie Paradise Premium">${svgCrown()}Premium</span>`;
     }
 
     const tips = [];
@@ -690,6 +694,11 @@
       if (info.vip || info.plan === "vip") tips.push("Plan: VIP");
       else if (info.plan === "free") tips.push("Plan: Free");
       tips.push(...(META.dailyQuotaDetails?.(info) || []));
+    }
+    if (providerKey === "MOVIEPARADISE" && info && typeof info === "object") {
+      if (info.username) tips.push(`Account: ${info.username}`);
+      if (info.vip || info.plan === "premium") tips.push("Plan: Premium");
+      else if (info.plan === "free") tips.push("Plan: Free");
     }
     if (providerKey === "TRAKT" && info && typeof info === "object") {
       const limits = info.limits || {};
@@ -747,38 +756,48 @@
     }));
   }
 
+  let statusRequest = null;
+  let statusScope = "";
   async function refreshStatus(force = false, verify = force) {
     if (authSetupPending()) return UI.status;
+    const scope = pairsCacheScope();
+    if (!force && statusRequest && statusScope === scope) return statusRequest;
     const now = Date.now();
-    if (!force && state.lastStatusMs && (now - state.lastStatusMs) < STATUS_MIN_INTERVAL) return UI.status;
-    state.lastStatusMs = now;
-
-    try {
-      const [, payload] = await Promise.all([
-        refreshPairedProviders(force ? 0 : 5000),
-        typeof API.Status?.get === "function"
-          ? API.Status.get(!!force, !!verify)
-          : requestJSON(verify ? "/api/status?fresh=1" : "/api/status", {}, 15000),
-      ]);
-      state.appDebug = !!payload?.debug;
-      const providers = extractProviderStatus(payload);
-      renderConnectorStatus(providers, { stale: false });
-      saveStatusCache(providers);
+    if (!force && statusScope === scope && state.lastStatusMs && (now - state.lastStatusMs) < STATUS_MIN_INTERVAL) return UI.status;
+    statusScope = scope;
+    const pending = (async () => {
       try {
-        const configuredProviders = [...getConfiguredProviders()].filter((key) => Object.prototype.hasOwnProperty.call(providers, key));
-        const detail = { payload, providers, configuredProviders };
-        window.__CW_PROVIDER_STATUS__ = detail;
-        document.dispatchEvent(new CustomEvent("cw-status-updated", { detail }));
-      } catch {}
-      UI.status = buildStatusUIState(payload, providers);
-      recomputeRunDisabled();
-      applyStatusSideEffects();
-      return UI.status;
-    } catch (e) {
-      if (String(e?.message || e || "").includes("auth setup pending")) return UI.status;
-      console.warn("refreshStatus failed", e);
-      return UI.status;
-    }
+        const [, payload] = await Promise.all([
+          refreshPairedProviders(force ? 0 : 5000),
+          typeof API.Status?.get === "function"
+            ? API.Status.get(!!force, !!verify)
+            : requestJSON(verify ? "/api/status?fresh=1" : "/api/status", {}, 15000),
+        ]);
+        if (scope !== pairsCacheScope()) return UI.status;
+        state.lastStatusMs = Date.now();
+        state.appDebug = !!payload?.debug;
+        const providers = extractProviderStatus(payload);
+        renderConnectorStatus(providers, { stale: false });
+        saveStatusCache(providers);
+        try {
+          const configuredProviders = [...getConfiguredProviders()].filter((key) => Object.prototype.hasOwnProperty.call(providers, key));
+          const detail = { payload, providers, configuredProviders };
+          window.__CW_PROVIDER_STATUS__ = detail;
+          document.dispatchEvent(new CustomEvent("cw-status-updated", { detail }));
+        } catch {}
+        UI.status = buildStatusUIState(payload, providers);
+        recomputeRunDisabled();
+        applyStatusSideEffects();
+        return UI.status;
+      } catch (e) {
+        if (String(e?.message || e || "").includes("auth setup pending")) return UI.status;
+        console.warn("refreshStatus failed", e);
+        return UI.status;
+      }
+    })();
+    statusRequest = pending;
+    try { return await pending; }
+    finally { if (statusRequest === pending) statusRequest = null; }
   }
 
   async function manualRefreshStatus() {
@@ -917,7 +936,6 @@
     if (authSetupPending()) return;
     mainRefreshStarted = true;
     enforceMainLayout();
-    state.lastStatusMs = 0;
     if (!window.esSum) queueSafe(() => window.openSummaryStream?.());
     if (!window.esLogs) queueSafe(() => window.openLogStream?.());
 
@@ -940,9 +958,10 @@
   }
 
   function setTabHeaderState(tab) {
-    ["main", "snapshots", "capture_compare", "playlists", "tracker", "editor", "analyzer", "events", "logs", "import_export", "maintenance", "settings"].forEach((name) => {
+    ["main", "snapshots", "capture_compare", "playlists", "tracker", "editor", "analyzer", "events", "logs", "import_export", "maintenance", "backups", "settings"].forEach((name) => {
       byId(`tab-${name}`)?.classList.toggle("active", name === tab || (name === "snapshots" && tab === "capture_compare"));
     });
+    byId("tab-tools")?.classList.toggle("active", ["events", "logs", "editor", "analyzer", "import_export", "maintenance", "backups"].includes(tab));
   }
 
   function setPageVisibility(tab) {
@@ -957,6 +976,7 @@
     byId("page-editor")?.classList.toggle("hidden", tab !== "editor");
     byId("page-analyzer")?.classList.toggle("hidden", tab !== "analyzer");
     byId("page-maintenance")?.classList.toggle("hidden", tab !== "maintenance");
+    byId("page-backups")?.classList.toggle("hidden", tab !== "backups");
     byId("page-events")?.classList.toggle("hidden", tab !== "events");
     byId("page-logs")?.classList.toggle("hidden", tab !== "logs");
     byId("page-import_export")?.classList.toggle("hidden", tab !== "import_export");
@@ -1011,6 +1031,7 @@
       if (tab === "tracker" && window.location.hash.startsWith("#tracker?")) await window.TrackerPage?.mount?.(byId("page-tracker"));
       else if (tab === "tracker") await window.TrackerPage?.resume?.();
       if (tab === "interactive_sync") window.InteractiveSync?.refresh?.();
+      if (tab === "backups") await window.BackupsPage?.mount?.(byId("page-backups"));
       if (tab === "maintenance") await window.MaintenancePage?.mount?.(byId("page-maintenance"));
       if (tab === "capture_compare") await window.CaptureComparePage?.mount?.(byId("page-capture_compare"));
       if (tab === "events") await window.EventsPage?.mount?.(byId("page-events"));
@@ -1029,6 +1050,7 @@
 
     if (previousTab === "capture_compare") window.CaptureComparePage?.hide?.();
     if (previousTab === "events") window.EventsPage?.hide?.();
+    if (previousTab === "backups") window.BackupsPage?.hide?.();
     if (previousTab === "logs") window.LogsPage?.hide?.();
     setTabHeaderState(tab);
     setPageVisibility(tab);
@@ -1098,6 +1120,20 @@
 
     if (tab === "interactive_sync") {
       await ensurePageModule("interactive-sync", "/assets/js/interactive-sync.js", "InteractiveSync");
+      return;
+    }
+
+    if (tab === "backups") {
+      try {
+        await ensurePageModule("backups", "/assets/helpers/backups.js", "BackupsPage");
+        if (!isCurrentNavigation()) return;
+        await window.BackupsPage.mount(byId("page-backups"));
+      } catch (error) {
+        if (!isCurrentNavigation()) return;
+        const root = byId("page-backups");
+        if (root) root.innerHTML = '<div class="cw-page-load-error">Backup & Restore failed to load. Refresh the page and try again.</div>';
+        console.error("Backup & Restore failed to load", error);
+      }
       return;
     }
 
@@ -2041,14 +2077,9 @@
       `Exit: ${summary.exit_code != null ? summary.exit_code : "—"}`,
     ];
 
-    try {
-      await navigator.clipboard.writeText(lines.join("\n"));
-      flashCopy(btn, true);
-      return true;
-    } catch {
-      flashCopy(btn, false);
-      return false;
-    }
+    const ok = (await window.cwCopyText?.(lines.join("\n"))) === true;
+    flashCopy(btn, ok);
+    return ok;
   }
 
   function setRefreshBusy(busy) {

@@ -105,9 +105,9 @@ def test_latest_ratings_widget_dedupes_and_sorts_provider_state() -> None:
     assert [item["title"] for item in payload["items"]] == ["Arrival", "Severance"]
     assert payload["items"][0]["rating"] == 9
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"PLEX", "TRAKT"}
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/10?fallback=2&kind=backdrop&size=w300"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/10?fallback=2&kind=backdrop&av=t&size=w300"
     assert payload["items"][0]["cover"] == "/art/tmdb/movie/10?fallback=2&size=w342"
-    assert payload["items"][1]["poster"] == "/art/tmdb/tv/20?fallback=2&kind=backdrop&size=w300"
+    assert payload["items"][1]["poster"] == "/art/tmdb/tv/20?fallback=2&kind=backdrop&av=t&size=w300"
     assert payload["items"][1]["cover"] == "/art/tmdb/tv/20?fallback=2&size=w342"
 
 
@@ -184,7 +184,7 @@ def test_dashboard_widgets_merge_flattened_provider_rows_across_providers(monkey
     assert {source["provider"] for source in history["items"][0]["sources"]} == set(FLATTENED_PROVIDERS)
     assert ratings["total"] == 1
     assert ratings["items"][0]["title"] == "Heat"
-    assert ratings["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&size=w300"
+    assert ratings["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&av=t&size=w300"
     assert ratings["items"][0]["cover"] == "/art/tmdb/movie/949?fallback=2&size=w342"
     assert {source["provider"] for source in ratings["items"][0]["sources"]} == set(FLATTENED_PROVIDERS)
 
@@ -221,7 +221,7 @@ def test_latest_ratings_widget_handles_nested_provider_movie_rows(provider: str)
     assert payload["items"][0]["title"] == "Heat"
     assert payload["items"][0]["year"] == 1995
     assert payload["items"][0]["tmdb"] == 949
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&size=w300"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&av=t&size=w300"
     assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?fallback=2&size=w342"
 
 
@@ -707,7 +707,7 @@ def test_latest_ratings_widget_merges_provider_local_movie_ids_and_inherits_art(
 
     assert payload["total"] == 1
     assert payload["items"][0]["title"] == "Heat"
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&size=w300"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&av=t&size=w300"
     assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?fallback=2&size=w342"
     assert {source["provider"] for source in payload["items"][0]["sources"]} == {"SIMKL", "TRAKT"}
 
@@ -895,7 +895,7 @@ def test_latest_ratings_widget_resolves_missing_art_from_metadata(monkeypatch) -
 
     assert payload["total"] == 1
     assert payload["items"][0]["tmdb"] == 949
-    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&size=w300"
+    assert payload["items"][0]["poster"] == "/art/tmdb/movie/949?fallback=2&kind=backdrop&av=t&size=w300"
     assert payload["items"][0]["cover"] == "/art/tmdb/movie/949?fallback=2&size=w342"
     assert fake.calls[0]["entity"] == "movie"
 
@@ -972,6 +972,98 @@ def test_recent_history_widget_uses_nested_show_tmdb_for_episode_art(monkeypatch
     assert payload["items"][0]["episode_label"] == "S03E02"
     assert payload["items"][0]["tmdb"] == 100
     assert payload["items"][0]["poster"] == "/art/tmdb/tv/100?fallback=2&kind=still&season=3&episode=2&size=w300&artv=2"
+
+
+@pytest.mark.parametrize("feature", ["ratings", "history", "progress", "scrobble"])
+@pytest.mark.parametrize("resolved", [213375, None])
+def test_episode_art_resolves_parent_without_using_episode_ids_as_show_ids(monkeypatch, feature, resolved) -> None:
+    from cw_platform import config_base
+    from providers.scrobble import _show_tmdb
+
+    lookups = []
+    manager = FakeMetadataManager()
+    monkeypatch.setattr(config_base, "load_config", lambda: {})
+    monkeypatch.setattr(dashboard_widgets, "_metadata_manager", lambda: manager)
+    monkeypatch.setattr(
+        _show_tmdb, "show_tmdb_id",
+        lambda cfg, show_ids, episode_ids: lookups.append((dict(show_ids), dict(episode_ids))) or resolved,
+    )
+    item = {
+        "type": "episode", "title": "S01E02", "series_title": "VisionQuest", "season": 1, "episode": 2,
+        "ids": {"tmdb": "6412926", "tvdb": "12023758", "imdb": "tt38934465"},
+        "rating": 6, "rated_at": "2026-11-19T23:41:10Z", "watched_at": "2026-11-19T23:41:10Z",
+        "progress_at": "2026-11-19T23:41:10Z", "progress_percent": 50,
+    }
+    events = [{**item, "id": "episode-2", "kind": "scrobble", "status": "ok", "event": "scrobble_stop", "source": "plex"}]
+    monkeypatch.setattr(dashboard_widgets, "list_events", lambda **_kwargs: {"items": events, "total": 1})
+    if feature == "scrobble":
+        result = dashboard_widgets.recent_scrobble_widget()
+    else:
+        widget = getattr(dashboard_widgets, "latest_ratings_widget" if feature == "ratings" else f"recent_{feature}_widget")
+        result = widget({}, tracker_items={"tmdb:6412926#s01e02": item})
+
+    row = result["items"][0]
+    assert row["ids"]["tmdb"] == "6412926"
+    assert row["tmdb"] == resolved
+    assert lookups == [({}, item["ids"])]
+    assert all(not any(key in call["ids"] for key in ("tmdb", "tvdb", "imdb")) for call in manager.calls)
+    assert "show_ids" not in item
+    if resolved:
+        assert row["ids"]["show_ids"]["tmdb"] == resolved
+        assert row["poster"].startswith("/art/tmdb/tv/213375?")
+        assert "season=1&episode=2" in row["poster"]
+        assert row["cover"].startswith("/art/tmdb/tv/213375?")
+    else:
+        assert not row["poster"] and not row["cover"]
+
+
+@pytest.mark.parametrize("feature", ["ratings", "history", "progress", "scrobble"])
+@pytest.mark.parametrize("series_title", [None, "Behind the Attraction"])
+def test_episode_art_search_requires_known_series_title(monkeypatch, feature, series_title) -> None:
+    from cw_platform import config_base
+    from providers.scrobble import _show_tmdb
+
+    manager = FakeMetadataManager()
+    monkeypatch.setattr(config_base, "load_config", lambda: {})
+    monkeypatch.setattr(_show_tmdb, "show_tmdb_id", lambda *_args: None)
+    monkeypatch.setattr(dashboard_widgets, "_metadata_manager", lambda: manager)
+    item = {
+        "type": "episode", "title": "Behind the Attraction", "season": 1, "episode": 2,
+        "ids": {"tmdb": "6412926"}, "series_title": series_title,
+        "rating": 6, "rated_at": "2026-11-19T23:41:10Z", "watched_at": "2026-11-19T23:41:10Z",
+        "progress_at": "2026-11-19T23:41:10Z", "progress_percent": 50,
+    }
+    events = [{**item, "id": "episode-2", "kind": "scrobble", "status": "ok", "event": "scrobble_stop", "source": "plex"}]
+    monkeypatch.setattr(dashboard_widgets, "list_events", lambda **_kwargs: {"items": events, "total": 1})
+    if feature == "scrobble":
+        result = dashboard_widgets.recent_scrobble_widget()
+    else:
+        widget = getattr(dashboard_widgets, "latest_ratings_widget" if feature == "ratings" else f"recent_{feature}_widget")
+        result = widget({}, tracker_items={"tmdb:6412926#s01e02": item})
+
+    row = result["items"][0]
+    if series_title:
+        assert row["tmdb"] == 100
+        assert row["poster"].startswith("/art/tmdb/tv/100?")
+        assert manager.calls[0]["ids"] == {"title": series_title}
+    else:
+        assert row["tmdb"] is None
+        assert not row["poster"] and not row["cover"]
+        assert manager.calls == []
+
+
+def test_season_art_never_uses_season_ids_for_show_lookup(monkeypatch) -> None:
+    from cw_platform import config_base
+    from providers.scrobble import _show_tmdb
+
+    calls = []
+    monkeypatch.setattr(config_base, "load_config", lambda: {})
+    monkeypatch.setattr(_show_tmdb, "show_tmdb_id", lambda cfg, show, episode: calls.append((show, episode)))
+    row = {"type": "season", "title": "Behind the Attraction", "ids": {"tmdb": "6412926", "tvdb": "12023758"}}
+    dashboard_widgets._resolve_show_art_ids(row)
+    assert calls == [({}, {})]
+    assert dashboard_widgets._tmdb_id(row) is None
+    assert dashboard_widgets._metadata_lookup_ids(row) == {}
 
 
 def test_recent_history_widget_uses_show_tmdb_for_episode_art_when_episode_has_tmdb(monkeypatch) -> None:
@@ -1134,6 +1226,51 @@ def test_recent_scrobble_widget_uses_nested_history_sync_item_art(tmp_path, monk
     ]
     assert payload["scrobble_total"] == 0
     assert payload["scrobble_hours"] == 0.0
+
+
+@pytest.mark.parametrize("explicit_parent", [False, True])
+def test_legacy_history_sync_flat_show_ids_keep_art_without_metadata(tmp_path, monkeypatch, explicit_parent) -> None:
+    from providers.scrobble import _show_tmdb
+
+    monkeypatch.setattr(activity, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(dashboard_widgets, "_metadata_manager", lambda: None)
+    monkeypatch.setattr(_show_tmdb, "show_tmdb_id", lambda *_args: pytest.fail("Parent lookup is unnecessary"))
+    ids = {"tmdb": 213375, "tvdb": 426606}
+    if explicit_parent:
+        ids.update(tmdb=6412926, tmdb_show=213375, tvdb_show=426606)
+    activity.add_event({
+        "id": "legacy-history", "kind": "history_sync", "status": "ok", "source": "trakt",
+        "target": "crosswatch", "media_type": "episode", "title": "VisionQuest",
+        "season": 1, "episode": 2, "watched_at": 1767229200, "ids": ids,
+    })
+
+    row = dashboard_widgets.recent_scrobble_widget()["items"][0]
+    assert row["tmdb"] == "213375"
+    assert row["ids"]["show_ids"]["tmdb"] == "213375"
+    assert row["poster"].startswith("/art/tmdb/tv/213375?")
+    assert row["cover"].startswith("/art/tmdb/tv/213375?")
+
+
+def test_new_history_sync_without_parent_does_not_treat_episode_ids_as_show(tmp_path, monkeypatch) -> None:
+    from cw_platform import config_base
+    from providers.scrobble import _show_tmdb
+
+    manager = FakeMetadataManager()
+    monkeypatch.setattr(activity, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(config_base, "load_config", lambda: {})
+    monkeypatch.setattr(_show_tmdb, "show_tmdb_id", lambda *_args: None)
+    monkeypatch.setattr(dashboard_widgets, "_metadata_manager", lambda: manager)
+    activity.record_history_sync_items([{
+        "type": "episode", "title": "Behind the Attraction", "season": 1, "episode": 2,
+        "watched_at": 1767229200, "ids": {"tmdb": 6412926},
+    }], source="trakt", target="crosswatch")
+
+    row = dashboard_widgets.recent_scrobble_widget()["items"][0]
+    assert row["ids"]["cw_scope"] == "episode"
+    assert row["ids"]["tmdb"] == "6412926"
+    assert row["tmdb"] is None
+    assert not row["poster"] and not row["cover"]
+    assert manager.calls == []
 
 
 def test_recent_scrobble_widget_reports_scrobble_total_separately(monkeypatch) -> None:

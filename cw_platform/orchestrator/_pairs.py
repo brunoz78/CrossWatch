@@ -35,7 +35,7 @@ from ._pairs_twoway import run_two_way_feature
 from ._pairs_playlists import run_playlist_mappings
 from ..run_control import SyncCancelled, cancel_requested
 from ..value_coercion import coerce_bool
-from ..pair_scope import pair_feature_scope
+from ..pair_scope import adopt_legacy_scope, pair_feature_scope, scope_move_pending
 from ..log_context import log_pair_id
 from ..connection_status import identity as connection_identity, record_health
 from ..interactive_reads import read_once, replaying
@@ -111,6 +111,12 @@ def _config_with_pair_feature_options(
     feature: str,
 ) -> dict[str, Any]:
     feature_key = str(feature or "").strip().lower()
+    if feature_key == "collection" and any(str(p or "").upper().strip() == "WETRAKR" for p in providers):
+        cfg = copy.deepcopy(cfg)
+        block = cfg.get("wetrakr")
+        if isinstance(block, dict):
+            current = block.get("collection")
+            block["collection"] = {**(current if isinstance(current, dict) else {}), "copy_details": coerce_bool((fcfg or {}).get("copy_details", False))}
     overrides: dict[str, list[str]] = {}
     provider_keys: list[str] = []
     for provider in providers:
@@ -641,6 +647,15 @@ def run_pairs(ctx) -> dict[str, Any]:
                 continue
 
             scope = pair_feature_scope(cfg, pair, feature, i)
+            if not preview:
+                adopt_legacy_scope(ctx.state_store.base_path, cfg, pair, feature, i)
+                if scope_move_pending(ctx.state_store.base_path, scope):
+                    emit("feature:error", src=src, dst=dst, feature=feature,
+                         error="Pair state is still being moved to its new key; this feature runs again next sync.")
+                    errors_total += 1
+                    if review is not None:
+                        review.failed_features.add(feature)
+                    continue
             with _pair_env(pair, i=i, src=src, dst=dst, mode=mode, feature=feature, scope=scope):
                 prev_cfg = ctx.config
                 prev_store = ctx.state_store

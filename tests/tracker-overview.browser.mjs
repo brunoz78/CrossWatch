@@ -122,9 +122,38 @@ async function choose(page, selector, value) {
   await page.locator(`.cw-icon-select-menu:not(.hidden) [data-value="${value}"]`).click();
 }
 
+for(const theme of ['original','flat-dark','flat-light']) test(`Tracker list cache and sync feature colors in ${theme}`,async t=>{
+  const {page}=await fixture(t,theme,{width:390});
+  for(const [view,feature] of [['watchlist','watchlist'],['history','history'],['ratings','ratings'],['progress','progress'],['collection','collection']]) {
+    await page.locator(`.trk-tabs [data-trk-view="${view}"]`).click();
+    await page.waitForFunction(view=>document.querySelector(`.trk-tabs [data-trk-view="${view}"]`)?.classList.contains('active'),view);
+    await page.waitForFunction(({view,feature})=>{
+      const el=document.querySelector(`.trk-tabs [data-trk-view="${view}"]`);
+      const probe=document.createElement('span');probe.style.color=`rgb(var(--cw-feature-${feature}-rgb))`;document.body.append(probe);
+      const expected=getComputedStyle(probe).color;probe.remove();return getComputedStyle(el).borderBottomColor===expected;
+    },{view,feature});
+  }
+  await page.locator('.trk-tabs [data-trk-view="history"]').click();
+  await page.locator('[data-trk-layout="grid"]').click();
+  await page.locator('.trk-grid-card').first().waitFor();
+  await page.locator('.trk-tabs [data-trk-view="overview"]').click();
+  let release;
+  const gate=new Promise(resolve=>{release=resolve;});t.after(()=>release());
+  await page.route('**/api/tracker/items?**',async route=>{await gate;await route.fulfill({json:{items:rows,total:rows.length}});});
+  await page.locator('.trk-tabs [data-trk-view="history"]').click();
+  await page.locator('.trk-grid-card').first().waitFor();
+  assert.equal(await page.getByText('Loading your history...',{exact:true}).count(),0);
+  release();
+});
+
 for (const width of [390,1440]) test(`Tracker restores its overview before slow summary requests at ${width}px`, async t => {
   const {page,boot,requests} = await fixture(t, "flat-dark", {width,playback:true});
   await page.waitForFunction(() => JSON.parse(sessionStorage.getItem("cw.tracker.overview.v1") || "[]").length > 0);
+  await page.evaluate(()=>{
+    const key='cw.tracker.overview.v1',entries=JSON.parse(sessionStorage.getItem(key));
+    entries.forEach(entry=>{entry.t=Date.now()-15*60*1000;});
+    sessionStorage.setItem(key,JSON.stringify(entries));
+  });
   let release, started;
   const gate = new Promise(resolve => { release = resolve; });
   const pending = new Promise(resolve => { started = resolve; });
@@ -154,7 +183,7 @@ for (const invalidation of ['account','profile','permissions','instance','expire
     const key = 'cw.tracker.overview.v1';
     if (invalidation === 'expired') {
       const entries = JSON.parse(sessionStorage.getItem(key));
-      entries.forEach(entry => { entry.t = Date.now() - 11 * 60 * 1000; });
+      entries.forEach(entry => { entry.t = Date.now() - 25 * 60 * 60 * 1000; });
       sessionStorage.setItem(key,JSON.stringify(entries));
     }
     if (invalidation === 'corrupt') sessionStorage.setItem(key,'invalid json');
@@ -968,64 +997,50 @@ test("Mobile tracker uses short previews, deliberate paging and one-time card mo
 });
 
 const pickerProfiles = [{id:"ann",label:"Ann and family",instances:{CROSSWATCH:["other"]}},{id:"bob",label:"Bob",instances:{CROSSWATCH:["default"]}}];
-for (const theme of ["original","flat-dark","flat-light"]) for (const width of [320,768,1440]) test(`${theme}: Tracker profile picker at ${width}px`, async t => {
-  const {page,boot,scopedReads} = await fixture(t,theme,{width,profiles:pickerProfiles});
-  const button = page.locator('#trk-profile + .cw-icon-select button');
-  await button.waitFor();
-  assert.match(await button.textContent(),/All profiles/);
+const pickProfile = (page, id) => page.evaluate(value => CW.OverviewProfile.setActive(value), id);
+const pickedProfile = page => page.evaluate(() => CW.OverviewProfile.id);
+
+for (const width of [390,1440]) test(`Tracker follows the selected profile at ${width}px`, async t => {
+  const {page,boot,scopedReads} = await fixture(t,'flat-dark',{width,profiles:pickerProfiles});
+  assert.equal(await page.locator('.trk-profile-picker').count(),0);
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false);
-  await button.focus();
-  await page.keyboard.press('Enter');
-  const menu = page.locator('.cw-icon-select-menu:not(.hidden)');
-  await menu.waitFor();
-  const bounds = await menu.boundingBox();
-  assert.ok(bounds.x>=0 && bounds.x+bounds.width<=width+1);
-  if (process.env.CW_PROFILE_PICKER_SCREENSHOTS) {
-    await mkdir(process.env.CW_PROFILE_PICKER_SCREENSHOTS,{recursive:true});
-    await page.screenshot({path:`${process.env.CW_PROFILE_PICKER_SCREENSHOTS}/${theme}-${width}.png`});
-  }
-  await page.keyboard.press('Escape');
-  assert.equal(await button.evaluate(el=>el===document.activeElement),true);
-  await Promise.all([page.waitForEvent('load'),choose(page,'#trk-profile','ann')]);
+  await Promise.all([page.waitForEvent('load'),pickProfile(page,'ann')]);
   await boot();
-  assert.equal(await page.locator('#trk-profile').inputValue(),'ann');
+  assert.equal(await pickedProfile(page),'ann');
   assert.equal(await page.locator('#trk-instance').inputValue(),'other');
   assert.equal(await page.locator('#trk-instance option').count(),1);
   assert.equal(scopedReads.filter(row=>row.path==='/api/tracker/summary').at(-1).viewAs,'ann');
   assert.match(await page.locator('[data-trk-overview-open="airing:0"]').textContent(),/Other tracker show/);
   await page.reload();
   await boot();
-  assert.equal(await page.locator('#trk-profile').inputValue(),'ann');
-  await Promise.all([page.waitForEvent('load'),choose(page,'#trk-profile','__default__')]);
+  assert.equal(await pickedProfile(page),'ann');
+  await Promise.all([page.waitForEvent('load'),pickProfile(page,'__default__')]);
   await boot();
-  assert.equal(await page.locator('#trk-profile').inputValue(),'__default__');
-  assert.match(await button.textContent(),/Admin \/ Default instances/);
+  assert.equal(await pickedProfile(page),'__default__');
+  assert.equal(await page.evaluate(()=>CW.OverviewProfile.label),'Admin');
   assert.equal(await page.locator('#trk-instance').inputValue(),'default');
   const defaultReads = scopedReads.filter(row=>row.path==='/api/tracker/summary').at(-1);
   assert.equal(defaultReads.instance,'default');
   assert.equal(defaultReads.viewAs,'');
   await page.reload();
   await boot();
-  assert.equal(await page.locator('#trk-profile').inputValue(),'__default__');
+  assert.equal(await pickedProfile(page),'__default__');
   assert.equal(await page.locator('#trk-instance').inputValue(),'default');
-  await Promise.all([page.waitForEvent('load'),choose(page,'#trk-profile','')]);
+  await Promise.all([page.waitForEvent('load'),pickProfile(page,'')]);
   await boot();
-  assert.equal(await page.locator('#trk-profile').inputValue(),'');
+  assert.equal(await pickedProfile(page),'');
   assert.equal(await page.locator('#trk-instance option').count(),2);
   assert.equal(scopedReads.filter(row=>row.path==='/api/tracker/summary').at(-1).viewAs,'');
 });
 
-test('Tracker profile picker respects managed users and an empty profile list', async t => {
+test('Tracker profile scope respects managed users and an empty profile list', async t => {
   const managed = await fixture(t,'flat-dark',{width:390,profiles:pickerProfiles,managed:true});
-  assert.equal(await managed.page.locator('.trk-profile-picker').isVisible(),false);
   assert.equal(await managed.page.locator('#trk-instance').inputValue(),'other');
   assert.equal(await managed.page.evaluate(()=>CW.OverviewProfile.setActive('bob')),false);
   const empty = await fixture(t,'flat-light',{width:390,profiles:[]});
-  assert.equal(await empty.page.locator('#trk-profile').isDisabled(),false);
-  assert.deepEqual(await empty.page.locator('#trk-profile option').allTextContents(),['All profiles','Admin / Default instances']);
-  await Promise.all([empty.page.waitForEvent('load'),choose(empty.page,'#trk-profile','__default__')]);
+  await Promise.all([empty.page.waitForEvent('load'),pickProfile(empty.page,'__default__')]);
   await empty.boot();
-  assert.equal(await empty.page.locator('#trk-profile').inputValue(),'__default__');
+  assert.equal(await pickedProfile(empty.page),'__default__');
   assert.equal(await empty.page.locator('#trk-instance').inputValue(),'default');
 });
 
@@ -1035,7 +1050,7 @@ test('Tracker reloads the selected profile when returning from another page', as
     document.querySelector('#page-tracker').classList.add('hidden');
     CW.OverviewProfile.setActive('ann');
   });
-  assert.equal(await page.locator('#trk-profile').inputValue(),'ann');
+  assert.equal(await pickedProfile(page),'ann');
   await Promise.all([page.waitForEvent('load'),page.evaluate(()=>{
     document.querySelector('#page-tracker').classList.remove('hidden');
     TrackerPage.resume();
@@ -1590,4 +1605,17 @@ test('Tracker Overview prioritizes live playback while Escape closes dialogs and
   await recent.locator('[data-trk-card-menu]').click();
   await page.keyboard.press('Escape');
   assert.equal(await banner.isVisible(),true);
+});
+
+
+test('Tracker overview does not wait for slow statistics on a cold load',async t=>{
+  const {page,boot}=await fixture(t,'flat-dark',{width:390});
+  await page.evaluate(()=>sessionStorage.clear());
+  let release;
+  const gate=new Promise(resolve=>{release=resolve;});t.after(()=>release());
+  await page.route('**/api/tracker/stats?**',async route=>{await gate;await route.fallback();});
+  await page.reload();
+  await boot({wait:false});
+  await page.locator('[data-trk-overview-open="airing:0"]').waitFor();
+  release();
 });

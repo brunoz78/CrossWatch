@@ -47,14 +47,15 @@
 
   const AUTH_GROUPS = Object.freeze([
     { id: "sec-auth-media", title: "Media servers", keys: ["PLEX", "JELLYFIN", "EMBY", "SILO", "TOFA"] },
-    { id: "sec-auth-trackers", title: "Trackers", keys: ["CROSSWATCH", "TRAKT", "SIMKL", "TMDB", "MDBLIST", "PUBLICMETADB", "ANILIST", "MYANIMELIST", "KITSU", "WETRAKR", "PUNCHPLAY", "BINGEBASE", "FLICKLIST", "FLOPPY", "SCROB"] },
+    { id: "sec-auth-trackers", title: "Trackers", keys: ["CROSSWATCH", "TRAKT", "SIMKL", "TMDB", "MDBLIST", "PUBLICMETADB", "ANILIST", "MYANIMELIST", "KITSU", "WETRAKR", "PUNCHPLAY", "BINGEBASE", "FLICKLIST", "MOVIEPARADISE", "FLOPPY", "SCROB"] },
     { id: "sec-auth-clients", title: "Media clients", keys: ["NUVIO", "KODI", "STREMIO"] },
     { id: "sec-auth-others", title: "Others", keys: ["TAUTULLI", "TRACEARR"] },
   ]);
   const AUTH_GROUP_BY_KEY = Object.freeze(Object.fromEntries(AUTH_GROUPS.flatMap((group) => group.keys.map((key) => [key, group.id]))));
-  const META_GROUP = Object.freeze({ id: "sec-auth-metadata", title: "Metadata", keys: ["TMDB_METADATA", "ANIME_MAPPING"] });
+  const META_GROUP = Object.freeze({ id: "sec-auth-metadata", title: "Metadata", keys: ["TMDB_METADATA", "FANART_METADATA", "ANIME_MAPPING"] });
   const META_ITEMS = Object.freeze({
     TMDB_METADATA: { key: "TMDB_METADATA", label: "TMDb Metadata", logoKey: "TMDB", sectionId: "sec-meta-tmdb", provider: "tmdb" },
+    FANART_METADATA: { key: "FANART_METADATA", label: "Fanart.tv Artwork", icon: "photo_library", sectionId: "sec-meta-fanart", provider: "fanart" },
     ANIME_MAPPING: { key: "ANIME_MAPPING", label: "Anime ID Mapping", icon: "shield", sectionId: "sec-meta-anime-mapping", provider: "anime-mapping" },
   });
 
@@ -285,6 +286,7 @@
     if (p === "myanimelist") return hasConfiguredValue(b.access_token) && !b.reauth_required;
     if (p === "wetrakr") return hasConfiguredValue(b.access_token) && !b.reauth_required;
     if (p === "punchplay") return hasConfiguredValue(b.access_token);
+    if (p === "movieparadise") return hasConfiguredValue(b.access_token) && b.auth_error !== "reconnect_required";
     if (p === "bingebase") return hasConfiguredValue(b.access_token) || hasConfiguredValue(b.webhook_url);
     if (p === "flicklist") return hasConfiguredValue(b.api_key) || hasConfiguredValue(b.access_token) || hasConfiguredValue(b.token);
     if (p === "floppy") return hasConfiguredValue(b.server_url || b.server) && hasConfiguredValue(b.api_token || b.token);
@@ -376,13 +378,14 @@
     if (!info) return false;
     if (info.key === "TMDB_METADATA") return !!String(cfg?.tmdb?.api_key || cfg?.metadata?.tmdb_api_key || "").trim();
     if (info.key === "ANIME_MAPPING") return !!cfg?.anime_mapping?.enabled;
+    if (info.key === "FANART_METADATA") return cfg?.fanart?.enabled === true;
     return false;
   }
 
   function metadataStatusFor(key, cfg = getCachedConfig()) {
     const info = metadataProviderInfo(key);
     const on = metadataConfigured(key, cfg);
-    if (info?.key === "ANIME_MAPPING") return on ? { text: "Enabled", ok: true } : { text: "Not enabled", ok: false };
+    if (info?.key === "ANIME_MAPPING" || info?.key === "FANART_METADATA") return on ? { text: "Enabled", ok: true } : { text: "Not enabled", ok: false };
     return on ? { text: "Connected", ok: true } : { text: "Not configured", ok: false };
   }
 
@@ -558,6 +561,36 @@
       });
   }
 
+  function fanartNudgeHtml(cfg) {
+    if (settingsScope() || !metadataConfigured("TMDB_METADATA", cfg)) return "";
+    if (cfg?.fanart?.enabled === true || cfg?.fanart?.nudge_dismissed === true) return "";
+    return `<div class="cw-auth-nudge">
+        <button type="button" class="cw-auth-service-card cw-auth-add-card" data-cw-meta-open="FANART_METADATA">
+          <span class="cw-auth-add-mark"><span class="material-symbols-rounded" aria-hidden="true">auto_awesome</span></span>
+          <span class="cw-auth-service-copy">
+            <strong>Try fanart.tv</strong>
+            <small>Better logos and backgrounds. Optional, no key needed.</small>
+          </span>
+          <span class="material-symbols-rounded cw-auth-chevron" aria-hidden="true">arrow_forward</span>
+        </button>
+        <button type="button" class="cw-auth-nudge-dismiss" data-cw-fanart-nudge-dismiss title="Hide this suggestion" aria-label="Hide this suggestion"><span class="material-symbols-rounded" aria-hidden="true">close</span></button>
+      </div>`;
+  }
+
+  async function dismissFanartNudge() {
+    try {
+      const r = await fetch("/api/fanart/settings", { method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store", credentials: "same-origin", body: JSON.stringify({ nudge_dismissed: true }) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data?.ok) return;
+    } catch {
+      return;
+    }
+    const cfg = getCachedConfig();
+    cfg.fanart = { ...(cfg.fanart || {}), nudge_dismissed: true };
+    const slot = document.getElementById("auth-providers");
+    if (slot) renderAuthCards(slot, cfg);
+  }
+
   function renderAuthCards(slot, cfg = getCachedConfig(), refreshProfiles = false) {
     const { shell } = ensureAuthShell(slot);
     const configured = configuredProviderKeys(cfg);
@@ -649,7 +682,8 @@
       </section>`;
     const serviceSections = sections.map((section) => {
       const addCard = section.cards.length < section.total ? renderAddCard(section) : "";
-      const cards = `${[...section.cards].sort((a, b) => String(a.label || "").localeCompare(String(b.label || ""), undefined, { sensitivity: "base", numeric: true })).map(renderCard).join("")}${addCard}`;
+      const nudge = section.id === META_GROUP.id ? fanartNudgeHtml(cfg) : "";
+      const cards = `${[...section.cards].sort((a, b) => String(a.label || "").localeCompare(String(b.label || ""), undefined, { sensitivity: "base", numeric: true })).map(renderCard).join("")}${nudge}${addCard}`;
       return `<section class="cw-auth-service-section" data-cw-auth-group="${section.id}">
         <div class="cw-auth-service-head">
           <h4>${section.title}</h4>
@@ -840,6 +874,16 @@
       code: ["#punchplay_device_panel"],
       actions: [{ row: ".pp-actions", status: "#punchplay_msg", buttons: "#punchplay_device_start, #punchplay_device_cancel, #punchplay_device_restart" }]
     },
+    MOVIEPARADISE: {
+      provider: "movieparadise", logo: "MOVIEPARADISE", help: window.CW.HelpLinks.url("movieparadise"), deleteSelector: "#movieparadise_disconnect",
+      tabs: { auth: ["lock", "Authentication", "Connect with a device code"] },
+      copy: { auth: ["Movie Paradise Authentication", "Connect Movie Paradise with a device code. CrossWatch ships its own Movie Paradise app id, so no keys are needed."] },
+      journey: ["Connect to Movie Paradise", "Click Connect Movie Paradise and approve the code at movieparadise.app/oauth/device. No API keys are needed - CrossWatch ships its own Movie Paradise app id.", "215,98,143", "139,63,161", "MOVIEPARADISE"],
+      steps: [["1", "Start device login", "CrossWatch shows a short link code"], ["2", "Approve access", "Enter the code at movieparadise.app/oauth/device"], ["3", "Validate account", "CrossWatch confirms Movie Paradise access"]],
+      order: ["#movieparadise_device_panel", ".mp-actions"],
+      code: ["#movieparadise_device_panel"],
+      actions: [{ row: ".mp-actions", status: "#movieparadise_msg", buttons: "#movieparadise_device_start, #movieparadise_device_cancel, #movieparadise_device_restart" }]
+    },
     BINGEBASE: {
       provider: "bingebase", logo: "BINGEBASE", help: window.CW.HelpLinks.url("bingebase"), deleteSelector: "#bingebase_disconnect", allowSaveWithoutConnection: true,
       tabs: { auth: ["lock", "Authentication", "Connect with a device code"] },
@@ -963,6 +1007,16 @@
       labels: { "#tmdb_check": "Connect TMDb" },
       actions: [{ row: ".inline", status: "#tmdb_check_msg", buttons: "#tmdb_check", connectedSelector: "#tmdb_api_key", connectedText: "Connected" }]
     },
+    FANART_METADATA: {
+      provider: "fanart", logo: "FANART", help: window.CW.HelpLinks.url("fanart-metadata"), deleteSelector: "#fanart_delete",
+      tabs: { api: ["key", "API key", "Connect fanart.tv"], settings: ["tune", "Settings", "Choose logos and backgrounds"] },
+      copy: { api: ["Fanart.tv Artwork", "Logos, backgrounds and disc art from fanart.tv."], settings: ["Fanart.tv Settings", "Choose where logos and backgrounds come from."] },
+      journey: ["Connect Fanart.tv", "Use fanart.tv logos, backgrounds and disc art, with TMDb as fallback. No key is needed because CrossWatch has its own project key. Requires TMDb Metadata.", "167,98,255", "255,120,190", "FANART"],
+      steps: [["1", "Add key", "Optional personal fanart.tv key"], ["2", "Connect fanart.tv", "Validate with CrossWatch"], ["3", "Pick art", "Choose logos and backgrounds"]],
+      introSubs: ["api", "settings"],
+      order: [".auth-card"],
+      actions: [{ row: ".inline", status: "#fanart_check_msg", buttons: "#fanart_check" }]
+    },
     ANIME_MAPPING: {
       provider: "anime-mapping", logo: "ANILIST", help: window.CW.HelpLinks.url("anime-mapping"), deleteSelector: "",
       hideNav: true,
@@ -980,6 +1034,12 @@
     const info = CONNECTION_MODAL_INFO[norm];
     return info ? { ...info, key: norm } : null;
   }
+
+  window.CW = window.CW || {};
+  window.CW.connectionBrand = (key) => {
+    const journey = connectionInfoForKey(key)?.journey;
+    return journey ? { c1: journey[2], c2: journey[3] || journey[2] } : null;
+  };
 
   function connectionPanelFor(section, info) {
     if (!section || !info) return null;
@@ -1008,11 +1068,11 @@
     const dialogKicker = root?.querySelector("#cw-auth-dialog-kicker");
     if (dialogTitle) dialogTitle.textContent = data[0];
     if (dialogCopy) dialogCopy.textContent = data[1];
-    if (dialogKicker) dialogKicker.textContent = info?.key === "TMDB_METADATA" || info?.key === "ANIME_MAPPING" ? "Metadata" : "Connection settings";
+    if (dialogKicker) dialogKicker.textContent = META_ITEMS[info?.key] ? "Metadata" : "Connection settings";
   }
 
   function connectionModalSupportsProfiles(info) {
-    return !!info && !["TMDB_METADATA", "ANIME_MAPPING"].includes(info.key);
+    return !!info && !META_ITEMS[info.key];
   }
 
   function connectionModalAllowsCelebration(info) {
@@ -1021,7 +1081,7 @@
 
   function connectionModalConfigured(info, cfg = getCachedConfig()) {
     if (!info) return false;
-    if (info.key === "TMDB_METADATA" || info.key === "ANIME_MAPPING") return metadataConfigured(info.key, cfg);
+    if (META_ITEMS[info.key]) return metadataConfigured(info.key, cfg);
     return configuredProviderKeys(cfg).has(info.key) || statusProviderData(info.key)?.connected === true;
   }
 
@@ -1237,7 +1297,7 @@
   }
 
   function connectionModalCurrentConnected(panel, info, cfg = getCachedConfig()) {
-    if (!info || info.key === "TMDB_METADATA" || info.key === "ANIME_MAPPING") return true;
+    if (!info || META_ITEMS[info.key]) return true;
     if (info.key === "NUVIO") {
       const profileRow = panel?.querySelector("#nuvio_profile_state");
       if (profileRow && !profileRow.classList.contains("hidden") && String(panel?.querySelector("#nuvio_profile_select")?.value || "").trim()) return true;
@@ -1713,7 +1773,7 @@
   function ensureConnectionModalJourney(panel, info) {
     const data = info?.journey;
     if (!data?.length) return;
-    const icon = info?.key === "TMDB_METADATA" || info?.key === "PUBLICMETADB" ? "key" : info?.key === "ANIME_MAPPING" ? "hub" : "link";
+    const icon = info?.key === "TMDB_METADATA" || info?.key === "FANART_METADATA" || info?.key === "PUBLICMETADB" ? "key" : info?.key === "ANIME_MAPPING" ? "hub" : "link";
     connectionIntroPanels(panel, info).forEach((authPanel) => {
       if (!authPanel) return;
       let node = authPanel.querySelector(":scope > .cw-auth-journey");
@@ -1905,6 +1965,7 @@
       if (info.key === "NUVIO") await window.cwAuth?.nuvio?.saveSelectedProfile?.({ silent: true });
       if (info.key === "SILO") await window.cwAuth?.silo?.saveSelectedProfile?.({ silent: true });
       if (info.key === "TOFA") await window.cwAuth?.tofa?.saveSelectedProfile?.({ silent: true });
+      if (info.key === "FANART_METADATA") await window.cwSaveFanartModal?.();
       const ret = window.saveSettings?.();
       if (ret && typeof ret.then === "function") await ret;
       if (btn) flashConnectionResult(btn, true);
@@ -2099,6 +2160,7 @@
       try {
         if (info.key === "TMDB_METADATA") window.cwBuildTmdbPanel?.();
         if (info.key === "ANIME_MAPPING") window.cwBuildAnimeMappingPanel?.();
+        if (info.key === "FANART_METADATA") window.cwBuildFanartPanel?.();
         window.cwMetaProviderEnsure?.();
       } catch {}
       section = document.getElementById(info.sectionId);
@@ -2129,6 +2191,9 @@
       try { window.cwAnimeMappingRefreshStatus?.(); } catch {}
     }
     enhanceConnectionModal(section, overlay, info.key);
+    if (info.key === "FANART_METADATA") {
+      try { await window.cwRefreshFanartState?.(); } catch {}
+    }
     if (info.key === "TMDB_METADATA") {
       try { window.cwRefreshTmdbMetadataState?.(); } catch {}
     }
@@ -2197,6 +2262,11 @@
         overlay.dataset.cwPickerCategory = category.dataset.cwPickerCategory;
         renderAuthPicker(overlay, getCachedConfig(), overlay.dataset.cwPickerMode);
         overlay.querySelector(".cw-auth-picker-results").scrollTop = 0;
+        return;
+      }
+      if (target?.closest?.("[data-cw-fanart-nudge-dismiss]")) {
+        event.preventDefault();
+        void dismissFanartNudge();
         return;
       }
       const emptyAdd = target?.closest?.("[data-cw-auth-empty-add]");

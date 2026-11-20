@@ -7,6 +7,8 @@ import re
 from dataclasses import asdict, replace
 from uuid import uuid4
 
+import requests
+
 from cw_platform.interactive_reads import read_once, use_review_reads
 from cw_platform.provider_instances import build_provider_config_view, normalize_instance_id
 from cw_platform.run_control import raise_if_cancelled
@@ -16,6 +18,10 @@ from cw_platform.status_mapping import (
 )
 from cw_platform.status_mapping_store import StatusStore, decode_item, decode_observation, encode_observation
 from providers.sync._status_mapping import NativeStatusAdapter, adapter_class
+
+
+class _SkippedStatusRead(RuntimeError):
+    pass
 
 
 def _read_status(adapter):
@@ -28,8 +34,24 @@ def _read_status(adapter):
                 raise
 
 
+def _read_status_for_plan(adapter):
+    try:
+        return _read_status(adapter)
+    except Exception as exc:
+        if not _transient_read_failure(exc):
+            raise
+        return _SkippedStatusRead(_read_skip_reason(exc))
+
+
 def _skipped_code(record):
     return record.raw.get("_cw_skipped") if isinstance(record.raw, dict) else None
+
+
+def _status_included(config, record, direction):
+    if record.observation.status is None:
+        return True
+    rule = config.rule(direction, record.media, record.observation.status)
+    return rule is not None and rule.include
 
 
 class _FreshReads:
@@ -99,6 +121,69 @@ def publish_status(ctx, pair, event, **values):
     if review is not None:
         review.status_mappings = [row for row in review.status_mappings if row["pair_id"] != summary["pair_id"]] + [summary]
     ctx.emit("status_mapping:" + event, **summary)
+
+
+_TRANSPORT_ERRORS = (requests.Timeout, requests.ConnectionError, TimeoutError, ConnectionError)
+
+
+def _causes(exc):
+    seen = set()
+    while isinstance(exc, BaseException) and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__
+
+
+def _http_status(exc):
+    for error in _causes(exc):
+        status = getattr(error, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            return status
+        if isinstance(error, requests.HTTPError):
+            status = getattr(error.response, "status_code", None)
+            if type(status) is int:
+                return status
+        match = re.fullmatch(r"[a-z]{2,20}_status(?:_[a-z]{2,20}){0,5}_http_(\d{3})", str(error))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _transport_error(exc):
+    return next((error for error in _causes(exc) if isinstance(error, _TRANSPORT_ERRORS)), None)
+
+
+def _transient_read_failure(exc):
+    if _transport_error(exc) is not None:
+        return True
+    status = _http_status(exc)
+    if status is None or re.search(r"_status_write_http_\d{3}$", str(exc)):
+        return False
+    return status in (404, 408, 429) or 500 <= status <= 599
+
+
+_HTTP_HINTS = {400: "request rejected", 401: "login rejected", 403: "access denied", 404: "not found", 408: "request timed out", 429: "rate limited"}
+
+
+def _failure_detail(exc):
+    transport = _transport_error(exc)
+    if isinstance(transport, (requests.Timeout, TimeoutError)):
+        return "no response in time"
+    if transport is not None:
+        return "could not connect"
+    code = _http_status(exc)
+    if code is None:
+        return ""
+    hint = _HTTP_HINTS.get(code) or ("server error" if code >= 500 else "")
+    endpoint = next((value for value in (getattr(error, "endpoint", None) for error in _causes(exc)) if isinstance(value, str)), None)
+    where = f" on {endpoint}" if isinstance(endpoint, str) and re.fullmatch(r"[a-z][a-z0-9/_-]{0,80}", endpoint) else ""
+    return f"HTTP {code}{where}" + (f", {hint}" if hint else "")
+
+
+def _read_skip_reason(exc):
+    prefix = re.match(r"([a-z]{2,20})_status_", str(exc))
+    provider = prefix.group(1).upper() if prefix else "The provider"
+    return f"{provider} did not respond correctly ({_failure_detail(exc)}). Status mapping retries on the next sync."
 
 
 def report_skipped(ctx, pair, reason):
@@ -208,7 +293,9 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                     if instances:
                         view[endpoint.provider] = {**view[endpoint.provider], "instances": instances}
                     adapter = (adapter_overrides or {}).get(endpoint) or cls(view)
-                    read = read_once(["status_mapping", asdict(endpoint)], lambda adapter=adapter: _read_status(adapter), scoped=False)
+                    read = read_once(["status_mapping", asdict(endpoint)], lambda adapter=adapter: _read_status_for_plan(adapter), scoped=False)
+                    if isinstance(read, _SkippedStatusRead):
+                        raise read
                     snapshots[endpoint], unidentified[endpoint] = read if isinstance(read, tuple) else (read, [])
                     adapters[endpoint] = adapter
             left, right = dict(snapshots[scope.a]), dict(snapshots[scope.b])
@@ -229,8 +316,10 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                     report(pair, f"{len(unidentified[endpoint])} {endpoint.provider.upper()} status entries without a usable ID were skipped ({unidentified[endpoint][0]}).")
             matched = list(matched_records(left, right, allow_mapping=allow_mapping))
             paired = {id(record) for match in matched for record in match}
-            missing = sum(1 for side in ((left, right) if scope.two_way else (left,)) for record in side.values()
+            source_sides = ((left, Direction.FORWARD), (right, Direction.REVERSE)) if scope.two_way else ((left, Direction.FORWARD),)
+            missing = sum(1 for side, direction in source_sides for record in side.values()
                           if id(record) not in paired and record.observation.state != ReadState.ABSENT and not _skipped_code(record)
+                          and _status_included(config, record, direction)
                           and not (record.observation.state == ReadState.UNKNOWN and record.observation.native_status in UNTRACKED_STATES))
             summary.update(source_count=len(snapshots[scope.a]), destination_count=len(snapshots[scope.b]), matched=len(matched), unmatched=missing)
             publish_status(ctx, pair, "read", **summary)
@@ -319,6 +408,8 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                     elif decision.reason == "rewatch_state_preserved":
                         rewatching = scope.a if decision.direction == Direction.REVERSE else scope.b
                         report(pair, f"Skipped, being rewatched on {rewatching.provider.upper()}, status left unchanged", item=a.item)
+                    elif decision.reason == "completed_destination_preserved" and not pending:
+                        summary["excluded"] += 1
                     elif decision.reason not in {"excluded", "source_absent", "watchlist_managed", "caught_up"}:
                         report(pair, decision.reason.replace("_", " "), item=a.item)
                     else:
@@ -327,8 +418,18 @@ def _run_status_mappings(ctx, pairs, cfg, health_map, *, store, adapter_override
                 proposals.append((pair, config, item, a, b, decision, state))
         except Exception as exc:
             code = str(exc)
+            if isinstance(exc, _SkippedStatusRead) or _transient_read_failure(exc):
+                totals["skipped"] += 1
+                summaries.pop(pair.get("id"), None)
+                proposals[:] = [proposal for proposal in proposals if proposal[0] is not pair]
+                skip = str(exc) if isinstance(exc, _SkippedStatusRead) else _read_skip_reason(exc)
+                publish_status(ctx, pair, "skip", state="skipped", reason=skip)
+                if callable(getattr(ctx, "emit_info", None)):
+                    ctx.emit_info(f"[!] Status mapping skipped for {pair.get('source')} and {pair.get('target')}: {skip}")
+                continue
             reason = code if re.fullmatch(r"[a-z]{2,20}_status(?:_[a-z]{2,20}){1,5}(?:_http_\d{3})?", code) else type(exc).__name__
-            report(pair, f"Status read or planning failed ({reason}). Refresh before retrying.", error=True)
+            detail = _failure_detail(exc)
+            report(pair, f"Status read or planning failed ({reason}{'; ' + detail if detail else ''}). Refresh before retrying.", error=True)
 
     before_reads = _FreshReads(adapters)
     written = []

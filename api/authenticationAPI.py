@@ -2534,6 +2534,85 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
             _safe_log(log_fn, "PUNCHPLAY", f"[PUNCHPLAY] ERROR disconnect: {e}")
             return {"ok": False, "error": "internal"}
 
+    @app.post("/api/movieparadise/device/start", tags=["auth"])
+    def api_movieparadise_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().start_device_code("movieparadise", cfg, instance_id=inst)
+            if isinstance(probe_cache, dict):
+                probe_cache["movieparadise"] = (0.0, False)
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] device start instance={inst} ok={bool(res.get('ok'))}")
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] ERROR device start: {type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/movieparadise/device/poll", tags=["auth"])
+    def api_movieparadise_device_poll(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().poll_device_code("movieparadise", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["movieparadise"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] ERROR device poll: {type(e).__name__}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.post("/api/movieparadise/device/cancel", tags=["auth"])
+    def api_movieparadise_device_cancel(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            from providers.auth import _auth_MOVIEPARADISE as movieparadise_auth
+
+            return movieparadise_auth.cancel_device_code(load_config(), instance_id=inst)
+        except Exception as e:
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] ERROR device cancel: {type(e).__name__}")
+            return {"ok": False, "error": "internal", "instance": inst}
+
+    @app.post("/api/movieparadise/refresh", tags=["auth"])
+    def api_movieparadise_refresh(instance: str | None = Query(None)) -> dict[str, Any]:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            res = _provider_auth().refresh_token("movieparadise", cfg, instance_id=inst)
+            if res.get("ok") and isinstance(probe_cache, dict):
+                probe_cache["movieparadise"] = (0.0, False)
+            return res
+        except Exception as e:
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] ERROR refresh: {type(e).__name__}")
+            return {"ok": False, "status": "internal", "instance": inst}
+
+    @app.get("/api/movieparadise/status", tags=["auth"])
+    def api_movieparadise_status(instance: str | None = Query(None)) -> dict[str, Any]:
+        cfg = load_config()
+        inst = normalize_instance_id(instance)
+        p = ensure_instance_block(cfg, "movieparadise", inst)
+        out = _provider_auth().status_for_block("movieparadise", p)
+        out["instance"] = inst
+        return out
+
+    @app.post("/api/movieparadise/disconnect", tags=["auth"])
+    def api_movieparadise_disconnect(instance: str | None = Query(None)) -> Any:
+        inst = normalize_instance_id(instance)
+        try:
+            cfg = load_config()
+            conflict = usage_conflict_response(cfg, "movieparadise", inst)
+            if conflict is not None:
+                return conflict
+            from providers.auth import _auth_MOVIEPARADISE as movieparadise_auth
+
+            movieparadise_auth.PROVIDER.disconnect(cfg, instance_id=inst)
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] disconnected instance={inst}")
+            if isinstance(probe_cache, dict):
+                probe_cache["movieparadise"] = (0.0, False)
+            return {"ok": True, "instance": inst}
+        except Exception as e:
+            _safe_log(log_fn, "MOVIEPARADISE", f"[MOVIEPARADISE] ERROR disconnect: {type(e).__name__}")
+            return {"ok": False, "error": "internal"}
+
     @app.post("/api/bingebase/device/start", tags=["auth"])
     def api_bingebase_device_start(payload: dict[str, Any] = Body(default_factory=dict), instance: str | None = Query(None)) -> dict[str, Any]:
         inst = normalize_instance_id(instance)
@@ -3280,10 +3359,22 @@ def register_auth(app, *, log_fn: Optional[Callable[[str, str], None]] = None, p
         try:
             cfg = load_config()
             own = str(provider_block(cfg, inst).get("profile_id") or "")
-            rows = _tofa_client(cfg, inst).list_profiles()
+            client = _tofa_client(cfg, inst)
+            rows = client.list_profiles()
             users = [{"id": p["id"], "username": p["name"], "has_pin": p["has_pin"], "is_child": p["is_child"], "is_primary": p["is_primary"],
                       "connected": p["id"] == own} for p in rows]
-            return {"ok": True, "instance": inst, "users": users}
+            shared_error = ""
+            try:
+                guests = client.shared_profiles()
+            except Exception as e:
+                guests, shared_error = [], _tofa_error(e)
+                _safe_log(log_fn, "TOFA", f"[TOFA] shared users failed reason={shared_error} instance={inst}")
+            users.extend({"id": p["id"], "username": p["username"], "has_pin": False, "is_child": p["is_child"], "is_primary": p["is_primary"],
+                          "connected": False, "shared": True, "user_id": p["user_id"]} for p in guests)
+            out = {"ok": True, "instance": inst, "users": users}
+            if shared_error:
+                out["shared_error"] = shared_error
+            return out
         except Exception as e:
             _safe_log(log_fn, "TOFA", f"[TOFA] users failed reason={_tofa_error(e)} instance={inst}")
             return {"ok": False, "error": _tofa_error(e), "instance": inst, "users": []}

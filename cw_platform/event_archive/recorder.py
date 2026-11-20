@@ -14,7 +14,8 @@ from typing import Any
 
 from cw_platform.provider_instances import normalize_instance_id
 from cw_platform.matching_details import match_details
-from cw_platform.reason_labels import reason_hint
+from cw_platform.reason_labels import reason_hint, reason_message
+from cw_platform.history_events import history_sync_key
 
 from .db import get_conn
 from .run_scope import pair_id_from_scope, record_run_pairs, scope_key as _scope_key
@@ -327,7 +328,7 @@ class RunRecorder:
                 self._pair_stats = {}
             record_run_finished(
                 self._run_id,
-                status="done",
+                status="cancelled" if f.get("cancelled") else "done",
                 pairs=int(f.get("pairs") or 0),
                 summary={k: f.get(k) for k in ("added", "removed", "updated", "unresolved", "blocked", "errors")},
                 conn=self._conn,
@@ -379,6 +380,20 @@ class RunRecorder:
                 destination_instance=self._di or None,
                 detail={k: f.get(k) for k in ("adds", "removes", "updates", "src_count", "dst_count")},
             )
+            self._flush()
+            return
+
+        if event == "history:skipped":
+            src, si, dst, di = self._destination_route(f.get("provider"), f.get("destination_instance"))
+            reason = str(f.get("reason") or "")
+            for item in f.get("items") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                self._add(event_type="write_skipped", operation=str(f.get("op") or "add"),
+                          source_provider=src or None, destination_provider=dst or None,
+                          source_instance=si or None, destination_instance=di or None,
+                          item_key=history_sync_key(item, event_mode=True), reason_code=reason,
+                          reason=reason_message(reason) or reason, **_item_fields(item))
             self._flush()
             return
 
@@ -490,6 +505,26 @@ class RunRecorder:
             if failed:
                 self._add(event_type="write_failed", severity="error", reason_code="tag_dropped_failed",
                           reason=str(f.get("error") or "tag_dropped_failed"), **route)
+            self._flush()
+            return
+
+        if event == "continue_watching:hidden":
+            src, si, dst, di = self._destination_route(f.get("dst"), f.get("destination_instance"))
+            failed = int(f.get("errors") or 0)
+            route = dict(
+                operation="hide_continue_watching", source_provider=src or None, destination_provider=dst or None,
+                source_instance=si or None, destination_instance=di or None,
+            )
+            titles = [str(title) for title in _as_list(f.get("items")) if str(title or "").strip()]
+            self._add(
+                event_type="write_attempted", severity="warn" if failed else "info",
+                reason_code="errors" if failed else None, **route,
+                detail=_fit_titles({"attempted": int(f.get("attempted") or 0), "hidden": int(f.get("confirmed") or 0),
+                                    "failed": failed}, titles),
+            )
+            if failed:
+                self._add(event_type="write_failed", severity="error", reason_code="hide_continue_watching_failed",
+                          reason=str(f.get("error") or "hide_continue_watching_failed"), **route)
             self._flush()
             return
 

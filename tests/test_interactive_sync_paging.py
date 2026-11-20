@@ -42,7 +42,8 @@ def test_fifty_thousand_rows_have_bounded_responses_and_server_selection(api_cli
     assert len(response.content) < 2000
     captured = []
 
-    def launch(current, task, cfg, chosen, **kwargs):
+    def launch(current, task, cfg, chosen, confirm_dry_run, **kwargs):
+        assert not confirm_dry_run
         captured.append(chosen)
 
     monkeypatch.setattr(api, "launch", launch)
@@ -52,6 +53,30 @@ def test_fifty_thousand_rows_have_bounded_responses_and_server_selection(api_cli
     assert not captured[0] & {row["id"] for row in filtered["items"]}
     print(json.dumps(dict(rows=50000, build_seconds=round(build_seconds, 3), two_pages_seconds=round(page_seconds, 3),
                          status_bytes=len(status.content), last_page_bytes=len(last_response.content), sqlite_bytes=session.store.path.stat().st_size)))
+
+
+@pytest.mark.parametrize("actionable", [0, 1])
+def test_unknown_date_skips_remain_visible_across_review_pages(actionable):
+    from cw_platform.history_dates import unknown_watch
+
+    store = ReviewStore()
+    try:
+        plan = InteractivePlan(rows=store.rows, copy_rows=False)
+        skipped = [(unknown_watch(item(i)), "unknown_watch_date_unsupported") for i in range(150)]
+        plan.excluded("history", "DST", "default", "add", skipped, result="skipped", source="SRC")
+        if actionable:
+            plan.filter("history", "DST", "default", "add", [item(150, watched_at="2026-09-01T12:00:00Z")], source="SRC")
+        store.finish()
+        assert store.counts["changes"] == store.counts["selected"] == actionable
+        assert store.counts["skipped"] == 150
+        pages = [store.page(offset=offset) for offset in range(0, 150 + actionable, 75)]
+        assert all(page["total"] == 150 + actionable for page in pages)
+        rows = [row for page in pages for row in page["items"]]
+        assert len({row["id"] for row in rows}) == 150 + actionable
+        assert all(not row["selectable"] and not row["selected"] for row in rows if row["result"] == "skipped")
+        assert store.page(result="skipped")["total"] == 150
+    finally:
+        store.close()
 
 
 def test_mapping_rows_filter_selection_before_paging(api_client):
@@ -150,6 +175,25 @@ def test_recheck_diagnostics_identify_changed_fields_without_item_payloads():
         assert "Movie 1" not in json.dumps(details)
         assert "watched_at" not in json.dumps(details)
         assert old.selected_ids()
+    finally:
+        old.close()
+        new.close()
+
+
+def test_full_refresh_selects_new_changes_and_keeps_existing_deselections():
+    old, new = ReviewStore(), ReviewStore()
+    try:
+        before = InteractivePlan(rows=old.rows, copy_rows=False)
+        before.filter("history", "DST", "default", "add", [item(1), item(2)])
+        old.finish()
+        old.select(False, q="Movie 2")
+        after = InteractivePlan(rows=new.rows, copy_rows=False)
+        after.filter("history", "DST", "default", "add", [item(1), item(2), item(3)])
+        new.rows["retry"] = dict(id="retry", feature="history", result="unresolved", selectable=True, item=item(4))
+        new.rows["blocked"] = dict(id="blocked", feature="history", result="blocked", selectable=False, item=item(5))
+        new.finish(old, select_new=True)
+        selected = {row["item"]["title"] for row in new.page()["items"] if row["selected"]}
+        assert selected == {"Movie 1", "Movie 3"}
     finally:
         old.close()
         new.close()

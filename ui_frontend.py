@@ -227,7 +227,7 @@ _SETTINGS_PANE_STARTS: tuple[tuple[str, str], ...] = (
     ("scheduling", '        <section class="cw-settings-pane" data-pane="scheduling">'),
     ("scrobbler", '        <section class="cw-settings-pane" data-pane="scrobbler">'),
     ("app", '        <section class="cw-settings-pane cw-app-settings-pane" data-pane="app">'),
-    ("maintenance", '        <section class="cw-settings-pane" data-pane="maintenance">'),
+    ("maintenance", '        <section class="cw-settings-pane cw-page-maintenance" data-pane="maintenance">'),
 )
 _SETTINGS_LEFT_END = "      </div>\n    </div>\n  </section>\n\n\n</main>"
 _MANAGED_SETTINGS_PANES = (("connections", "providers"), ("pairs", "sync"), ("schedule", "scheduling"), ("scrobbler", "scrobbler"))
@@ -297,9 +297,43 @@ def _assert_admin_shell_stripped(html: str, *, settings_panes: set[str] | None =
 
 def _profile_nav_tab(label: str, href: str, active: bool = False) -> str:
     cls = "tab active" if active else "tab"
-    route = {"Main": "main", "Hub": "profile", "Captures": "snapshots", "Playlists": "playlists", "Tracker": "tracker", "Editor": "editor"}.get(label)
+    route = {"Main": "main", "Hub": "profile", "Captures": "snapshots", "Playlists": "playlists", "Tracker": "tracker"}.get(label)
     tab_id = f' id="tab-{route}"' if route else ""
     return f"<button{tab_id} class=\"{cls}\" type=\"button\" onclick=\"location.href='{href}'\">{label}</button>"
+
+
+_TOOLS_MENU_ITEMS: tuple[tuple[str, str, str, int], ...] = (
+    ("events", "history", "Events", 0),
+    ("logs", "receipt_long", "Logs", 0),
+    ("editor", "edit_note", "Editor", 1),
+    ("analyzer", "monitoring", "Analyzer", 1),
+    ("import_export", "import_export", "Import / Export", 1),
+    ("backups", "backup", "Backup & Restore", 2),
+)
+
+
+def _tools_menu(*, maintenance: bool = True, href_prefix: str = "") -> str:
+    items: list[str] = []
+    group: int | None = None
+    for route, icon, label, item_group in _TOOLS_MENU_ITEMS:
+        if route == "backups" and not maintenance:
+            continue
+        if group is not None and item_group != group:
+            items.append('<div class="cw-menu-sep" role="separator" aria-hidden="true"></div>')
+        group = item_group
+        items.append(
+            f'<button id="tab-{route}" class="cw-menu-item" type="button" role="menuitem" onclick="window.cwToolsMenuSelect(\'{route}\')">'
+            f'<span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">{icon}</span><span>{label}</span></button>'
+        )
+    prefix = f' data-href-prefix="{html_lib.escape(href_prefix, quote=True)}"' if href_prefix else ""
+    return (
+        '<div class="cw-tabmenu" id="tab-tools-menu">'
+        '<button id="tab-tools" class="tab" type="button" aria-haspopup="menu" aria-expanded="false" onclick="window.cwToggleToolsMenu(event)">'
+        '<span>Tools</span><span class="tab-caret" aria-hidden="true"></span></button>'
+        f'<div class="cw-menu hidden" id="cw-tools-menu" role="menu" aria-labelledby="tab-tools"{prefix}>'
+        + "".join(items)
+        + "</div></div>"
+    )
 
 
 def _profile_bulk_bar(bar_id: str, scope: str) -> str:
@@ -528,24 +562,15 @@ def _profile_playback_panel() -> str:
         </div>
       </form>
     </dialog>
-    <dialog id="profile-playback-providers" class="cw-tl-dialog cw-tl-dialog--wide" aria-labelledby="profile-playback-providers-title">
-      <form method="dialog" class="cw-tl-dialog-body">
-        <div class="cw-tl-dialog-head">
-          <span class="material-symbols-rounded" aria-hidden="true">tune</span>
-          <span><strong id="profile-playback-providers-title">Playback providers</strong><small>Choose which provider profiles show up here</small></span>
+    <dialog id="profile-playback-providers" class="cw-page-playback-settings" aria-labelledby="profile-playback-providers-title">
+      <form method="dialog" class="cw-page-preferences">
+        <header class="pf-head"><div><h2 id="profile-playback-providers-title">Playback settings</h2><p>Choose the instances shown in playback.</p></div><button class="pf-button" type="button" data-playback-dialog-cancel>Close</button></header>
+        <div class="pf-body">
+          <label class="pf-grouping"><span><strong>Group matching playback</strong><small id="profile-playback-grouping-help">Matching media in the same profile, with similar progress.</small></span><select id="profile-playback-grouping" class="cw-page-input" aria-describedby="profile-playback-grouping-help"><option value="automatic">Automatic</option><option value="separate">Separate instances</option></select></label>
+          <section class="pf-section"><h3>Included instances</h3><div id="profile-playback-provider-list" class="pf-provider-list"></div></section>
+          <details class="pf-advanced"><summary>Advanced</summary><label class="pf-timeout"><span><strong>Provider timeout</strong><small>Skip providers that take longer to respond.</small></span><span class="pf-timeout-value"><input id="profile-playback-timeout" class="cw-page-input" type="number" min="3" max="60" step="1" aria-label="Timeout in seconds"><span>sec</span></span></label></details>
         </div>
-        <label class="cw-play-timeout">
-          <span><strong>Slow provider timeout</strong><small>Skip providers that take longer than this</small></span>
-          <span class="cw-play-edit-value"><input id="profile-playback-timeout" type="number" min="3" max="60" step="1" aria-label="Timeout in seconds"><span>sec</span></span>
-        </label>
-        <div id="profile-playback-provider-list" class="cw-play-provider-list"></div>
-        <div id="profile-playback-providers-error" class="cw-tl-dialog-error" role="alert"></div>
-        <div class="cw-tl-dialog-actions">
-          <button class="cw-tl-ghost" type="button" data-playback-settings-reset>Reset</button>
-          <span class="cw-tl-spacer"></span>
-          <button class="cw-tl-ghost" type="button" data-playback-dialog-cancel>Cancel</button>
-          <button class="cw-tl-primary" type="submit">Apply</button>
-        </div>
+        <footer class="pf-footer"><div id="profile-playback-providers-error" class="pf-error" role="alert"></div><button class="pf-button pf-reset" type="button" data-playback-settings-reset>Reset defaults</button><div class="pf-actions"><button class="pf-button" type="button" data-playback-dialog-cancel>Cancel</button><button class="pf-button primary" type="submit">Apply</button></div></footer>
       </form>
     </dialog>
   </section>"""
@@ -588,13 +613,9 @@ def _profile_menu_items(user: dict | None = None) -> str:
     user = user or {}
     name = html_lib.escape(str(user.get("display_name") or user.get("label") or user.get("username") or "Profile"))
     username = html_lib.escape(str(user.get("username") or ""))
-    preferences = ""
-    if user.get("is_admin") or _managed_user_permissions(user).get("write"):
-        preferences = '<button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="preferences"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">tune</span><span>Preferences</span></button>'
     return f"""<div class="cw-account-identity"><strong>{name}</strong><span>@{username}</span></div>
         <div data-cw-account-panel="main">
           <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="account"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">person</span><span>My profile</span></button>
-          {preferences}
           <button class="cw-menu-item" type="button" role="menuitem" data-cw-account-view="help"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help &amp; About</span></button>
           <div class="cw-menu-sep" role="separator"></div>
           <button class="cw-menu-item danger" type="button" role="menuitem" data-cw-profile-menu-action="logout"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">logout</span><span>Log out</span></button>
@@ -603,8 +624,7 @@ def _profile_menu_items(user: dict | None = None) -> str:
           <button class="cw-menu-item" type="button" role="menuitem" data-cw-account-view="main"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">arrow_back</span><span>Back</span></button>
           <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="help"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">help</span><span>Help</span></button>
           <button class="cw-menu-item" type="button" role="menuitem" data-cw-profile-menu-action="about"><span class="material-symbols-rounded cw-menu-icon" aria-hidden="true">info</span><span>About CrossWatch</span></button>
-        </div>
-        <div class="cw-account-version">__CW_CURRENT_VERSION__</div>"""
+        </div>"""
 
 
 def _nav_profile_link(user: dict | None = None) -> str:
@@ -621,6 +641,7 @@ __CW_NAV_PROFILE_ITEMS__
 
 def _managed_user_shell(html: str, user: dict | None = None) -> str:
     html = html.replace('  <section id="page-maintenance" class="card hidden tab-page"></section>\n\n', "")
+    html = html.replace('  <section id="page-backups" class="hidden tab-page cw-page-backups" aria-labelledby="br-title"></section>\n\n', "")
     tracker = _managed_tracker_allowed(user)
     if not tracker:
         html = html.replace('  <section id="page-tracker" class="card hidden tab-page cw-themed-page"></section>\n\n', "")
@@ -636,7 +657,7 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
             _profile_nav_tab("Hub", "/profile#overview"),
             '    <button id="tab-snapshots" class="tab" type="button" onclick="showTab(\'snapshots\')">Captures</button>',
             '    <button id="tab-playlists" class="tab" type="button" onclick="showTab(\'playlists\')">Playlists</button>',
-            '    <button id="tab-editor" class="tab" type="button" onclick="showTab(\'editor\')">Editor</button>',
+            "    " + _tools_menu(maintenance=False),
             *(['    <button id="tab-settings" class="tab" type="button" onclick="showTab(\'settings\')">Settings</button>'] if settings_panes else []),
             _nav_profile_link(user),
         ]
@@ -661,7 +682,6 @@ def _managed_user_shell(html: str, user: dict | None = None) -> str:
         )
         html = html.replace('    <button id="tab-snapshots" class="tab" type="button" onclick="showTab(\'snapshots\')">Captures</button>\n', "")
         html = html.replace('    <button id="tab-playlists" class="tab" type="button" onclick="showTab(\'playlists\')">Playlists</button>\n', "")
-        html = html.replace('    <button id="tab-editor" class="tab" type="button" onclick="showTab(\'editor\')">Editor</button>\n', "")
         for fragment in (
             '  <section id="page-snapshots" class="card hidden tab-page cw-themed-page"></section>\n\n',
             '  <section id="page-capture_compare" class="card hidden tab-page"></section>\n\n',
@@ -732,6 +752,7 @@ def _asset_block(include_admin: bool = True, user: dict | None = None) -> str:
     ) if include_admin else (('<script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>',) if full_user else ())
     return "\n".join((
         '<script src="/assets/helpers/dialog-focus.js?v=__CW_VERSION__" defer></script>',
+        '<script src="/assets/helpers/clipboard.js?v=__CW_VERSION__" defer></script>',
         helper_tags,
         '<script src="/assets/crosswatch.js?v=__CW_VERSION__" defer></script>',
         app_tags,
@@ -790,6 +811,7 @@ def _get_index_html_static() -> str:
     logs: "Logs",
     import_export: "Import / Export",
     maintenance: "Maintenance tools",
+    backups: "Backup & Restore",
     interactive_sync: "Interactive Sync",
     settings: "Settings",
   };
@@ -879,7 +901,7 @@ def _get_index_html_static() -> str:
       window.location.replace("/profile#watchlist");
       return;
     }
-    const tabs = new Set(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "settings"]);
+    const tabs = new Set(["snapshots", "capture_compare", "playlists", "editor", "analyzer", "events", "logs", "import_export", "interactive_sync", "maintenance", "backups", "settings"]);
     let tab = tabs.has(route) ? route : "main";
     document.documentElement.dataset.cwInitialTab = tab;
     document.documentElement.dataset.tab = tab;
@@ -922,6 +944,7 @@ html[data-cw-initial-tab="tracker"] #page-tracker,
 html[data-cw-initial-tab="editor"] #page-editor,
 html[data-cw-initial-tab="analyzer"] #page-analyzer,
 html[data-cw-initial-tab="maintenance"] #page-maintenance,
+html[data-cw-initial-tab="backups"] #page-backups,
 html[data-cw-initial-tab="events"] #page-events,
 html[data-cw-initial-tab="logs"] #page-logs,
 html[data-cw-initial-tab="import_export"] #page-import_export,
@@ -977,7 +1000,7 @@ html[data-cw-initial-tab="settings"] #page-settings{display:block!important}
     <button id="tab-profile" class="tab" type="button" onclick="location.href='/profile#overview'">Hub</button>
     <button id="tab-snapshots" class="tab" type="button" onclick="showTab('snapshots')">Captures</button>
     <button id="tab-playlists" class="tab" type="button" onclick="showTab('playlists')">Playlists</button>
-    <button id="tab-editor" class="tab" type="button" onclick="showTab('editor')">Editor</button>
+    __CW_TOOLS_MENU__
     <div class="cw-tabmenu" id="tab-settings-menu">
       <button id="tab-settings" class="tab" type="button"
               aria-haspopup="menu" aria-expanded="false"
@@ -1048,7 +1071,7 @@ __CW_NAV_PROFILE_MENU__
         <div class="cw-menu cw-sync-menu hidden" id="cw-sync-menu" role="menu" aria-labelledby="run-menu"></div>
       </div>
         <button id="btn-details" class="btn cw-hub-action" onclick="toggleDetails()" title="Show the sync results and stats" aria-label="Show the latest sync results and stats"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">description</span><span>View details</span></button>
-        <button class="btn cw-hub-action" onclick="openAnalyzer()" title="Finds missing, unresolved or inconsistent sync items" aria-label="Finds missing, unresolved or inconsistent sync items between providers"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">monitoring</span><span>Analyzer</span></button>
+        <button class="btn cw-hub-action cw-hub-tools-start" onclick="openAnalyzer()" title="Finds missing, unresolved or inconsistent sync items" aria-label="Finds missing, unresolved or inconsistent sync items between providers"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">monitoring</span><span>Analyzer</span></button>
         <button class="btn cw-hub-action" onclick="openEvents()" title="View sync events" aria-label="View sync events"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">history</span><span>Events</span></button>
         <button class="btn cw-hub-action" onclick="openExporter()" title="Import or export watchlist, history and ratings data" aria-label="Import or export watchlist, history and ratings data"><span class="material-symbols-rounded cw-action-icon" aria-hidden="true">import_export</span><span>Import / Export</span></button>
       </div>
@@ -1119,9 +1142,6 @@ __CW_NAV_PROFILE_MENU__
       </div>
       <div class="cw-stats-head-side">
         <button id="stats-calendar-open" class="cw-stats-calendar-btn" type="button" onclick="window.openStatisticsModal?.()" title="Sync activity calendar" aria-label="Open sync activity calendar"><span class="material-symbols-rounded" aria-hidden="true">calendar_month</span></button>
-        <div id="cw-view-as" class="cw-view-as hidden">
-          <select id="cw-view-as-select" aria-label="View data as profile"></select>
-        </div>
       </div>
     </div>
 
@@ -1254,6 +1274,8 @@ __CW_NAV_PROFILE_MENU__
   <section id="page-analyzer" class="card hidden tab-page"></section>
 
   <section id="page-maintenance" class="card hidden tab-page"></section>
+
+  <section id="page-backups" class="hidden tab-page cw-page-backups" aria-labelledby="br-title"></section>
 
   <section id="page-events" class="card hidden tab-page"></section>
 
@@ -2227,84 +2249,34 @@ __CW_NAV_PROFILE_MENU__
           </div>
         </section>
 
-        <section class="cw-settings-pane" data-pane="maintenance">
-          <div class="cw-settings-pane-head cw-maint-hero">
-            <div>
-              <div class="cw-settings-pane-kicker">Maintenance</div>
-              <h3>Maintenance zone, Debug and Restart</h3>
-              <p>Use these actions to reset CrossWatch states. They are safe but cannot be undone.</p>
+        <section class="cw-settings-pane cw-page-maintenance" data-pane="maintenance">
+          <header class="mt-page-head"><h3>Maintenance</h3><p>Cleanup and diagnostics.</p></header>
+          <div id="sec-troubleshoot" data-accordion="off">
+            <section class="cw-page-panel mt-debug">
+              <div><h4>Debug logging</h4><p>Choose the detail included in logs.</p></div>
+              <label class="mt-field" for="debug"><span>Level</span>
+                <select id="debug" name="debug" class="cw-page-input">
+                  <option value="off">Off</option><option value="on">Standard</option>
+                  <option value="mods">Include provider debug</option><option value="full">Full debug (requires restart)</option>
+                </select>
+              </label>
+            </section>
+            <div class="cw-page-panel mt-tool-list" aria-label="Maintenance actions">
+              <button class="mt-tool" type="button" onclick="openMaintenance()">
+                <span><strong>Maintenance tools</strong><small>Check local data, clear caches and reset sync state.</small></span><span class="mt-open" aria-hidden="true">Open</span>
+              </button>
+              <button class="mt-tool" type="button" onclick="openProviderCleanupModal()">
+                <span><strong>Provider cleanup</strong><small>Remove selected data from a provider instance.</small></span><span class="mt-open" aria-hidden="true">Open</span>
+              </button>
+              <button class="mt-tool" type="button" onclick="openSupportModal()">
+                <span><strong>Support</strong><small>Download sync state or a diagnostic bundle.</small></span><span class="mt-open" aria-hidden="true">Open</span>
+              </button>
             </div>
-            <span class="material-symbols-rounded cw-maint-hero-gear" aria-hidden="true">settings</span>
-          </div>
-          <div class="section open cw-settings-section cw-maint-section" id="sec-troubleshoot" data-accordion="off">
-            <div class="head"><span class="chev"></span><strong>Maintenance</strong></div>
-            <div class="body">
-              <div class="cw-maint-layout">
-                <div class="cw-maint-debug-card">
-                  <div class="cw-maint-card-head">
-                    <span class="material-symbols-rounded cw-maint-card-icon" aria-hidden="true">bug_report</span>
-                    <div class="cw-maint-card-copy">
-                      <strong>Debug logging</strong>
-                      <small>Control how much detail CrossWatch writes to the live logs and diagnostics.</small>
-                    </div>
-                  </div>
-                  <div class="cw-maint-debug-field">
-                    <label for="debug">Level</label>
-                    <select id="debug" name="debug">
-                      <option value="off">off</option>
-                      <option value="on">on</option>
-                      <option value="mods">on - including MOD debug - best option for debug</option>
-                      <option value="full">on - full (requires restart) - use with caution</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div class="cw-maint-actions" aria-label="Maintenance actions">
-                  <button class="btn cw-maint-action backup" type="button" onclick="openBackupRestore()">
-                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">backup</span>
-                    <span class="cw-maint-action-copy">
-                      <strong>Backup & Restore</strong>
-                      <small>Create archives, validate backups, restore state, or manage schedules.</small>
-                    </span>
-                    <span class="cw-maint-action-cta" aria-hidden="true"><span>Open</span><span class="material-symbols-rounded">arrow_forward</span></span>
-                  </button>
-                  <button class="btn cw-maint-action tools" type="button" onclick="openMaintenance()">
-                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">tune</span>
-                    <span class="cw-maint-action-copy">
-                      <strong>Maintenance Tools</strong>
-                      <small>Clean local state, reset counters, and run recovery actions.</small>
-                    </span>
-                    <span class="cw-maint-action-cta" aria-hidden="true"><span>Open</span><span class="material-symbols-rounded">arrow_forward</span></span>
-                  </button>
-                  <button class="btn cw-maint-action provider-cleanup" type="button" onclick="openProviderCleanupModal()">
-                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">cleaning_services</span>
-                    <span class="cw-maint-action-copy">
-                      <strong>Provider Cleanup</strong>
-                      <small>Clear provider watchlist, ratings, history, or progress data by profile.</small>
-                    </span>
-                    <span class="cw-maint-action-cta" aria-hidden="true"><span>Open</span><span class="material-symbols-rounded">arrow_forward</span></span>
-                  </button>
-                  <button class="btn cw-maint-action support" type="button" onclick="openSupportModal()">
-                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">support_agent</span>
-                    <span class="cw-maint-action-copy">
-                      <strong>Support</strong>
-                      <small>Export state.json and a diagnostic bundle to attach to a bug report.</small>
-                    </span>
-                    <span class="cw-maint-action-cta" aria-hidden="true"><span>Open</span><span class="material-symbols-rounded">arrow_forward</span></span>
-                  </button>
-                  <button class="btn cw-maint-action restart" type="button" onclick="restartCrossWatch()">
-                    <span class="material-symbols-rounded cw-maint-action-icon" aria-hidden="true">restart_alt</span>
-                    <span class="cw-maint-action-copy">
-                      <strong>Restart CrossWatch</strong>
-                      <small>Restart CW container.</small>
-                    </span>
-                    <span class="cw-maint-action-cta" aria-hidden="true"><span>Restart</span><span class="material-symbols-rounded">arrow_forward</span></span>
-                  </button>
-                </div>
-
-                <div id="tb_msg" class="msg ok hidden">Done </div>
-              </div>
+            <div class="mt-restart">
+              <div><h4>Restart CrossWatch</h4><p>Temporarily interrupts access to CW.</p></div>
+              <button class="cw-page-button mt-button mt-danger" type="button" onclick="restartCrossWatch()">Restart</button>
             </div>
+            <div id="tb_msg" class="msg ok hidden">Done</div>
           </div>
         </section>
       </div>
@@ -2322,7 +2294,7 @@ __CW_NAV_PROFILE_MENU__
 </div>
 
 
-<script>(()=>{const $=id=>document.getElementById(id),closeMenu=id=>{const m=$(id==="settings"?"cw-settings-menu":"cw-about-menu"),b=$(id==="settings"?"tab-settings":"tab-about");m?.classList.add("hidden");b?.setAttribute("aria-expanded","false")},closeAll=()=>{closeMenu("settings");closeMenu("about")},toggleMenu=(id,e)=>{e?.preventDefault?.();e?.stopPropagation?.();const menuId=id==="settings"?"cw-settings-menu":"cw-about-menu",btnId=id==="settings"?"tab-settings":"tab-about",m=$(menuId),b=$(btnId);if(!m||!b)return;const open=m.classList.contains("hidden");closeAll();m.classList.toggle("hidden",!open);b.setAttribute("aria-expanded",String(open))},setHelp=open=>{const o=$("cw-help-overlay");if(!o)return;if(open){const f=$("cw-help-frame");if(f&&!f.src)f.src="https://wiki.crosswatch.app";o.classList.remove("hidden");o.setAttribute("aria-hidden","false")}else{o.classList.add("hidden");o.setAttribute("aria-hidden","true")}},openSettings=pane=>{window.showTab?.("settings");setTimeout(()=>window.cwSettingsSelect?.(pane),0)};window.CW_CURRENT_VERSION="__CW_CURRENT_VERSION__";window.APP_VERSION="__CW_VERSION__";window["__CW_"+"VERSION__"]=window.APP_VERSION;window.cwOpenHelp=()=>setHelp(true);window.cwCloseHelp=()=>setHelp(false);window.openHelp=()=>window.location?.protocol==="https:"?window.cwOpenHelp?.():window.open("https://wiki.crosswatch.app","_blank","noopener,noreferrer");window.cwCloseAboutMenu=()=>closeMenu("about");window.cwCloseSettingsMenu=()=>closeMenu("settings");window.cwToggleAboutMenu=e=>toggleMenu("about",e);window.cwToggleSettingsMenu=e=>toggleMenu("settings",e);window.cwAboutMenuSelect=w=>(closeMenu("about"),w==="about"?window.openAbout?.():w==="help"?window.openHelp?.():w==="assistant"?window.openAssistant?.():undefined);window.cwSettingsMenuSelect=w=>{closeMenu("settings");if(w==="overview")return openSettings("overview");if(w==="providers")return openSettings("providers");if(w==="scheduling")return openSettings("scheduling");if(w==="pairs"||w==="sync")return openSettings("sync");if(w==="scrobbler")return openSettings("scrobbler");if(w==="app")return openSettings("app");if(w==="maintenance")return openSettings("maintenance")};document.addEventListener("click",e=>{const o=$("cw-help-overlay"),c=$("cw-help-card"),aboutHost=$("tab-about-menu"),settingsHost=$("tab-settings-menu");if(o&&!o.classList.contains("hidden")&&c&&!c.contains(e.target))window.cwCloseHelp?.();if(aboutHost&&!aboutHost.contains(e.target))closeMenu("about");if(settingsHost&&!settingsHost.contains(e.target))closeMenu("settings")},true);document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;window.cwCloseHelp?.();closeAll()},true)})();</script>
+<script>(()=>{const $=id=>document.getElementById(id),closeMenu=id=>{const m=$("cw-"+id+"-menu"),b=$("tab-"+id);m?.classList.add("hidden");b?.setAttribute("aria-expanded","false")},closeAll=()=>{closeMenu("settings");closeMenu("about");closeMenu("tools")},toggleMenu=(id,e)=>{e?.preventDefault?.();e?.stopPropagation?.();const m=$("cw-"+id+"-menu"),b=$("tab-"+id);if(!m||!b)return;const open=m.classList.contains("hidden");closeAll();m.classList.toggle("hidden",!open);b.setAttribute("aria-expanded",String(open))},setHelp=open=>{const o=$("cw-help-overlay");if(!o)return;if(open){const f=$("cw-help-frame");if(f&&!f.src)f.src="https://wiki.crosswatch.app";o.classList.remove("hidden");o.setAttribute("aria-hidden","false")}else{o.classList.add("hidden");o.setAttribute("aria-hidden","true")}},openSettings=pane=>{window.showTab?.("settings");setTimeout(()=>window.cwSettingsSelect?.(pane),0)};window.CW_CURRENT_VERSION="__CW_CURRENT_VERSION__";window.APP_VERSION="__CW_VERSION__";window["__CW_"+"VERSION__"]=window.APP_VERSION;window.cwOpenHelp=()=>setHelp(true);window.cwCloseHelp=()=>setHelp(false);window.openHelp=()=>window.location?.protocol==="https:"?window.cwOpenHelp?.():window.open("https://wiki.crosswatch.app","_blank","noopener,noreferrer");window.cwCloseAboutMenu=()=>closeMenu("about");window.cwCloseSettingsMenu=()=>closeMenu("settings");window.cwToggleAboutMenu=e=>toggleMenu("about",e);window.cwToggleSettingsMenu=e=>toggleMenu("settings",e);window.cwCloseToolsMenu=()=>closeMenu("tools");window.cwToggleToolsMenu=e=>toggleMenu("tools",e);window.cwToolsMenuSelect=r=>{closeMenu("tools");const f={events:"openEvents",logs:"openLogs",analyzer:"openAnalyzer",import_export:"openExporter",maintenance:"openMaintenance"}[r];return f&&typeof window[f]==="function"?window[f]():window.showTab?.(r)};window.cwAboutMenuSelect=w=>(closeMenu("about"),w==="about"?window.openAbout?.():w==="help"?window.openHelp?.():w==="assistant"?window.openAssistant?.():undefined);window.cwSettingsMenuSelect=w=>{closeMenu("settings");if(w==="overview")return openSettings("overview");if(w==="providers")return openSettings("providers");if(w==="scheduling")return openSettings("scheduling");if(w==="pairs"||w==="sync")return openSettings("sync");if(w==="scrobbler")return openSettings("scrobbler");if(w==="app")return openSettings("app");if(w==="maintenance")return openSettings("maintenance")};document.addEventListener("click",e=>{const o=$("cw-help-overlay"),c=$("cw-help-card"),aboutHost=$("tab-about-menu"),settingsHost=$("tab-settings-menu"),toolsHost=$("tab-tools-menu");if(o&&!o.classList.contains("hidden")&&c&&!c.contains(e.target))window.cwCloseHelp?.();if(aboutHost&&!aboutHost.contains(e.target))closeMenu("about");if(settingsHost&&!settingsHost.contains(e.target))closeMenu("settings");if(toolsHost&&!toolsHost.contains(e.target))closeMenu("tools")},true);document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;window.cwCloseHelp?.();closeAll()},true)})();</script>
 
 __CW_ASSET_BLOCK__
 
@@ -2527,18 +2499,26 @@ __CW_ASSET_BLOCK__
 
 def _seed_media_card_style(html: str, user: dict | None = None) -> str:
     from cw_platform.config_base import load_config
+    from providers.metadata._meta_FANART import art_version
 
     cfg = load_config() or {}
     value = (cfg.get("ui") or {}).get("media_card", "full")
     if isinstance(user, dict) and user.get("is_admin") is False:
         value = (user.get("preferences") or {}).get("media_card", value)
     style = "compact" if value == "compact" else "full"
-    return html.replace('<html lang="en"', f'<html lang="en" data-cw-media-card="{style}"', 1)
+    try:
+        from services.artwork_choices import revisions
+
+        chosen = " ".join(f"{key}={rev}" for key, rev in sorted(revisions().items()))
+    except Exception:
+        chosen = ""
+    return html.replace('<html lang="en"', f'<html lang="en" data-cw-media-card="{style}" data-cw-art="{art_version(cfg)}" data-cw-art-ov="{html_lib.escape(chosen, quote=True)}"', 1)
 
 
 def get_index_html(include_admin: bool = True, user: dict | None = None) -> str:
     html = _get_index_html_static().replace("__CW_ASSET_BLOCK__", _asset_block(include_admin=include_admin, user=user))
     html = html.replace("__CW_NAV_PROFILE_MENU__", _nav_profile_link(user if user is not None else {"is_admin": include_admin}))
+    html = html.replace("__CW_TOOLS_MENU__", _tools_menu(maintenance=include_admin))
     html = html.replace('<html lang="en"', f'<html lang="en" data-cw-reconnect="{" ".join(reconnect_connection_keys())}"', 1)
     if not include_admin:
         perms = _managed_user_permissions(user)
@@ -2641,7 +2621,7 @@ def get_profile_html(user: dict | None = None) -> str:
             _profile_nav_tab("Hub", "/profile#overview", active=True),
             _profile_nav_tab("Captures", "/#snapshots"),
             _profile_nav_tab("Playlists", "/#playlists"),
-            _profile_nav_tab("Editor", "/#editor"),
+            _tools_menu(href_prefix="/"),
             settings_nav,
         ])
     elif write_nav:
@@ -2651,7 +2631,7 @@ def get_profile_html(user: dict | None = None) -> str:
             _profile_nav_tab("Hub", "/profile#overview", active=True),
             _profile_nav_tab("Captures", "/?main=1#snapshots"),
             _profile_nav_tab("Playlists", "/?main=1#playlists"),
-            _profile_nav_tab("Editor", "/?main=1#editor"),
+            _tools_menu(maintenance=False, href_prefix="/?main=1"),
         ])
     else:
         nav_items.append(_profile_nav_tab("Hub", "/profile#overview", active=True))
@@ -2696,10 +2676,6 @@ def get_profile_html(user: dict | None = None) -> str:
     ) if watchlist_allowed else ""
     collection_bulk = _profile_bulk_bar("profile-collection-bulk", "collection")
     remove_dialog = _profile_remove_dialog()
-    view_as_picker = (
-        '<div id="cw-view-as" class="cw-view-as hidden"><select id="cw-view-as-select" aria-label="View profile as"></select></div>'
-        if is_admin else ""
-    )
     view_as_banner = """  <div id="profile-view-as-banner" class="cw-profile-viewas" role="status" hidden>
     <span class="material-symbols-rounded" aria-hidden="true">visibility</span>
     <span class="cw-profile-viewas-copy">Viewing <strong id="profile-view-as-name"></strong> as read-only</span>
@@ -2795,7 +2771,6 @@ def get_profile_html(user: dict | None = None) -> str:
           </div>
         </div>
       </div>
-      <div class="cw-media-hero-account">{view_as_picker}</div>
     </div>
     <div id="profile-hero-media" class="cw-media-hero-context" aria-live="polite">
       <span class="cw-media-hero-heading"><strong>Everything you watch, across your providers</strong><img class="cw-media-hero-logo" alt="" hidden></span>
@@ -2938,6 +2913,15 @@ def get_profile_html(user: dict | None = None) -> str:
       </label>
       <div class="cw-hub-records-chips" id="profile-collection-types" aria-label="Collection type filters"></div>
       <div class="cw-hub-records-controls">
+        <select id="profile-collection-shelf" aria-label="Collection source">
+          <option value="synced">Synced</option>
+          <option value="shelf">My shelf</option>
+          <option value="all">Synced and shelf</option>
+          <option value="unwatched">Shelf: never watched</option>
+          <option value="not_on_server">Shelf: not on a server</option>
+          <option value="not_on_shelf">Server: not on shelf</option>
+        </select>
+        <select id="profile-collection-shelf-filter" aria-label="Shelf filter" hidden><option value="">Whole shelf</option></select>
         <select id="profile-collection-provider" aria-label="Provider filter"><option value="">All providers</option></select>
         <select id="profile-collection-sort" aria-label="Collection sort">
           <option value="collected_at">Recently added</option>
@@ -2946,8 +2930,11 @@ def get_profile_html(user: dict | None = None) -> str:
           <option value="title_desc">Title Z-A</option>
           <option value="year_desc">Year: newest</option>
           <option value="year_asc">Year: oldest</option>
+          <option value="price_desc">Price: highest</option>
+          <option value="purchased_desc">Bought: newest</option>
         </select>
         <div class="cw-hub-records-views" role="group" aria-label="View mode">
+          <button class="cw-view-shelf" type="button" data-collection-display="shelf" title="Show my shelf" aria-label="Show my shelf" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">shelves</span></button>
           <button class="cw-view-timeline" type="button" data-collection-timeline title="Show timeline" aria-label="Show timeline" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">timeline</span></button>
           <button class="active" type="button" data-collection-view="grid" title="Grid view" aria-label="Grid view" aria-pressed="true"><span class="material-symbols-rounded" aria-hidden="true">grid_view</span></button>
           <button type="button" data-collection-view="list" title="List view" aria-label="List view" aria-pressed="false"><span class="material-symbols-rounded" aria-hidden="true">view_list</span></button>
@@ -2956,6 +2943,7 @@ def get_profile_html(user: dict | None = None) -> str:
       </div>
     </div>
     <div id="profile-collection-timeline" class="cw-hist-timeline" aria-label="Collections per month" hidden></div>
+    <div id="profile-collection-shelfstats" class="cw-shelf-stats-host" hidden></div>
     <div id="profile-collection-grid" class="cw-collection-grid" data-view="grid" aria-live="polite"></div>
     <div id="profile-collection-footer" class="cw-collection-footer" hidden>
       <nav id="profile-collection-pages" class="cw-collection-pages" aria-label="Collection pages"></nav>
@@ -3081,17 +3069,17 @@ def get_profile_html(user: dict | None = None) -> str:
 (() => {{
   const $ = id => document.getElementById(id);
   const closeMenu = id => {{
-    const menu = $(id === "settings" ? "cw-settings-menu" : "cw-about-menu");
-    const button = $(id === "settings" ? "tab-settings" : "tab-about");
+    const menu = $(`cw-${{id}}-menu`);
+    const button = $(`tab-${{id}}`);
     menu?.classList.add("hidden");
     button?.setAttribute("aria-expanded", "false");
   }};
-  const closeAll = () => {{ closeMenu("settings"); closeMenu("about"); }};
+  const closeAll = () => {{ closeMenu("settings"); closeMenu("about"); closeMenu("tools"); }};
   const toggleMenu = (id, event) => {{
     event?.preventDefault?.();
     event?.stopPropagation?.();
-    const menu = $(id === "settings" ? "cw-settings-menu" : "cw-about-menu");
-    const button = $(id === "settings" ? "tab-settings" : "tab-about");
+    const menu = $(`cw-${{id}}-menu`);
+    const button = $(`tab-${{id}}`);
     if (!menu || !button) return;
     const open = menu.classList.contains("hidden");
     closeAll();
@@ -3144,6 +3132,13 @@ def get_profile_html(user: dict | None = None) -> str:
   window.cwToggleSettingsMenu = event => toggleMenu("settings", event);
   window.cwToggleAboutMenu = event => toggleMenu("about", event);
   window.cwSettingsMenuSelect = pane => {{ closeMenu("settings"); openSettings(pane); }};
+  window.cwToggleToolsMenu = event => toggleMenu("tools", event);
+  window.cwCloseToolsMenu = () => closeMenu("tools");
+  window.cwToolsMenuSelect = route => {{
+    closeMenu("tools");
+    const prefix = $("cw-tools-menu")?.dataset.hrefPrefix || "/";
+    window.location.href = `${{prefix}}#${{route}}`;
+  }};
   window.cwAboutMenuSelect = async what => {{
     closeMenu("about");
     if (what === "help") window.openHelp?.();
@@ -3155,6 +3150,7 @@ def get_profile_html(user: dict | None = None) -> str:
     if (overlay && !overlay.classList.contains("hidden") && card && !card.contains(event.target)) window.cwCloseHelp?.();
     if (!$("tab-settings-menu")?.contains(event.target)) closeMenu("settings");
     if (!$("tab-about-menu")?.contains(event.target)) closeMenu("about");
+    if (!$("tab-tools-menu")?.contains(event.target)) closeMenu("tools");
   }}, true);
   document.addEventListener("keydown", event => {{
     if (event.key === "Escape") {{ window.cwCloseHelp?.(); closeAll(); }}
@@ -3162,6 +3158,7 @@ def get_profile_html(user: dict | None = None) -> str:
 }})();
 </script>
 <script type="module" src="/assets/js/modals.js?v=__CW_VERSION__"></script>
+<script src="/assets/helpers/clipboard.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/selection-bar.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/card-actions.js?v=__CW_VERSION__" defer></script>
 <script src="/assets/helpers/provider-meta.js?v=__CW_VERSION__" defer></script>

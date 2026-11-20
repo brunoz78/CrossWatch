@@ -943,6 +943,7 @@ function cwMetaProviderEnsure() {
 
   if (!panelHost.dataset.__cwMetaBuilt) {
     try { cwBuildTmdbPanel(); } catch {}
+    try { cwBuildFanartPanel(); } catch {}
     try { cwBuildAnimeMappingPanel(); } catch {}
     panelHost.dataset.__cwMetaBuilt = "1";
   }
@@ -1507,6 +1508,287 @@ function cwBuildTmdbPanel() {
   let lastSub = "api";
   try { lastSub = (localStorage.getItem(TMDB_META_SUBTAB_KEY) || "api").toLowerCase(); } catch {}
   cwMetaProviderSubSelect("tmdb", (lastSub === "advanced") ? "advanced" : "api", { persist: false });
+}
+
+function cwBuildFanartPanel() {
+  const panelHost = document.getElementById("meta-provider-panel");
+  if (!panelHost) return;
+  if (panelHost.querySelector('.cw-meta-provider-panel[data-provider="fanart"]')) return;
+
+  const modeOptions = `<option value="fanart">fanart.tv first</option><option value="tmdb_first">TMDb first</option><option value="tmdb">TMDb only</option>`;
+  const wrap = document.createElement("div");
+  wrap.className = "section cw-settings-section cw-settings-provider-section cw-meta-provider-panel active";
+  wrap.id = "sec-meta-fanart";
+  wrap.dataset.provider = "fanart";
+  wrap.innerHTML = `
+    <div class="head" data-toggle-section="sec-meta-fanart">
+      <span class="chev"></span>
+      <div class="cw-meta-provider-head-copy">
+        <strong>Fanart.tv</strong>
+        <span class="cw-meta-provider-help" title="Optional. Logos, backgrounds and disc art from fanart.tv, with TMDb as fallback." aria-label="Optional. Logos, backgrounds and disc art from fanart.tv, with TMDb as fallback.">
+          <span class="material-symbols-rounded cw-meta-provider-help-icon" aria-hidden="true">info</span>
+        </span>
+      </div>
+      <span class="auth-dot" id="meta-fanart-dot" aria-hidden="true"></span>
+    </div>
+    <div class="body">
+      <div class="cw-panel-head">
+        <div>
+          <div class="cw-panel-title">Fanart.tv</div>
+          <div class="muted">Logos, backgrounds and disc art from fanart.tv.</div>
+        </div>
+      </div>
+      <div class="cw-subtiles">
+        <button type="button" class="cw-subtile active" data-sub="api">API key</button>
+        <button type="button" class="cw-subtile" data-sub="settings">Settings</button>
+      </div>
+      <div class="cw-subpanels">
+        <div class="cw-subpanel active" data-sub="api">
+          <div class="auth-card">
+            <div class="auth-card-notes" id="fanart_hint">Images are provided by <a href="https://fanart.tv" target="_blank" rel="noopener noreferrer">fanart.tv</a>. No keys are required. Leave both fields empty and just click Connect fanart.tv to use the CrossWatch project key.</div>
+            <div class="auth-card-notes" id="fanart_tmdb_hint" hidden>Connect TMDb Metadata first. fanart.tv art is loaded through TMDb Metadata.</div>
+            <div class="auth-card-fields">
+              <div style="display:flex;gap:14px;flex-wrap:wrap">
+                <div class="field" style="flex:1 1 220px;min-width:0">
+                  <div class="muted" style="margin-bottom:6px;">Personal API key (not required)</div>
+                  <input id="fanart_personal_api_key" type="text" placeholder="Optional, from your fanart.tv profile" autocomplete="off">
+                </div>
+                <div class="field" style="flex:1 1 220px;min-width:0">
+                  <div class="muted" style="margin-bottom:6px;">Project API key (not required)</div>
+                  <input id="fanart_api_key" type="text" placeholder="Optional, replaces the CrossWatch key" autocomplete="off">
+                </div>
+              </div>
+              <div class="auth-card-notes">A personal key shows new fanart.tv uploads after 2 days instead of 7, and right away for fanart.tv VIP members. Only add a project key if you have your own fanart.tv project.</div>
+              <div class="inline" style="display:flex;margin-top:10px;gap:10px;align-items:center;justify-content:flex-start">
+                <button type="button" class="btn good" id="fanart_check">Connect fanart.tv</button>
+                <button type="button" class="btn danger" id="fanart_delete" hidden>Delete</button>
+                <div id="fanart_check_msg" class="msg ok hidden" aria-live="polite" style="margin-left:auto;width:auto;max-width:min(520px,60%);flex:0 1 auto;white-space:normal"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="cw-subpanel" data-sub="settings">
+          <div class="auth-card">
+            <div class="auth-card-fields">
+              <div class="field">
+                <div class="muted" style="margin-bottom:6px;">Logos</div>
+                <select id="fanart_pref_logos" aria-label="Logo source">${modeOptions}</select>
+              </div>
+              <div class="field">
+                <div class="muted" style="margin-bottom:6px;">Backgrounds</div>
+                <select id="fanart_pref_backgrounds" aria-label="Background source">${modeOptions}</select>
+              </div>
+            </div>
+            <div class="auth-card-notes" id="fanart_settings_hint" hidden>Connect fanart.tv first.</div>
+            <div class="auth-card-notes">fanart.tv first uses fanart.tv art and falls back to TMDb. TMDb first only uses fanart.tv when TMDb has nothing, which mostly helps logos. Logos and backgrounds show in media details, the Now Playing card, the Media Hub, dashboard widgets and the tracker. Posters always come from TMDb. Reload open pages to see a change.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  panelHost.appendChild(wrap);
+
+  wrap.querySelector("#fanart_check")?.addEventListener("click", () => { cwSaveFanartKey().catch(() => {}); });
+  wrap.querySelector("#fanart_delete")?.addEventListener("click", () => { cwDeleteFanartKey().catch(() => {}); });
+  wrap.querySelectorAll("#fanart_api_key, #fanart_personal_api_key").forEach((input) => {
+    input.addEventListener("input", () => {
+      input.dataset.touched = "1";
+      input.dataset.masked = "0";
+      cwSetFanartMessage(true, "");
+      cwFanartStateUpdate();
+    });
+  });
+  wrap.querySelectorAll("#fanart_pref_logos, #fanart_pref_backgrounds").forEach((select) => {
+    select.addEventListener("change", () => { select.dataset.touched = "1"; });
+  });
+  cwRefreshFanartState().catch(() => {});
+}
+
+function cwFanartCacheUpdate(values) {
+  try { window._cfgCache = { ...(window._cfgCache || {}), fanart: { ...(window._cfgCache?.fanart || {}), ...values } }; } catch {}
+  try { window.CW?.Cache?.invalidate?.("config"); } catch {}
+  try { window.invalidateConfigCache?.(); } catch {}
+}
+
+function cwFanartHasTmdb() {
+  const cfg = window._cfgCache || {};
+  return !!String(cfg?.tmdb?.api_key || cfg?.metadata?.tmdb_api_key || "").trim();
+}
+
+function cwFanartKeysTouched() {
+  return ["fanart_api_key", "fanart_personal_api_key"].some((id) => document.getElementById(id)?.dataset?.touched === "1");
+}
+
+async function cwSaveFanartPrefs() {
+  const body = {
+    logos: document.getElementById("fanart_pref_logos")?.value || "fanart",
+    backgrounds: document.getElementById("fanart_pref_backgrounds")?.value || "fanart",
+  };
+  try {
+    const r = await fetch("/api/fanart/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      credentials: "same-origin",
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data?.ok) throw new Error(data?.error || "save_failed");
+    cwFanartCacheUpdate({ enabled: data.enabled, logos: data.logos, backgrounds: data.backgrounds });
+    ["fanart_pref_logos", "fanart_pref_backgrounds"].forEach((id) => { const select = document.getElementById(id); if (select) select.dataset.touched = ""; });
+    cwFanartStateUpdate();
+    return true;
+  } catch {
+    cwSetFanartMessage(false, "fanart.tv settings save failed.");
+    return false;
+  }
+}
+
+async function cwSaveFanartModal() {
+  const on = window._cfgCache?.fanart?.enabled === true;
+  if (cwFanartKeysTouched()) {
+    if (!on && !cwFanartHasTmdb()) {
+      cwSetFanartMessage(false, "Connect TMDb Metadata first.");
+      throw new Error("fanart_tmdb_missing");
+    }
+    if (!await cwSaveFanartKey()) throw new Error("fanart_key_failed");
+  } else if (!on) {
+    return true;
+  }
+  if (!await cwSaveFanartPrefs()) throw new Error("fanart_settings_failed");
+  return true;
+}
+
+function cwSetFanartMessage(ok, text) {
+  const msg = document.getElementById("fanart_check_msg");
+  if (!msg) return;
+  msg.textContent = String(text || "");
+  msg.classList.toggle("hidden", !msg.textContent);
+  msg.classList.toggle("warn", !!msg.textContent && !ok);
+  msg.classList.toggle("ok", !!msg.textContent && !!ok);
+}
+
+function cwFanartStateUpdate() {
+  const fanart = window._cfgCache?.fanart || {};
+  const on = fanart.enabled === true;
+  const dot = document.getElementById("meta-fanart-dot");
+  if (dot) {
+    dot.classList.toggle("on", on);
+    dot.title = on ? "Connected" : "Not connected";
+    dot.setAttribute("aria-label", dot.title);
+    dot.closest?.('.cw-meta-provider-panel[data-provider="fanart"]')?.classList?.toggle("is-configured", on);
+  }
+  const hasTmdb = cwFanartHasTmdb();
+  const blocked = !on && !hasTmdb;
+  const connected = on && !cwFanartKeysTouched();
+  const btn = document.getElementById("fanart_check");
+  if (btn) {
+    try { window.CW?.AuthShared?.setConnectLocked?.(["fanart_check"], connected, "Connected"); } catch {}
+    if (!btn.classList.contains("busy")) btn.disabled = blocked;
+  }
+  const tmdbHint = document.getElementById("fanart_tmdb_hint");
+  if (tmdbHint) tmdbHint.hidden = !blocked;
+  const settingsHint = document.getElementById("fanart_settings_hint");
+  if (settingsHint) settingsHint.hidden = on;
+  const msg = document.getElementById("fanart_check_msg");
+  if (msg) {
+    const text = String(msg.textContent || "").trim();
+    if (connected && (!text || msg.classList.contains("hidden"))) cwSetFanartMessage(true, "Connected");
+    else if (!connected && text === "Connected") cwSetFanartMessage(true, "");
+  }
+  const modeOf = (value) => value === false ? "tmdb" : ["fanart", "tmdb_first", "tmdb"].includes(value) ? value : "fanart";
+  [["fanart_pref_logos", "logos"], ["fanart_pref_backgrounds", "backgrounds"]].forEach(([id, name]) => {
+    const select = document.getElementById(id);
+    if (!select) return;
+    if (!select.dataset.touched) select.value = modeOf(fanart[name]);
+    select.disabled = !on;
+  });
+}
+
+async function cwRefreshFanartState() {
+  let cfg = window._cfgCache || {};
+  try {
+    const r = await fetch("/api/config", { cache: "no-store", credentials: "same-origin" });
+    if (r.ok) {
+      const fresh = await r.json().catch(() => null);
+      if (fresh && typeof fresh === "object") {
+        window._cfgCache = fresh;
+        cfg = fresh;
+      }
+    }
+  } catch {}
+  [["fanart_api_key", cfg?.fanart?.api_key], ["fanart_personal_api_key", cfg?.fanart?.personal_api_key]].forEach(([id, value]) => {
+    const input = document.getElementById(id);
+    if (!input) return;
+    const has = !!String(value || "").trim();
+    input.value = has ? "********" : "";
+    input.dataset.masked = has ? "1" : "0";
+    input.dataset.touched = "";
+  });
+  ["fanart_pref_logos", "fanart_pref_backgrounds"].forEach((id) => { const select = document.getElementById(id); if (select) select.dataset.touched = ""; });
+  cwFanartStateUpdate();
+  return cfg?.fanart?.enabled === true;
+}
+
+async function cwSaveFanartKey() {
+  const keyInput = document.getElementById("fanart_api_key");
+  const personalInput = document.getElementById("fanart_personal_api_key");
+  const btn = document.getElementById("fanart_check");
+  const api_key = String(keyInput?.value || "").trim();
+  const personal_api_key = String(personalInput?.value || "").trim();
+  const wasOn = window._cfgCache?.fanart?.enabled === true;
+  try {
+    if (btn) btn.disabled = true;
+    cwSetFanartMessage(true, "Checking...");
+    const r = await fetch("/api/fanart/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      credentials: "same-origin",
+      body: JSON.stringify({ api_key, personal_api_key }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data?.ok) {
+      cwSetFanartMessage(false, data?.error || "fanart.tv key check failed.");
+      return false;
+    }
+    cwFanartCacheUpdate({ enabled: true });
+    await cwRefreshFanartState();
+    cwSetFanartMessage(true, "Connected");
+    try { window.dispatchEvent(new CustomEvent("auth-changed")); } catch {}
+    if (!wasOn) {
+      try { document.dispatchEvent(new CustomEvent("cw-provider-connected", { bubbles: true, detail: { provider: "fanart", key: "FANART_METADATA" } })); } catch {}
+    }
+    return true;
+  } catch {
+    cwSetFanartMessage(false, "fanart.tv key check failed.");
+    return false;
+  } finally {
+    cwFanartStateUpdate();
+  }
+}
+
+async function cwDeleteFanartKey() {
+  try {
+    const r = await fetch("/api/fanart/disconnect", { method: "POST", cache: "no-store", credentials: "same-origin" });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data?.ok === false) throw new Error(data?.error || "disconnect_failed");
+    ["fanart_api_key", "fanart_personal_api_key"].forEach((id) => {
+      const input = document.getElementById(id);
+      if (!input) return;
+      input.value = "";
+      input.dataset.masked = "0";
+      input.dataset.touched = "";
+    });
+    cwFanartCacheUpdate({ enabled: false, api_key: "", personal_api_key: "" });
+    cwSetFanartMessage(true, "");
+    cwFanartStateUpdate();
+    try { window.dispatchEvent(new CustomEvent("auth-changed")); } catch {}
+    return true;
+  } catch {
+    cwSetFanartMessage(false, "fanart.tv delete failed.");
+    return false;
+  }
 }
 
 try {
@@ -2294,6 +2576,9 @@ function setTraktSuccess(show) {
     cwBuildTmdbPanel,
     cwDeleteTmdbKey,
     cwRefreshTmdbMetadataState,
+    cwBuildFanartPanel,
+    cwRefreshFanartState,
+    cwSaveFanartModal,
     cwMetaSettingsSelect,
     cwMetaSettingsHubUpdate,
     cwMetaSettingsHubInit,

@@ -118,6 +118,7 @@ def _normalize_progress_block(v: dict | bool | None) -> dict:
     d["propagate_timestamp_updates"] = coerce_bool(
         d.get("propagate_timestamp_updates", d.get("propagateTimestampUpdates", False))
     )
+    d["continue_watching_removals"] = coerce_bool(d.get("continue_watching_removals", False))
 
     # Strip legacy keys if present.
     for kk in ("minSeconds", "deltaSeconds", "maxPercent", "enabled"):
@@ -257,8 +258,8 @@ def _enforce_pair_feature_constraints(pair: dict[str, Any]) -> None:
     if not sync_provider_supports_feature(src, "ratings") or not sync_provider_supports_feature(dst, "ratings"):
         feats.pop("ratings", None)
     if "collection" in feats:
-        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "SILO", "TOFA", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
-        collection_targets = {"TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST"}
+        collection_sources = {"PLEX", "EMBY", "JELLYFIN", "SILO", "TOFA", "KODI", "TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST", "WETRAKR"}
+        collection_targets = {"TRAKT", "MDBLIST", "CROSSWATCH", "PUNCHPLAY", "FLOPPY", "SCROB", "FLICKLIST", "WETRAKR"}
         if src not in collection_sources or dst not in collection_targets or str(pair.get("mode") or "").strip().lower().startswith("two"):
             feats.pop("collection", None)
     raw_providers = pair.get("providers")
@@ -2325,6 +2326,10 @@ def api_sync_providers(request: Request = cast(Request, None)) -> JSONResponse:
         status_caps = provider_caps(mf["name"])
         if status_caps:
             mf["capabilities"]["status_mapping"] = status_caps
+        from providers.sync._continue_watching import provider_caps as continue_watching_caps
+        cw_caps = continue_watching_caps(mf["name"])
+        if cw_caps:
+            mf["capabilities"]["continue_watching"] = cw_caps
         if mf["name"] in seen:
             continue
         seen.add(mf["name"])
@@ -3148,7 +3153,7 @@ def api_run_sync(payload: dict | None = Body(None), request: Request = cast(Requ
         overrides = {
             key: value
             for key, value in (payload or {}).items()
-            if key not in {"pair_id", "pairId", "pair_scope", "pair_scope_ids"}
+            if key not in {"pair_id", "pairId", "pair_scope", "pair_scope_ids", "_cw_on_start"}
         }
         if pair_id:
             overrides["pair_id"] = pair_id
@@ -3162,6 +3167,9 @@ def api_run_sync(payload: dict | None = Body(None), request: Request = cast(Requ
         )
         th.start()
         RUNNING_PROCS["SYNC"] = th
+        on_start = (payload or {}).get("_cw_on_start") if isinstance(payload, dict) else None
+        if callable(on_start):
+            on_start(th)
         _rt()[8]("SYNC", f"[i] Triggered sync run {run_id}")
         return {"ok": True, "run_id": run_id}
 

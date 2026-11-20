@@ -71,6 +71,7 @@
   (window.CW ||= {}).syncBar = sync;
 
   let summary = null;
+  window.CW.getRunSummary = () => summary;
   let summaryRevision = 0;
   let enabledFromPairs = null;
   let lastPairsAt = 0;
@@ -713,6 +714,7 @@
 
     const { running, justFinished } = sync.fromSummary(s);
     summary = s;
+    window.dispatchEvent(new CustomEvent("cw:run-summary-changed"));
     setRunButtonState(running);
 
     if (justFinished && finishedForRun !== runKey) {
@@ -818,7 +820,7 @@
       esSummary = null;
       window.esSum = null;
     },
-    pullSummary: () => { pullSummary().then(renderAll); },
+    pullSummary: () => pullSummary().then(renderAll),
   });
 
   window.openLogStream = function openLogStream() {
@@ -855,6 +857,7 @@
   window.addEventListener("cw:overview-profile-changed", () => {
     summaryRevision++;
     summary = null;
+    window.dispatchEvent(new CustomEvent("cw:run-summary-changed"));
     sumBusy = false;
     safe(sumAbort?.abort?.bind(sumAbort));
     sync.reset();
@@ -875,6 +878,11 @@
   });
 
   async function tick() {
+    if (document.hidden) {
+      clearTimeout(tick._t);
+      tick._t = setTimeout(tick, 6000);
+      return;
+    }
     if (authSetupPending()) {
       try { esSummary?.close?.(); } catch {}
       esSummary = null;

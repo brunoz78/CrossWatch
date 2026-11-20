@@ -21,7 +21,13 @@ from ._mod_common import build_op_result, build_session, _sleep_cancellable
 from ._log import log
 from .myanimelist import _history, _ratings, _watchlist
 
-__VERSION__ = "0.3"
+_UNKNOWN_DATES = {
+    "read": True, "write": True,
+    "rewatches": {"read": False, "write": False},
+    "multiple": {"read": False, "write": False},
+}
+
+__VERSION__ = "1.0"
 _MANUAL_RATING_SCALE = {"step": 1}
 __all__ = ["get_manifest", "MYANIMELISTModule", "OPS"]
 _FEATURES = {"watchlist": _watchlist, "ratings": _ratings, "history": _history}
@@ -59,7 +65,7 @@ def capabilities() -> dict[str, Any]:
             "watchlist": {"types": titles, "remove": True},
             "ratings": {"manual_scale": _MANUAL_RATING_SCALE, "types": titles, "upsert": True, "unrate": True, "from_date": False},
             "history": {"types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
-                        "upsert": False, "remove": True, "observed_deletes": False,
+                        "upsert": False, "remove": True, "observed_deletes": False, "unknown_dates": _UNKNOWN_DATES,
                         "rewatches": {"read": False, "write": False}}}
 
 
@@ -84,7 +90,7 @@ def transport(session: Any, method: str, url: str, *, max_retries: int = 1, **kw
         with _LOCK:
             delay = max(0.0, _NEXT_REQUEST - time.monotonic())
             if delay > 60:
-                raise RuntimeError("MyAnimeList rate limit cooldown")
+                raise MyAnimeListHTTPError("MyAnimeList rate limit cooldown", 429)
             _sleep_cancellable(delay)
             _NEXT_REQUEST = time.monotonic() + 1.0
             response = session.request(method, url, **kwargs)
@@ -96,6 +102,12 @@ def transport(session: Any, method: str, url: str, *, max_retries: int = 1, **kw
         if delay > 60 or attempt == 2:
             return response
     return response
+
+
+class MyAnimeListHTTPError(RuntimeError):
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class MyAnimeListClient:
@@ -127,7 +139,7 @@ class MyAnimeListClient:
         if method == "DELETE" and response.status_code in (200, 204, 404):
             return {}
         if response.status_code >= 300:
-            raise RuntimeError(f"MyAnimeList HTTP {response.status_code}")
+            raise MyAnimeListHTTPError(f"MyAnimeList HTTP {response.status_code}", response.status_code)
         data = response.json()
         if not isinstance(data, dict):
             raise RuntimeError("MyAnimeList returned an invalid response")

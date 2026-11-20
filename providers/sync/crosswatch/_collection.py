@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from cw_platform.collection_media import item_copies, same_copy_value
 from cw_platform.id_map import migrate_media_key, canonical_key, merge_ids
 
 from ._common import (
@@ -25,6 +26,11 @@ from ._common import (
 )
 
 _dbg, _info, _warn, _error = make_logger("collection")
+_SYNCED_COPY_FIELDS = (
+    "format", "resolution", "hdr", "audio", "audio_channels", "is_3d", "edition", "packaging", "condition", "region",
+    "discs", "price", "store", "shelf", "notes", "lent_to", "purchased",
+)
+_KEPT_COPY_FIELDS = frozenset(("price", "store", "shelf", "notes", "lent_to", "purchased"))
 
 
 def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
@@ -34,7 +40,63 @@ def _accepted(obj: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(value, str) and value.strip():
             item["collected_at"] = value.strip()
             break
+    if obj.get("media_manual") is True:
+        item["media_manual"] = True
+    copies = obj.get("copies")
+    if isinstance(copies, list) and copies:
+        item["copies"] = [dict(row) for row in copies if isinstance(row, Mapping)]
     return item
+
+
+def _merged_copy(row: Mapping[str, Any], incoming: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    for field in _SYNCED_COPY_FIELDS:
+        if field not in incoming:
+            if field not in _KEPT_COPY_FIELDS:
+                out.pop(field, None)
+        elif not same_copy_value(field, row.get(field), incoming[field]):
+            out[field] = incoming[field]
+    return out
+
+
+def _merged_copies(existing: Mapping[str, Any], incoming: Mapping[str, Any]) -> list[dict[str, Any]]:
+    current = [dict(row) for row in item_copies(existing)]
+    if "copies" not in incoming:
+        return current
+    from services.shelf_store import MAX_COPIES, ShelfError, clean_copies
+
+    try:
+        new = clean_copies([dict(row) for row in item_copies(incoming)])
+    except ShelfError:
+        return current
+    sources = {row["source"] for row in new if row.get("source")}
+    by_id = {row["id"]: row for row in new}
+    out: list[dict[str, Any]] = []
+    for row in current:
+        match = by_id.pop(str(row.get("id") or ""), None)
+        if match is not None:
+            out.append(_merged_copy(row, match))
+        elif not row.get("source") or row.get("source") not in sources:
+            out.append(row)
+    out.extend(by_id.values())
+    return out[:MAX_COPIES]
+
+
+def _keep_manual_media(existing: Mapping[str, Any], accepted: dict[str, Any]) -> dict[str, Any]:
+    copies = _merged_copies(existing, accepted)
+    if copies:
+        accepted["copies"] = copies
+    else:
+        accepted.pop("copies", None)
+    if existing.get("media_manual") is not True:
+        return accepted
+    for field in ("format", "media_info"):
+        if existing.get(field) not in (None, "", {}):
+            accepted[field] = existing[field]
+        else:
+            accepted.pop(field, None)
+    accepted["media_manual"] = True
+    return accepted
 
 
 def _load_state(adapter: Any) -> dict[str, Any]:
@@ -168,6 +230,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
             accepted = merge_tracker_identity(existing, accepted)
             if existing.get("collected_at") and not accepted.get("collected_at"):
                 accepted["collected_at"] = existing.get("collected_at")
+            accepted = _keep_manual_media(existing, accepted)
         if existing != accepted:
             cur[key] = accepted
             changed += 1

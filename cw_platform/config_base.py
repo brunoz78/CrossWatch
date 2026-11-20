@@ -465,6 +465,17 @@ DEFAULT_CFG: dict[str, Any] = {
         },
     },
 
+    "movieparadise": {
+        "auth_method": "device_code",
+        "access_token": "",
+        "refresh_token": "",
+        "token_type": "Bearer",
+        "scope": "",
+        "expires_at": 0,
+        "username": "",
+        "user_id": "",
+    },
+
     "bingebase": {
         "auth_method": "device_code",
         "access_token": "",
@@ -786,6 +797,7 @@ DEFAULT_CFG: dict[str, Any] = {
     # --- Meta Providers ------------------------------------------------------
     
     "tmdb": {"api_key": ""},                            # Metadata resolver (TMDb)
+    "fanart": {"enabled": False, "api_key": "", "personal_api_key": "", "logos": "fanart", "backgrounds": "fanart"},  # Artwork (fanart.tv)
 
     # --- Sync / Orchestrator -------------------------------------------------
     "sync": {
@@ -1027,6 +1039,7 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "myanimelist": {"access_token", "refresh_token"},
         "wetrakr": {"access_token", "refresh_token"},
         "punchplay": {"access_token", "refresh_token", "_pending_device"},
+        "movieparadise": {"access_token", "refresh_token", "_pending_device"},
         "bingebase": {"access_token", "webhook_url", "api_key", "_pending_device"},
         "flicklist": {"api_key", "access_token", "token", "_pending_device"},
         "nuvio": {"access_token", "refresh_token", "_pending_tv_login", "_pending_tv_caller"},
@@ -1039,9 +1052,10 @@ def redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "jellyfin": {"access_token", "api_key", "password"},
         "emby": {"access_token", "api_key", "password"},
         "silo": {"access_token", "refresh_token", "profile_token", "_pending_device"},
-        "tofa": {"access_token", "refresh_token", "profile_token", "_pending_device"},
+        "tofa": {"access_token", "refresh_token", "profile_token", "sync_key_token", "_pending_device"},
         "kodi": {"password"},
         "tmdb": {"api_key"},
+        "fanart": {"api_key", "personal_api_key"},
         "tmdb_sync": {"api_key", "session_id", "_pending_request_token", "read_token", "access_token", "_pending_access_token"},
         "assistant": {"api_key"},
     }
@@ -1164,6 +1178,7 @@ CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
     "publicmetadb",
     "wetrakr",
     "punchplay",
+    "movieparadise",
     "bingebase",
     "flicklist",
     "nuvio",
@@ -1173,6 +1188,7 @@ CONFIG_TOP_LEVEL_ORDER: tuple[str, ...] = (
     "crosswatch",
     "metadata",
     "tmdb",
+    "fanart",
     "anime_mapping",
     "assistant",
     "sync",
@@ -1604,7 +1620,7 @@ def _normalize_collection_feature(val: dict[str, Any]) -> dict[str, Any]:
     v["enable"] = bool(v.get("enable", False))
     v["add"] = bool(v.get("add", False))
     v["remove"] = bool(v.get("remove", False))
-    for flag in ("media_info", "media_updates"):
+    for flag in ("media_info", "media_updates", "copy_details"):
         if flag in v:
             v[flag] = bool(v.get(flag))
 
@@ -3150,6 +3166,7 @@ _ROTATING_TOKEN_EXPIRY: dict[str, str] = {
     "wetrakr": "expires_at",
     "nuvio": "expires_at",
     "punchplay": "expires_at",
+    "movieparadise": "expires_at",
 }
 _ROTATING_TOKEN_FIELDS: tuple[str, ...] = (
     "access_token",

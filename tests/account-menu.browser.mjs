@@ -171,10 +171,16 @@ for (const theme of ['original','flat-dark','flat-light']) test(`${theme}: profi
 for (const shell of ['main','profile']) {
   test(`${shell}: More destinations use mobile tile styles and restore desktop tabs`, async t => {
     const {page} = await fixture(t,{shell,width:390,height:844});
+    await page.evaluate(() => {
+      window.navigationBuzzes = [];
+      navigator.vibrate = duration => { window.navigationBuzzes.push(duration); return true; };
+    });
     await page.locator('#cw-mobile-more').click();
+    assert.deepEqual(await page.evaluate(() => window.navigationBuzzes), [30]);
     const menu=page.locator('#cw-mobile-navigation');
-    assert.equal(await menu.getByRole('button',{name:'Editor',exact:true}).isVisible(),true);
-    for (const selector of ['#tab-settings','.tab:has-text("Editor")']) {
+    assert.equal(await menu.locator('#tab-tools').isVisible(),true);
+    assert.equal(await menu.locator('.cw-mobile-tool-destinations [data-mobile-route="events"]').isVisible(),false);
+    for (const selector of ['#tab-settings','#tab-tools']) {
       const style=await menu.locator(selector).evaluate(node=>{
         const s=getComputedStyle(node);
         return {border:s.borderTopWidth,radius:s.borderTopLeftRadius,color:s.color,fill:s.webkitTextFillColor};
@@ -188,13 +194,39 @@ for (const shell of ['main','profile']) {
     await page.setViewportSize({width:390,height:844});
     await page.locator('#cw-mobile-more').click();
     assert.equal(await page.locator('#tab-settings').evaluate(node=>getComputedStyle(node).borderTopWidth),'0px');
-    if(shell==='profile') {
-      await menu.getByRole('button',{name:'Editor',exact:true}).focus();
-      await page.keyboard.press('Enter');
-      await page.waitForURL('https://account-menu.test/#editor');
-    } else {
-      assert.equal(await menu.locator('#tab-editor').getAttribute('onclick'),"showTab('editor')");
-    }
+    await page.evaluate(() => { window.navigationBuzzes = []; });
+    await menu.locator('#tab-tools').click();
+    assert.deepEqual(await page.evaluate(() => window.navigationBuzzes), [30]);
+    assert.equal(await menu.locator('#cw-tools-menu').isVisible(),false);
+    assert.equal(await menu.locator('#tab-settings').isVisible(),false);
+    assert.deepEqual(await menu.locator('.cw-mobile-tool-destinations .tab').evaluateAll(nodes=>nodes.filter(node=>node.getClientRects().length).map(node=>node.dataset.mobileRoute || 'back')), ['back','events','logs','editor','analyzer','import_export','backups']);
+    const backups=menu.locator('[data-mobile-route="backups"]');
+    assert.equal(await backups.innerText().then(value=>value.includes('Backup & Restore')),true);
+    assert.equal(await backups.evaluate(node=>node.scrollWidth<=node.clientWidth),true);
+    assert.equal(await backups.getAttribute('href'),shell==='profile'?'/#backups':'#backups');
+    await menu.locator('.cw-mobile-tools-back').click();
+    assert.deepEqual(await page.evaluate(() => window.navigationBuzzes), [30,30]);
+    assert.equal(await page.locator('#cw-mobile-nav-toggle').getAttribute('aria-expanded'),'true');
+    assert.equal(await menu.locator('#tab-tools').isVisible(),true);
+    assert.equal(await menu.locator('.cw-mobile-tool-destinations [data-mobile-route="events"]').isVisible(),false);
+    assert.equal(await menu.locator('#tab-editor').getAttribute('onclick'),"window.cwToolsMenuSelect('editor')");
+    if(shell==='profile') assert.equal(await menu.locator('#cw-tools-menu').getAttribute('data-href-prefix'),'/');
+    await page.evaluate(() => {
+      document.querySelector('#cw-mobile-navigation').addEventListener('click', event => event.preventDefault());
+    });
+    await menu.locator('#tab-tools').click();
+    await backups.click();
+    assert.deepEqual(await page.evaluate(() => window.navigationBuzzes), [30,30,30,30]);
+    await page.evaluate(() => { localStorage.setItem('cw.mobile.haptics','0'); });
+    await page.locator('#cw-mobile-more').click();
+    await menu.locator('#tab-tools').click();
+    await menu.locator('.cw-mobile-tools-back').click();
+    assert.deepEqual(await page.evaluate(() => window.navigationBuzzes), [30,30,30,30]);
+    await page.evaluate(() => { localStorage.setItem('cw.mobile.haptics','1'); });
+    await page.setViewportSize({width:1440,height:900});
+    await menu.locator('#tab-tools').evaluate(node => node.removeAttribute('onclick'));
+    await menu.locator('#tab-tools').dispatchEvent('click');
+    assert.deepEqual(await page.evaluate(() => window.navigationBuzzes), [30,30,30,30]);
   });
 
   test(`${shell}: profile settings and logout`, async t => {
@@ -224,21 +256,22 @@ for (const shell of ['main','profile']) {
 
 for (const shell of ['main','profile']) test(`${shell}: primary order and desktop overflow`, async t => {
   const {page} = await fixture(t,{shell,width:1440});
-  assert.deepEqual(await page.locator('#cw-mobile-navigation > .tab').evaluateAll(nodes=>nodes.map(node=>node.id)), ['tab-main','tab-tracker','tab-profile','tab-snapshots','tab-playlists','tab-editor']);
+  assert.deepEqual(await page.locator('#cw-mobile-navigation > .tab, #cw-mobile-navigation > .cw-tabmenu:not(#cw-desktop-more) > .tab').evaluateAll(nodes=>nodes.map(node=>node.id)), ['tab-main','tab-tracker','tab-profile','tab-snapshots','tab-playlists','tab-tools','tab-settings']);
   assert.equal(await page.locator('#tab-about').count(),0);
   assert.equal(await page.locator('#tab-settings').getAttribute('aria-label'),'Settings');
   assert.equal(await page.locator('#tab-settings .cw-settings-icon').evaluate(node=>getComputedStyle(node).fontSize),'20px');
   await page.setViewportSize({width:1000,height:800});
   await page.locator('#cw-desktop-more-toggle').click();
-  assert.deepEqual(await page.locator('#cw-desktop-more-menu [role="menuitem"]').evaluateAll(nodes=>nodes.map(node=>node.id)),['tab-snapshots','tab-playlists','tab-editor']);
+  assert.deepEqual(await page.locator('#cw-desktop-more-menu [role="menuitem"]').evaluateAll(nodes=>nodes.map(node=>node.id)),['tab-snapshots','tab-playlists']);
+  assert.equal(await page.locator('#tab-tools').isVisible(),true);
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#cw-desktop-more-menu').isVisible(),false);
   await page.setViewportSize({width:390,height:844});
   await page.locator('#cw-mobile-more').click();
-  assert.equal(await page.locator('#tab-editor').isVisible(),true);
+  assert.equal(await page.locator('#tab-tools').isVisible(),true);
   assert.equal(await page.locator('#cw-desktop-more').isVisible(),false);
   await page.setViewportSize({width:1440,height:900});
-  assert.equal(await page.locator('#tab-editor').isVisible(),true);
+  assert.equal(await page.locator('#tab-tools').isVisible(),true);
   await page.locator('#tab-profile').click();
   await page.waitForURL('https://account-menu.test/profile#overview');
 });

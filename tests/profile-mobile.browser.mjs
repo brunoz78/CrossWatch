@@ -111,10 +111,55 @@ async function snapshot(page,name) {
   await page.locator('.cw-profile-panel.active').screenshot({path:`${process.env.CW_PROFILE_SCREENSHOTS}/${name}.png`});
 }
 
+for(const width of [390,1440]) test(`Hub list cache restores pages and keeps unchanged artwork at ${width}px`,async t=>{
+  const {page,state}=await fixture(t,'flat-dark',width,{history:true,library:true,playback:true});
+  for(const tab of ['history','watchlist','ratings','collection','playback']) {
+    await page.evaluate(tab=>{history.replaceState(null,'',`#${tab}`);},tab);
+    await page.locator(`[data-profile-tab="${tab}"]`).click();
+    const card=page.locator(`#profile-panel-${tab} .cw-hist-card, #profile-panel-${tab} .cw-collection-card, #profile-panel-${tab} .cw-play-card`).first();
+    await card.waitFor();
+    await page.waitForFunction(()=>JSON.parse(sessionStorage.getItem('cw.hub.lists.v1')||'[]').length>0);
+    await page.evaluate(()=>{
+      const key='cw.hub.lists.v1',entries=JSON.parse(sessionStorage.getItem(key));
+      entries.forEach(entry=>{entry.t=Date.now()-15*60*1000;});
+      sessionStorage.setItem(key,JSON.stringify(entries));
+    });
+    let release;
+    const gate=new Promise(resolve=>{release=resolve;});
+    t.after(()=>release());
+    const path=tab==='playback'?'/api/playback_progress/items':`/api/profile/${tab}`;
+    state.gates.set(path,gate);
+    await page.reload({waitUntil:'domcontentloaded'});
+    await card.waitFor();
+    await card.evaluate(el=>window.cachedListCard=el);
+    const response=page.waitForResponse(r=>new URL(r.url()).pathname===path);
+    state.gates.delete(path);release();await response;
+    await page.waitForFunction(()=>!document.querySelector('[aria-busy="true"]'));
+    assert.equal(await card.evaluate(el=>window.cachedListCard===el),true,tab);
+  }
+});
+
+for(const theme of ['original','flat-dark','flat-light']) test(`Hub feature navigation uses sync colors in ${theme}`,async t=>{
+  const {page}=await fixture(t,theme,390);
+  for(const [tab,feature] of [['watchlist','watchlist'],['history','history'],['ratings','ratings'],['playback','progress'],['collection','collection']]) {
+    await page.locator(`[data-profile-tab="${tab}"]`).click();
+    assert.equal(await page.locator(`[data-profile-tab="${tab}"]`).evaluate((el,feature)=>{
+      const probe=document.createElement('span');probe.style.color=`rgb(var(--cw-feature-${feature}-rgb))`;document.body.append(probe);
+      const expected=getComputedStyle(probe).color;probe.remove();return getComputedStyle(el).borderBottomColor===expected;
+    },feature),true,tab);
+  }
+  assert.equal(await page.locator('[data-cw-profile-menu-action="preferences"]').count(),0);
+});
+
 for(const width of [390,1440]) test(`Hub restores cached cards before profile and provider requests at ${width}px`,async t=>{
   const {page,state}=await fixture(t,'flat-dark',width,{activity:true});
   await page.locator('#profile-progress .cw-cw-card[data-profile-poster-key]').first().waitFor();
   await page.waitForFunction(()=>Object.keys(localStorage).some(key=>key.includes('.overview') && JSON.parse(localStorage.getItem(key)).payload.progress));
+  await page.evaluate(()=>{
+    for(const key of Object.keys(localStorage).filter(key=>key.includes('.overview'))) {
+      const entry=JSON.parse(localStorage.getItem(key));entry.t=Date.now()-15*60*1000;localStorage.setItem(key,JSON.stringify(entry));
+    }
+  });
   let release;
   const gate=new Promise(resolve=>{release=resolve;});
   t.after(()=>release());
@@ -311,9 +356,6 @@ for(const width of [390,1440]) test(`Hub header follows playback and falls back 
   assert.equal(await heading.locator('img').evaluate(el=>getComputedStyle(el).backgroundColor),'rgba(0, 0, 0, 0)');
   assert.equal(await page.locator('.cw-media-hero-kicker').textContent(),'My Media Hub');
   assert.equal(await page.locator('.cw-media-hero-brand #profile-display-name').textContent(),'Mobile preview');
-  const picker=await page.locator('#cw-view-as').boundingBox();
-  const identity=await page.locator('.cw-profile-identity').boundingBox();
-  assert.ok(identity.x+identity.width<=picker.x);
   assert.equal(await page.locator('.cw-profile-avatar-badge').count(),0);
   assert.equal(await page.locator('#profile-hero-chips').isVisible(),width>760);
   assert.match(await heading.innerText(),/2026.*Movie/);
@@ -509,6 +551,34 @@ for(const width of [390,980,1440]) test(`Hub Progress keeps provider actions, fi
   await clickRecordControl(panel,'#profile-playback-refresh');
   await panel.locator('.cw-profile-empty').waitFor();
   await snapshot(page,`hub-progress-empty-${width}`);
+});
+
+for(const theme of ['original','flat-dark','flat-light'])for(const width of [390,1440])test(`Hub selection stays readable in ${theme} at ${width}px`,async t=>{
+  const {page}=await fixture(t,theme,width,{history:true});
+  await page.locator('[data-profile-tab="history"]').click();
+  const card=page.locator('#profile-panel-history .cw-tl-card').first();
+  await card.waitFor();
+  const background=await card.evaluate(node=>getComputedStyle(node).backgroundColor);
+  const select=card.locator('.cw-tl-select');
+  if(width<=760)assert.ok((await select.boundingBox()).width>=44);
+  await select.click();
+  assert.equal(await select.locator('input').isChecked(),true);
+  await page.mouse.move(0,0);
+  assert.equal(await card.evaluate(node=>getComputedStyle(node).backgroundColor),background);
+  const contrast=await select.evaluate(node=>{
+    const luminance=colour=>colour.match(/[\d.]+/g).slice(0,3).map(Number).map(value=>value/255).map(value=>value<=.04045?value/12.92:((value+.055)/1.055)**2.4).reduce((total,value,index)=>total+value*[.2126,.7152,.0722][index],0);
+    const mark=getComputedStyle(node.querySelector('.material-symbols-rounded'));
+    const background=getComputedStyle(node).backgroundColor;
+    const values=[luminance(mark.webkitTextFillColor),luminance(background==='rgba(0, 0, 0, 0)'?getComputedStyle(node,'::before').backgroundColor:background)].sort((a,b)=>b-a);
+    return (values[0]+.05)/(values[1]+.05);
+  });
+  assert.ok(contrast>=3,`Selected tick contrast: ${contrast}`);
+  await page.keyboard.press('Tab');
+  await select.locator('input').focus();
+  assert.notEqual(await select.evaluate(node=>getComputedStyle(node).outlineStyle),'none');
+  await snapshot(page,`hub-selection-${theme}-${width}`);
+  await page.keyboard.press('Space');
+  assert.equal(await select.locator('input').isChecked(),false);
 });
 
 for(const width of [390,1440]) test(`Hub History preserves filters, provider actions and timeline at ${width}px`,async t=>{
@@ -1027,4 +1097,32 @@ test('Hub shows observed live destinations without inventing resume actions', as
   await page.locator('.cw-card-action-menu [data-playback-action="update_progress"]').click();
   await page.locator('#profile-playback-edit[open]').waitFor();
   assert.match(await page.locator('#profile-playback-edit-sub').innerText(),/1 provider record/);
+});
+
+
+test('Hub direct history navigation loads only the selected list and hero preview',async t=>{
+  const {page,state}=await fixture(t,'flat-dark',390,{history:true});
+  state.queries=[];
+  await page.goto('https://profile-mobile.test/profile?direct=1#history');
+  await page.locator('#profile-panel-history .cw-hist-card').first().waitFor();
+  await page.waitForFunction(()=>document.querySelector('#profile-display-name').textContent==='Mobile preview');
+  const paths=state.queries.map(query=>query.path);
+  for(const path of ['/api/state/wall','/api/playback_progress/items','/api/insights','/api/profile/collection','/api/events/feed']) assert.equal(paths.includes(path),false,path);
+  assert.ok(state.queries.some(query=>query.path==='/api/dashboard/widgets' && query.params.include==='history,scrobble'));
+});
+
+test('Hub overview polls unfinished provider reads without replacing cached cards',async t=>{
+  const {page}=await fixture(t,'flat-dark',390);
+  await page.locator('#profile-progress [data-profile-poster-key]').first().waitFor();
+  let reads=0;
+  await page.route('**/api/playback_progress/items?**',async route=>{
+    assert.equal(new URL(route.request().url()).searchParams.get('progressive'),'true');
+    reads++;
+    await route.fulfill({json:{items:items.slice(0,1),loading:reads===1?[{provider:'PLEX',instance_id:'default'}]:[]}});
+  });
+  await page.reload({waitUntil:'domcontentloaded'});
+  await page.waitForFunction(()=>document.querySelectorAll('#profile-progress [data-profile-poster-key]').length===1);
+  await page.evaluate(()=>{window.progressCard=document.querySelector('#profile-progress [data-profile-poster-key]');});
+  await page.waitForResponse(response=>new URL(response.url()).pathname==='/api/playback_progress/items' && reads>=2);
+  assert.equal(await page.evaluate(()=>window.progressCard===document.querySelector('#profile-progress [data-profile-poster-key]')),true);
 });

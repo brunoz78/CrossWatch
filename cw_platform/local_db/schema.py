@@ -628,6 +628,9 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute("""CREATE TABLE IF NOT EXISTS pair_scope_owners (
             pair_scope TEXT PRIMARY KEY, pair_id TEXT NOT NULL, feature TEXT NOT NULL
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS pair_scope_moves (
+            old_scope TEXT PRIMARY KEY, new_scope TEXT NOT NULL, created_at INTEGER NOT NULL
+        )""")
         _ensure_column(conn, "baseline_items", "collected_at", "TEXT")
         for table in ("baseline_items", "pair_baseline_items"):
             _ensure_column(conn, table, "path_metadata_json", "TEXT")
@@ -664,6 +667,10 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute("""CREATE TABLE IF NOT EXISTS pair_analyzer_skips (
             pair_scope TEXT NOT NULL, feature TEXT NOT NULL, state_json TEXT NOT NULL, updated_at INTEGER NOT NULL,
             PRIMARY KEY(pair_scope,feature)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS pair_continue_rows (
+            pair_scope TEXT NOT NULL, provider TEXT NOT NULL, instance TEXT NOT NULL, state_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL, PRIMARY KEY(pair_scope,provider,instance)
         )""")
         conn.execute(_CREATE_MANUAL_POLICY_BLOCKS)
         conn.execute(_CREATE_MANUAL_POLICY_ADD_ITEMS)

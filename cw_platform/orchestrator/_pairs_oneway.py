@@ -275,7 +275,7 @@ from ._snapshots import (
 )
 from ._applier import apply_add, apply_remove, apply_update
 from ._chunking import effective_chunk_size
-from ._unresolved import load_unresolved_keys, load_unresolved_map, load_unresolved_pending, record_unresolved, clear_unresolved, clear_matched_history_retries, is_remove_retry_reason
+from ._unresolved import load_unresolved_keys, load_unresolved_map, load_unresolved_pending, record_unresolved, clear_unresolved, clear_matched_history_retries, clear_library_skipped, is_remove_retry_reason
 from ._planner import diff, diff_ratings, diff_progress, _pick_rating, _pick_rated_at, _ts_epoch
 from ._phantoms import PhantomGuard
 from ._tombstones import clear_items_for_feature, media_tombstone_tokens
@@ -285,6 +285,8 @@ from ._pairs_utils import (
     ratings_step_for,
     ratings_zero_for,
     collection_media_updates_for,
+    collection_copies_for,
+    collection_copy_details_for,
     declared_types_for,
     config_with_pair_libraries as _config_with_pair_libraries,
     _supports_feature,
@@ -316,6 +318,8 @@ from ._history_rewatches import (
 from ._history_copies import config_with_history_copies, copy_gap_adds, history_copies_requested, take_copy_gaps
 from ._history_resets import apply_reset_unwatches, load_reset_plan, preview_reset_unwatches
 from ._pair_skips import record_pair_skips
+from ..history_dates import split_unknown_dates
+from ._continue_watching import requested as continue_watching_requested, sync_removals as sync_continue_watching_removals
 
 # Blackbox imports
 from ._blackbox import load_blackbox_keys, record_attempts, record_success
@@ -1648,11 +1652,13 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         adds = list(adds) + gap_adds
 
     if feature == "collection" and bool((fcfg or {}).get("media_updates")) and collection_media_updates_for(dst_ops):
+        copies_ok = collection_copies_for(dst_ops)
+        details_ok = copies_ok and collection_copy_details_for(dst_ops, fcfg)
         for sv in (src_idx or {}).values():
-            if not isinstance(sv, Mapping) or not (sv.get("media_info") or sv.get("format")):
+            if not isinstance(sv, Mapping) or not (sv.get("media_info") or sv.get("format") or (copies_ok and sv.get("copies"))):
                 continue
             dv = _find_in_idx(dst_full, dst_alias, sv)
-            upd = _collection_media_update(sv, dv) if dv else None
+            upd = _collection_media_update(sv, dv, copies=copies_ok, private=details_ok) if dv else None
             if upd:
                 updates.append(upd)
         if updates:
@@ -1852,6 +1858,14 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
 
     adds = filter_provider_adds(dst_ops, dst_cfg, feature, adds)
 
+    adds, unknown_adds = split_unknown_dates(feature, dst_ops, adds, event_mode=history_event_mode,
+        emit=emit, provider=dst, instance=dst_inst)
+    updates, unknown_updates = split_unknown_dates(feature, dst_ops, updates, event_mode=history_event_mode,
+        emit=emit, provider=dst, instance=dst_inst, operation="update")
+    removes, unknown_removes = split_unknown_dates(feature, src_ops, removes, event_mode=history_event_mode,
+        emit=emit, provider=dst, instance=dst_inst, operation="remove")
+    unknown_skipped = len(unknown_adds) + len(unknown_updates) + len(unknown_removes)
+
     emit("one:plan", src=src, dst=dst, feature=feature,
         adds=len(adds), removes=len(removes), updates=len(updates),
         src_count=len(src_idx), dst_count=len(dst_full))
@@ -1871,6 +1885,8 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         planned_adds = list(adds)
         review_args = dict(source=src, source_instance=src_inst, before=dst_full, down=dst_down)
         review.excluded(feature, dst, dst_inst, "add", library_skipped, **review_args)
+        for operation, skipped in (("add", unknown_adds), ("update", unknown_updates), ("remove", unknown_removes)):
+            review.excluded(feature, dst, dst_inst, operation, skipped, result="skipped", **review_args)
         adds = review.filter(feature, dst, dst_inst, "add", adds, **review_args)
         updates = review.filter(feature, dst, dst_inst, "update", updates, **review_args)
         removes = review.filter(feature, dst, dst_inst, "remove", removes, **review_args)
@@ -1891,8 +1907,12 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
                 reset_plan.unwatch = reset_plan.settle(planned_adds, alias=_alias_index, find=_find_in_idx,
                                                        unblocked=lambda items: _filter_manual_block(items, manual_blocks))
                 preview_reset_unwatches(reset_plan, review=review, feature=feature, dst_inst=dst_inst, src_inst=src_inst, down=dst_down)
+            if continue_watching_requested(feature, fcfg) and not (src_down or dst_down or src_suspect or dst_suspect):
+                sync_continue_watching_removals(ctx.state_store, src=(src, src_inst, src_ops, src_cfg),
+                                                dst=(dst, dst_inst, dst_ops, dst_cfg), two_way=False,
+                                                dry_run=True, emit=emit, fcfg=fcfg, blocked=manual_blocks, review=review)
             return {"blocked": blocked_total, "manual_excluded": int(manual_blocked),
-                    "library_skipped": len(library_skipped), "cancelled": cancelled}
+                    "unknown_date_skipped": unknown_skipped, "library_skipped": len(library_skipped), "cancelled": cancelled}
 
     src_idx, dst_full = groups.restore(0, src_idx), groups.restore(1, dst_full)
     dst_canonical = groups.restore(1, dst_canonical)
@@ -1959,6 +1979,15 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         if resolved:
             resolved_items = {key: src_idx[event_key] for key, event_key in resolved.items()}
             _emit_item_resolutions(emit, dst, feature, pair_key, resolved, resolved_items, instance=dst_cfg.get("_cw_provider_instance"))
+
+    if library_skipped and not (cancelled or dry_run_flag or dst_down):
+        try:
+            cleared = clear_library_skipped(dst, feature, [it for it, _reason in library_skipped],
+                                            instance=dst_cfg.get("_cw_provider_instance"))
+            if cleared.get("count"):
+                emit("debug", msg="library_only.unresolved_cleared", feature=feature, dst=dst, count=cleared["count"])
+        except Exception:
+            pass
 
     if updates and not cancelled:
         if dst_down:
@@ -2356,6 +2385,11 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
             dry_run=dry_run_flag, emit=emit, review=review, src_inst=src_inst, dst_inst=dst_inst,
         )
 
+    if continue_watching_requested(feature, fcfg) and not (cancelled or src_down or dst_down or src_suspect or dst_suspect):
+        sync_continue_watching_removals(ctx.state_store, src=(src, src_inst, src_ops, src_cfg),
+                                        dst=(dst, dst_inst, dst_ops, dst_cfg), two_way=False,
+                                        dry_run=dry_run_flag, emit=emit, fcfg=fcfg, blocked=manual_blocks, review=review)
+
     if reset_plan and not (cancelled or src_down or dst_down or src_suspect or dst_suspect):
         reset_plan.unwatch = reset_plan.settle(adds, alias=_alias_index, find=_find_in_idx,
                                                unblocked=lambda items: _filter_manual_block(items, manual_blocks))
@@ -2491,14 +2525,14 @@ def run_one_way_feature(  # pyright: ignore[reportGeneralTypeIssues]
         "updated": int(updated_effective),
         "added": int(added_effective),
         "removed": int(removed_count),
-        "skipped": int((res_update or {}).get("skipped", 0)) + int((res_add or {}).get("skipped", 0)) + int((res_remove or {}).get("skipped", 0)),
+        "skipped": unknown_skipped + int((res_update or {}).get("skipped", 0)) + int((res_add or {}).get("skipped", 0)) + int((res_remove or {}).get("skipped", 0)),
         "unresolved": unresolved_total,
         "errors": int((res_update or {}).get("errors", 0)) + int((res_add or {}).get("errors", 0)) + int((res_remove or {}).get("errors", 0)),
         "skipped_exact": int((res_update or {}).get("skipped_exact", 0)) + int((res_add or {}).get("skipped_exact", 0)),
         "skipped_inferred": int((res_update or {}).get("skipped_inferred", 0)) + int((res_add or {}).get("skipped_inferred", 0)),
         "blocked": int(blocked_total),
         "manual_excluded": int(manual_blocked),
-        "library_skipped": len(library_skipped),
+        "unknown_date_skipped": unknown_skipped, "library_skipped": len(library_skipped),
         "res_add": res_add,
         "res_update": res_update,
         "res_remove": res_remove,

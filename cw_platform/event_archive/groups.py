@@ -10,6 +10,8 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable, ParamSpec, TypeVar
 
@@ -28,11 +30,24 @@ _Result = TypeVar("_Result")
 def _serialized(fn: Callable[_PArgs, _Result]) -> Callable[_PArgs, _Result]:
     @wraps(fn)
     def wrapped(*args: _PArgs.args, **kwargs: _PArgs.kwargs) -> _Result:
-        # Include version checks and reads so a rebuild cannot invalidate the
-        # groups another request is currently assembling.
         with _GROUP_LOCK:
             return fn(*args, **kwargs)
     return wrapped
+
+
+@contextmanager
+def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    if conn.in_transaction:
+        yield
+        return
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 _GROUP_COLUMNS = (
@@ -55,6 +70,7 @@ _SCROBBLE_STATUS = {
     "scrobble_playback": "running",
     "rating_applied": "rated",
     "rating_failed": "failed",
+    "rating_skipped": "skipped",
 }
 _AUDIT_STATUS = {
     "audit_login": "completed",
@@ -76,8 +92,9 @@ _AUDIT_STATUS = {
     "audit_2fa_failed": "failed",
     "audit_2fa_required": "informational",
 }
-_PAST = {"add": "added", "remove": "removed", "update": "updated", "tag_dropped": "marked dropped", "rewatch_reset": "marked unwatched"}
-_VERB = {"tag_dropped": "mark dropped", "rewatch_reset": "mark unwatched"}
+_PAST = {"add": "added", "remove": "removed", "update": "updated", "tag_dropped": "marked dropped", "rewatch_reset": "marked unwatched",
+         "hide_continue_watching": "hidden from Continue Watching"}
+_VERB = {"tag_dropped": "mark dropped", "rewatch_reset": "mark unwatched", "hide_continue_watching": "hide from Continue Watching"}
 _SEVERITY = {
     "completed": "success", "resolved": "success", "rated": "success",
     "warning": "warning", "blackboxed": "warning", "unresolved": "warning",
@@ -141,6 +158,27 @@ def _g(r: Any, key: str) -> Any:
         return None
 
 
+def _activity_hash(row: Any) -> str:
+    return group_hash({**dict(row), "destination_provider": None, "pair_key": None})
+
+
+@_serialized
+def _ensure_activity_hashes(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT g.id AS activity_group_id, g.group_hash, e.* FROM event_groups g "
+        "LEFT JOIN events e ON e.id=(SELECT MIN(id) FROM events WHERE group_id=g.id) "
+        "WHERE g.domain='scrobble' AND g.activity_hash IS NULL"
+    ).fetchall()
+    if not rows:
+        return
+    updates = [(_activity_hash(row) if row["id"] is not None else row["group_hash"], row["activity_group_id"]) for row in rows]
+    if conn.in_transaction:
+        conn.executemany("UPDATE event_groups SET activity_hash=? WHERE id=?", updates)
+    else:
+        with conn:
+            conn.executemany("UPDATE event_groups SET activity_hash=? WHERE id=?", updates)
+
+
 def _is_playlist_batch_event(r: Any) -> bool:
     if str(_g(r, "feature") or "").strip().lower() != "playlists":
         return False
@@ -149,9 +187,10 @@ def _is_playlist_batch_event(r: Any) -> bool:
 
 
 def group_hash(r: Any) -> str:
-    if str(_g(r, "domain") or "").strip().lower() == "audit":
+    if str(_g(r, "domain") or "").strip().lower() in ("audit", "capture", "backup"):
         ident = str(_g(r, "event_hash") or _g(r, "id") or _g(r, "created_at") or "").strip()
-        return hashlib.sha256(f"\x00audit\x1f{ident}".encode("utf-8", "replace")).hexdigest()
+        dom = str(_g(r, "domain") or "").strip().lower()
+        return hashlib.sha256(f"\x00{dom}\x1f{ident}".encode("utf-8", "replace")).hexdigest()
     if str(_g(r, "domain") or "sync") == "scrobble":
         token = session_token(_g(r, "session_key"), _g(r, "created_at"))
         ident = str(_g(r, "item_key") or "").strip() or str(_g(r, "title") or "").strip().lower()
@@ -205,6 +244,10 @@ def group_hash(r: Any) -> str:
 def _derive_status(events: list[dict[str, Any]], extra_problems: int = 0) -> str:
     types = {e.get("event_type") for e in events}
 
+    if any(str(e.get("domain") or "").strip().lower() in ("capture", "backup") for e in events):
+        last = max(events, key=lambda e: int(e.get("created_at") or 0))
+        return "failed" if str(last.get("event_type") or "").endswith("_failed") else "completed"
+
     if any(str(e.get("domain") or "").strip().lower() == "audit" for e in events):
         best, best_ts = "informational", -1
         for e in events:
@@ -254,7 +297,7 @@ def _derive_status(events: list[dict[str, Any]], extra_problems: int = 0) -> str
     if "sync_run_started" in types:
         return "running"
 
- 
+
     status_by_type = {
         "write_succeeded": "resolved",
         "unresolved_cleared": "resolved",
@@ -263,6 +306,7 @@ def _derive_status(events: list[dict[str, Any]], extra_problems: int = 0) -> str
         "unresolved_recorded": "unresolved",
         "write_failed": "failed",
         "write_attempted": "pending",
+        "write_skipped": "skipped",
     }
     best_status = None
     best_ts = -1
@@ -350,6 +394,9 @@ def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str
     types = {e.get("event_type") for e in events}
     last = events[-1] if events else {}
     feat_disp = str(feature or "").title()
+
+    if any(str(e.get("domain") or "").strip().lower() in ("capture", "backup") for e in events):
+        return str(last.get("title") or last.get("event_type") or "Capture").strip()
 
     if any(str(e.get("domain") or "").strip().lower() == "audit" for e in events):
         d = _detail(last)
@@ -475,6 +522,8 @@ def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str
             add("unresolved cleared")
         elif t == "write_succeeded":
             add(f"item {past} successfully")
+        elif t == "write_skipped":
+            add(f"{verb} skipped")
         elif t == "write_attempted":
             add(f"{verb} attempted")
         elif t == "plan_created":
@@ -543,6 +592,9 @@ def _summarize_scrobble(status: str, events: list[dict[str, Any]], dst: str) -> 
     if status == "paused":
         return f"Paused {name}{to}{tail}"
     if status == "skipped":
+        if any(e.get("event_type") == "rating_skipped" for e in events):
+            reason = str(_pick(events, "reason_code") or _pick(events, "reason") or "")
+            return f"Rating skipped: {name}{to}: {friendly_reason(reason)}" if reason else f"Rating skipped: {name}{to}"
         why = _skipped_delivery(_detail(playback or last))
         if not why:
             skip = next((e for e in reversed(events) if e.get("event_type") == "scrobble_skipped"), None)
@@ -561,19 +613,28 @@ def _pick(events: list[dict[str, Any]], key: str) -> Any:
     return None
 
 
-def _run_feature_issues(conn: sqlite3.Connection, run_id: Any) -> dict[str, int]:
+def _run_feature_issues(conn: sqlite3.Connection, run_id: Any, *, finished: bool = False) -> dict[str, int]:
     rid = str(run_id or "").strip()
     if not rid:
         return {}
     try:
+        frozen = conn.execute("SELECT feature, items FROM run_issue_counts WHERE run_id=?", (rid,)).fetchall()
+        if frozen:
+            return {str(r["feature"] or ""): int(r["items"]) for r in frozen if int(r["items"] or 0)}
         rows = conn.execute(
             f"SELECT feature, COUNT(DISTINCT item_key) c FROM events WHERE run_id=? "
             f"AND event_type IN {_UNRESOLVED_TYPES_SQL} AND item_key IS NOT NULL AND item_key<>'' GROUP BY feature",
             (rid,),
         ).fetchall()
+        out = {str(r["feature"] or "").strip().lower(): int(r["c"]) for r in rows if int(r["c"] or 0)}
+        if finished and out:
+            conn.executemany(
+                "INSERT OR IGNORE INTO run_issue_counts(run_id, feature, items) VALUES(?,?,?)",
+                [(rid, feature, items) for feature, items in out.items()],
+            )
+        return out
     except Exception:
         return {}
-    return {str(r["feature"] or "").strip().lower(): int(r["c"]) for r in rows if int(r["c"] or 0)}
 
 
 def _recompute(conn: sqlite3.Connection, group_id: int, now: int) -> None:
@@ -595,7 +656,7 @@ def _recompute(conn: sqlite3.Connection, group_id: int, now: int) -> None:
     feature = str(_pick(events, "feature") or "")
     norm_op = _norm_op(_pick(events, "operation"))
     dst = _P(_pick(events, "destination_provider"))
-    feat_issues = _run_feature_issues(conn, _pick(events, "run_id")) if is_run else {}
+    feat_issues = _run_feature_issues(conn, _pick(events, "run_id"), finished="sync_run_finished" in types) if is_run else {}
     status = _derive_status(events, sum(feat_issues.values()))
     severity = _SEVERITY.get(status, "info")
     playback = next((e for e in reversed(events) if e.get("event_type") == "scrobble_playback"), None)
@@ -650,9 +711,12 @@ def _recompute(conn: sqlite3.Connection, group_id: int, now: int) -> None:
         "status=?, severity=?, feature=?, operation=?, source_provider=?, source_instance=?, "
         "destination_provider=?, destination_instance=?, origin_provider=?, origin_instance=?, "
         "pair_key=?, direction=?, item_key=?, title=?, year=?, media_type=?, season=?, episode=?, "
-        "reason_code=?, reason=?, summary=? WHERE id=?",
-        vals,
+        "reason_code=?, reason=?, summary=?, health_only=? WHERE id=?",
+        (*vals[:-1], int(types == {"provider_health"}), group_id),
     )
+    if domain == "scrobble":
+        conn.execute("UPDATE event_groups SET activity_hash=? WHERE id=?", (_activity_hash(events[0]), group_id))
+
 
 
 def _persist_titles(conn: sqlite3.Connection, ids: list[int]) -> None:
@@ -737,28 +801,121 @@ def correlate(*, conn: sqlite3.Connection | None = None, reset: bool = False) ->
                 touched.add(gid)
             for gid in touched:
                 _recompute(c, gid, now)
+            if reset:
+                refresh_run_owned(c)
+            else:
+                _mark_run_owned(c, touched)
     except Exception as exc:
         _LOG.warning("event correlation failed: %s", exc, exc_info=True)
         return {"ok": False, "error": "internal_error", "grouped": 0}
     return {"ok": True, "grouped": len(rows), "groups_touched": len(touched)}
 
 
+_ITEM_GROUP_SQL = "COALESCE(operation,'')<>'run' AND COALESCE(item_key,'')<>''"
+
+
+def refresh_run_owned(c: sqlite3.Connection) -> None:
+    c.execute("UPDATE event_groups SET run_owned=0 WHERE run_owned<>0")
+    c.execute(
+        f"UPDATE event_groups SET run_owned=1 WHERE {_ITEM_GROUP_SQL} AND id IN ("
+        "SELECT pe.group_id FROM event_groups rg JOIN events pe "
+        f"ON pe.event_type IN {_PROBLEM_TYPES_SQL} "
+        "AND pe.created_at>=rg.first_event_at AND pe.created_at<=rg.last_event_at "
+        "WHERE rg.operation='run' AND pe.group_id IS NOT NULL)"
+    )
+
+
+def _mark_run_owned(c: sqlite3.Connection, gids: set[int]) -> None:
+    ids = sorted(gids)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        rows = c.execute(
+            "SELECT id, operation, item_key, first_event_at, last_event_at, run_owned FROM event_groups "
+            f"WHERE id IN ({','.join('?' for _ in part)})",
+            part,
+        ).fetchall()
+        for r in rows:
+            if r["operation"] == "run":
+                if r["first_event_at"] is None or r["last_event_at"] is None:
+                    continue
+                c.execute(
+                    f"UPDATE event_groups SET run_owned=1 WHERE run_owned=0 AND {_ITEM_GROUP_SQL} AND id IN ("
+                    f"SELECT group_id FROM events WHERE event_type IN {_PROBLEM_TYPES_SQL} "
+                    "AND created_at>=? AND created_at<=?)",
+                    (int(r["first_event_at"]), int(r["last_event_at"])),
+                )
+            elif str(r["item_key"] or "") and not r["run_owned"] and run_owned(c, int(r["id"])):
+                c.execute("UPDATE event_groups SET run_owned=1 WHERE id=?", (int(r["id"]),))
+
+
+def run_owned(c: sqlite3.Connection, group_id: int) -> bool:
+    return c.execute(
+        f"SELECT 1 FROM events pe WHERE pe.group_id=? AND pe.event_type IN {_PROBLEM_TYPES_SQL} "
+        "AND EXISTS (SELECT 1 FROM event_groups rg WHERE rg.operation='run' "
+        "AND rg.last_event_at>=pe.created_at AND rg.first_event_at<=pe.created_at) "
+        "ORDER BY pe.created_at DESC LIMIT 1",
+        (group_id,),
+    ).fetchone() is not None
+
+
 _RUN_SUMMARY_META = "run_route_summary_version"
 _RUN_SUMMARY_VERSION = 2
+_HIDE_SUMMARY_META = "continue_watching_hide_summary_version"
+_HIDE_SUMMARY_VERSION = 1
+_GROUP_FLAGS_META = "event_group_flags_version"
+_GROUP_FLAGS_VERSION = 1
+
+
+def _set_meta_version(c: sqlite3.Connection, meta: str, version: int, now: int) -> None:
+    c.execute(
+        "INSERT INTO local_meta(key,value_int,value_type,updated_at) VALUES(?,?,'int',?) "
+        "ON CONFLICT(key) DO UPDATE SET value_int=excluded.value_int,value_type=excluded.value_type,"
+        "updated_at=excluded.updated_at",
+        (meta, version, now),
+    )
+
+
+def _meta_done(c: sqlite3.Connection, meta: str, version: int) -> bool:
+    done = c.execute("SELECT value_int FROM local_meta WHERE key=?", (meta,)).fetchone()
+    return done is not None and int(done[0] or 0) >= version
 
 
 @_serialized
-def refresh_run_summaries(*, conn: sqlite3.Connection | None = None) -> int:
+def refresh_group_flags(*, conn: sqlite3.Connection | None = None) -> bool:
     c = conn or get_conn()
     if c is None:
-        return 0
+        return False
     try:
-        done = c.execute("SELECT value_int FROM local_meta WHERE key=?", (_RUN_SUMMARY_META,)).fetchone()
-        if done is not None and int(done[0] or 0) >= _RUN_SUMMARY_VERSION:
+        if _meta_done(c, _GROUP_FLAGS_META, _GROUP_FLAGS_VERSION):
+            return False
+        with c:
+            c.execute(
+                "UPDATE event_groups SET health_only=1 WHERE health_only=0 AND id IN ("
+                "SELECT group_id FROM events WHERE event_type='provider_health' AND group_id IS NOT NULL) "
+                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.group_id=event_groups.id "
+                "AND e.event_type<>'provider_health')"
+            )
+            refresh_run_owned(c)
+            c.execute(
+                "INSERT OR IGNORE INTO run_issue_counts(run_id, feature, items) "
+                "SELECT run_id, LOWER(TRIM(COALESCE(feature,''))), COUNT(DISTINCT item_key) FROM events "
+                f"WHERE event_type IN {_UNRESOLVED_TYPES_SQL} AND COALESCE(item_key,'')<>'' AND run_id IN ("
+                "SELECT run_id FROM events WHERE event_type='sync_run_finished' AND run_id IS NOT NULL) "
+                "GROUP BY run_id, LOWER(TRIM(COALESCE(feature,'')))"
+            )
+            _set_meta_version(c, _GROUP_FLAGS_META, _GROUP_FLAGS_VERSION, int(time.time()))
+        return True
+    except Exception as exc:
+        _LOG.warning("event group flag refresh failed: %s", exc, exc_info=True)
+        return False
+
+
+def _refresh_summaries(c: sqlite3.Connection, meta: str, version: int, where: str, label: str) -> int:
+    try:
+        if _meta_done(c, meta, version):
             return 0
         gids = [int(r[0]) for r in c.execute(
-            "SELECT DISTINCT group_id FROM events WHERE group_id IS NOT NULL "
-            "AND event_type IN ('sync_run_started','sync_run_finished')"
+            f"SELECT DISTINCT group_id FROM events WHERE group_id IS NOT NULL AND {where}"
         ).fetchall()]
         now = int(time.time())
         for i in range(0, len(gids), 200):
@@ -766,33 +923,58 @@ def refresh_run_summaries(*, conn: sqlite3.Connection | None = None) -> int:
                 for gid in gids[i:i + 200]:
                     _recompute(c, gid, now)
         with c:
-            c.execute(
-                "INSERT INTO local_meta(key,value_int,value_type,updated_at) VALUES(?,?,'int',?) "
-                "ON CONFLICT(key) DO UPDATE SET value_int=excluded.value_int,value_type=excluded.value_type,"
-                "updated_at=excluded.updated_at",
-                (_RUN_SUMMARY_META, _RUN_SUMMARY_VERSION, now),
-            )
+            _set_meta_version(c, meta, version, now)
         return len(gids)
     except Exception as exc:
-        _LOG.warning("run summary refresh failed: %s", exc, exc_info=True)
+        _LOG.warning("%s refresh failed: %s", label, exc, exc_info=True)
         return 0
 
 
 @_serialized
-def _ensure_correlated(conn: sqlite3.Connection) -> None:
+def refresh_run_summaries(*, conn: sqlite3.Connection | None = None) -> int:
+    c = conn or get_conn()
+    if c is None:
+        return 0
+    return _refresh_summaries(c, _RUN_SUMMARY_META, _RUN_SUMMARY_VERSION,
+                              "event_type IN ('sync_run_started','sync_run_finished')", "run summary")
+
+
+@_serialized
+def refresh_hide_summaries(*, conn: sqlite3.Connection | None = None) -> int:
+    c = conn or get_conn()
+    if c is None:
+        return 0
+    return _refresh_summaries(c, _HIDE_SUMMARY_META, _HIDE_SUMMARY_VERSION,
+                              "operation='hide_continue_watching'", "continue watching summary")
+
+
+def _correlation_version(conn: sqlite3.Connection) -> int:
     try:
-        appid = int(conn.execute("PRAGMA application_id").fetchone()[0] or 0)
+        return int(conn.execute("PRAGMA application_id").fetchone()[0] or 0)
     except Exception:
-        appid = CORRELATION_VERSION
-    if appid < CORRELATION_VERSION:
-        result = correlate(conn=conn, reset=True)
-        if not result.get("ok"):
-            return
-        try:
-            conn.execute(f"PRAGMA application_id={CORRELATION_VERSION}")
-        except Exception:
-            pass
-        return
+        return CORRELATION_VERSION
+
+
+def _flags_pending(conn: sqlite3.Connection) -> bool:
+    try:
+        return not _meta_done(conn, _GROUP_FLAGS_META, _GROUP_FLAGS_VERSION)
+    except Exception:
+        return False
+
+
+def _ensure_correlated(conn: sqlite3.Connection) -> None:
+    if _correlation_version(conn) < CORRELATION_VERSION:
+        with _GROUP_LOCK:
+            if _correlation_version(conn) < CORRELATION_VERSION:
+                result = correlate(conn=conn, reset=True)
+                if not result.get("ok"):
+                    return
+                try:
+                    conn.execute(f"PRAGMA application_id={CORRELATION_VERSION}")
+                except Exception:
+                    pass
+    if _flags_pending(conn):
+        refresh_group_flags(conn=conn)
     try:
         pending = conn.execute("SELECT 1 FROM events WHERE group_id IS NULL LIMIT 1").fetchone()
     except Exception:
@@ -826,7 +1008,6 @@ _CATEGORY_STATUS = {
 }
 
 
-@_serialized
 def list_groups(
     *,
     q: str | None = None,
@@ -851,12 +1032,15 @@ def list_groups(
     order: str | None = "newest",
     limit: int = 50,
     offset: int = 0,
+    activities: bool = False,
+    row_filter: Callable[[dict[str, Any]], bool] | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     c = conn or get_conn()
     if c is None:
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
-    _ensure_correlated(c)
+    if not c.in_transaction:
+        _ensure_correlated(c)
 
     clauses: list[str] = []
     params: list[Any] = []
@@ -877,7 +1061,8 @@ def list_groups(
 
     cat = _CATEGORY_STATUS.get(str(category or "").strip().lower())
     if cat:
-        clauses.append(f"g.status IN ({','.join('?' for _ in cat)})")
+        clause = f"g.status IN ({','.join('?' for _ in cat)})"
+        clauses.append(f"({clause} OR g.severity='error')" if category == "problems" else clause)
         params.extend(cat)
     eq("origin_provider", origin_provider, up=True)
     eq("destination_provider", destination_provider, up=True)
@@ -886,14 +1071,7 @@ def list_groups(
     eq("operation", operation)
 
     if top_level_only:
-        clauses.append(
-            "(g.operation='run' OR g.item_key IS NULL OR g.item_key='' OR NOT EXISTS ("
-            "SELECT 1 FROM events pe JOIN event_groups rg "
-            "ON rg.operation='run' AND pe.created_at>=rg.first_event_at AND pe.created_at<=rg.last_event_at "
-            "WHERE pe.group_id=g.id AND pe.event_type IN "
-            "('write_failed','unresolved_recorded','blackbox_promoted','blackbox_blocked')"
-            "))"
-        )
+        clauses.append("g.run_owned=0")
 
     if provider:
         p = provider.upper()
@@ -940,31 +1118,91 @@ def list_groups(
     if vc:
         clauses.append(vc)
 
-    # hide health-only groups 
+    # hide health-only groups
     explicit = str(visibility or "").strip().lower() == "all" or any(v not in (None, "") for v in (
         q, status, category, event_type, provider, origin_provider,
         destination_provider, source_provider, feature, pair_key, item_key, run_id, reason_code, operation,
     ))
     if not explicit and str(domain or "sync") != "scrobble":
-        clauses.append(
-            "g.id NOT IN (SELECT group_id FROM events WHERE group_id IS NOT NULL "
-            "GROUP BY group_id HAVING SUM(event_type='provider_health')=COUNT(*) AND COUNT(*)>0)"
-        )
+        clauses.append("g.health_only=0")
 
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     dir_ = "ASC" if str(order or "").strip().lower() in ("oldest", "asc") else "DESC"
     lim = max(1, min(int(limit or 50), 500))
     off = max(0, int(offset or 0))
+    if activities and domain == "scrobble":
+        _ensure_activity_hashes(c)
+    permission_function = f"cw_activity_allowed_{id(row_filter)}"
+    permission_columns = _GROUP_COLUMNS
+    if activities and domain == "scrobble" and row_filter:
+        c.create_function(permission_function, len(permission_columns), lambda *values: int(bool(row_filter(dict(zip(permission_columns, values))))))
+        where += (" AND " if where else " WHERE ") + f"{permission_function}({','.join('g.' + col for col in permission_columns)})=1"
     try:
-        total = int(c.execute(f"SELECT COUNT(*) FROM event_groups g{where}", params).fetchone()[0])
-        rows = c.execute(
-            f"SELECT {','.join('g.' + col for col in _GROUP_COLUMNS)} FROM event_groups g{where} "
-            f"ORDER BY g.last_event_at {dir_}, g.id {dir_} LIMIT ? OFFSET ?",
-            [*params, lim, off],
-        ).fetchall()
+        with _read_snapshot(c):
+            if activities and domain == "scrobble":
+                total = int(c.execute(f"SELECT COUNT(DISTINCT g.activity_hash) FROM event_groups g{where}", params).fetchone()[0])
+                keys = [row[0] for row in c.execute(
+                    f"SELECT g.activity_hash FROM event_groups g{where} GROUP BY g.activity_hash "
+                    f"ORDER BY MAX(g.last_event_at) {dir_}, g.activity_hash {dir_} LIMIT ? OFFSET ?",
+                    [*params, lim, off],
+                )]
+                if not keys:
+                    return {"items": [], "total": total, "limit": lim, "offset": off}
+                selected = (" AND " if where else " WHERE ") + f"g.activity_hash IN ({','.join('?' for _ in keys)})"
+                rows = c.execute(
+                    f"SELECT {','.join('g.' + col for col in _GROUP_COLUMNS)}, g.activity_hash, "
+                    "(SELECT latest.detail FROM events latest WHERE latest.group_id=g.id "
+                    "ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1) AS activity_detail "
+                    f"FROM event_groups g{where}{selected} ORDER BY g.last_event_at {dir_}, g.id {dir_}", [*params, *keys],
+                )
+                bundles: dict[str, dict[str, Any]] = {}
+                for row in rows:
+                    item = dict(row)
+                    try:
+                        values = json.loads(item.pop("activity_detail") or "{}")
+                    except (ValueError, TypeError):
+                        values = {}
+                    if isinstance(values, dict):
+                        item["rating"] = values.get("rating")
+                        item["progress"] = values.get("progress")
+                    key = item.pop("activity_hash")
+                    if key not in bundles:
+                        bundles[key] = {**item, "destinations": [], "event_count": 0}
+                    bundle = bundles[key]
+                    bundle["destinations"].append(item)
+                    bundle["event_count"] += int(item.get("event_count") or 0)
+                    bundle["first_event_at"] = min(bundle["first_event_at"], item["first_event_at"])
+                    if item["last_event_at"] > bundle["last_event_at"]:
+                        if bundle["status"] != "failed":
+                            bundle["status"] = item["status"]
+                            bundle["severity"] = item["severity"]
+                        bundle["rating"] = item.get("rating")
+                        bundle["progress"] = item.get("progress")
+                    bundle["last_event_at"] = max(bundle["last_event_at"], item["last_event_at"])
+                    if not item.get("acknowledged_at"):
+                        bundle["acknowledged_at"] = None
+                    if item.get("severity") == "error" or item.get("status") == "failed":
+                        bundle["severity"] = "error"
+                        bundle["status"] = "failed"
+                items = [bundles[key] for key in keys]
+                for item in items:
+                    item["destinations"] = _with_reason_labels(item["destinations"])
+                    if item["status"] != "failed" and any(row["status"] == "rated" for row in item["destinations"]):
+                        item["status"] = "rated"
+                        item["severity"] = "success"
+                return {"items": _with_reason_labels(items), "total": total, "limit": lim, "offset": off}
+            total = int(c.execute(f"SELECT COUNT(*) FROM event_groups g{where}", params).fetchone()[0])
+            rows = c.execute(
+                f"SELECT {','.join('g.' + col for col in _GROUP_COLUMNS)} FROM event_groups g{where} "
+                f"ORDER BY g.last_event_at {dir_}, g.id {dir_} LIMIT ? OFFSET ?",
+                [*params, lim, off],
+            ).fetchall()
     except Exception as exc:
         _LOG.warning("group list failed: %s", exc, exc_info=True)
         return {"items": [], "total": 0, "limit": lim, "offset": off}
+    finally:
+        if activities and domain == "scrobble" and row_filter:
+            c.create_function(permission_function, len(permission_columns), None)
     return {"items": _with_reason_labels([dict(r) for r in rows]), "total": total, "limit": lim, "offset": off}
 
 
@@ -1239,7 +1477,6 @@ def _run_problem_status_counts_bulk(
     return out
 
 
-@_serialized
 def list_tree(*, order: str | None = "newest", limit: int = 50, offset: int = 0,
               include_children: bool = True, domain: str | None = None,
               conn: sqlite3.Connection | None = None, **filters: Any) -> dict[str, Any]:
@@ -1249,6 +1486,15 @@ def list_tree(*, order: str | None = "newest", limit: int = 50, offset: int = 0,
     c = conn or get_conn()
     if c is None:
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
+    if not c.in_transaction:
+        _ensure_correlated(c)
+    with _read_snapshot(c):
+        return _build_tree(c, order=order, limit=limit, offset=offset,
+                           include_children=include_children, domain=domain, filters=filters)
+
+
+def _build_tree(c: sqlite3.Connection, *, order: str | None, limit: int, offset: int,
+                include_children: bool, domain: str | None, filters: dict[str, Any]) -> dict[str, Any]:
     visibility = filters.get("visibility", "open")
     active_filters = any(
         value not in (None, "")

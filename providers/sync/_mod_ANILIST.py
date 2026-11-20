@@ -55,6 +55,12 @@ def _confirmed_keys(key_of, items: Iterable[Mapping[str, Any]], unresolved: Any)
         seen.add(k)
     return out
 
+_UNKNOWN_DATES = {
+    "read": True, "write": True,
+    "rewatches": {"read": False, "write": False},
+    "multiple": {"read": False, "write": False},
+}
+
 __VERSION__ = "1.1"
 _MANUAL_RATING_SCALE = {"step": 1}
 os.environ.setdefault("CW_ANILIST_UA", http_user_agent("AniList", override_env="CW_ANILIST_UA"))
@@ -121,7 +127,7 @@ UA = os.environ.get("CW_ANILIST_UA") or os.environ.get("CW_UA") or http_user_age
 
 
 class ANILISTError(RuntimeError):
-    pass
+    status_code: int | None = None
 
 
 class ANILISTAuthError(ANILISTError):
@@ -260,7 +266,9 @@ class ANILISTClient:
         if r.status_code in (401, 403):
             raise ANILISTAuthError("AniList unauthorized")
         if r.status_code >= 400:
-            raise ANILISTError(f"AniList http:{r.status_code}")
+            error = ANILISTError(f"AniList http:{r.status_code}")
+            error.status_code = r.status_code
+            raise error
 
         errs = j.get("errors")
         if errs and not tolerate_errors:
@@ -298,6 +306,7 @@ def supported_features() -> dict[str, bool]:
 
 
 _HISTORY_CAPS: dict[str, Any] = {
+    "unknown_dates": _UNKNOWN_DATES,
     "types": {"movies": True, "shows": False, "seasons": False, "episodes": True},
     "upsert": False,
     "remove": True,

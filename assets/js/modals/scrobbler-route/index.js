@@ -469,7 +469,8 @@ function filtersPanel(r, f) {
     isStremio ? "" : `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">movie_filter</span><span><strong>Ignore Agregarr placeholder trailers</strong><small>Skip files marked as Trailer editions or stored beside .comingsoon markers.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-ignore-agregarr" ${f.ignore_agregarr_trailers ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`,
     `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">star</span><span><strong>Ignore specials (Season 0)</strong><small>Skip scrobbles for Season 0 / specials episodes.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-ignore-specials" ${f.ignore_specials ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`,
   ];
-  if (isPlex) toggles.push(`<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">live_tv</span><span><strong>Ignore Plex Live TV &amp; DVR</strong><small>Skip scrobbles from live channels and DVR recordings.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-live" ${f.ignore_live_tv_dvr ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`);
+  if (isPlex) toggles.push(`<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">live_tv</span><span><strong>Ignore Plex Live TV &amp; DVR</strong><small>Skip scrobbles from live channels and DVR recordings.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-live" ${f.ignore_live_tv_dvr !== false ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`);
+  if (r.provider === "jellyfin" || r.provider === "emby") toggles.push(`<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">live_tv</span><span><strong>Ignore Live TV</strong><small>Skip scrobbles from live TV channels and programs.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-live" ${f.ignore_live_tv_dvr !== false ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>`);
   return `
     <section class="scrm-panel ${activeTab === "filters" ? "active" : ""}" data-panel="filters">
       <div class="scrm-journey scrm-journey-compact">
@@ -660,13 +661,15 @@ function optionsPanel(r) {
       ${manualMarks}
       ${animeMapping}
       ${r.sink === "simkl" ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">replay</span><span><strong>Track rewatches</strong><small>Allow repeat watches on this route. Requires SIMKL Pro or VIP. SIMKL applies a 48-hour gap per movie or episode. Your watched threshold still applies, with a minimum of 80%.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-simkl-rewatches" ${r.options.watch?.simkl_rewatches === true ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>` : ""}
+      ${r.sink === "crosswatch" ? `<label class="scrm-toggle-row"><span class="scrm-toggle-copy"><span class="material-symbols-rounded">replay</span><span><strong>Track rewatches</strong><small>Save every completed watch as its own play. When off, a new watch replaces the latest play of that title.</small></span></span><span class="scrm-switch"><input type="checkbox" id="scr-cw-rewatches" ${r.options.watch?.crosswatch_rewatches === true ? "checked" : ""}><span class="scrm-switch-track"></span></span></label>
+      <div class="scrm-fields two">${field("Rewatch window (h)", `<input class="input" id="scr-cw-rewatch-window" type="number" min="1" max="168" value="${esc(r.options.watch?.crosswatch_rewatch_window_hours ?? "")}" placeholder="12">`, "", "Hours from 1 to 168. A watch of the same movie or episode within this window counts as the same play. Only used when Track rewatches is on.")}</div>` : ""}
     </section>
   `;
 }
 
 function globalRatingTargets() {
   const g = props.overview?.source_state?.global_plex_ratings || {};
-  return ["trakt", "simkl", "mdblist"].filter((s) => g[s]);
+  return Object.keys(g).filter((s) => g[s] === true);
 }
 
 function ratingsPanel(r, ratings, ratingTargets) {
@@ -685,7 +688,7 @@ function ratingsPanel(r, ratings, ratingTargets) {
       }).join("")
     : `<span class="scrm-muted">No configured rating destinations</span>`;
   const endpoint = r.ratings_webhook_url
-    ? `<div class="scrm-endpoint"><code title="${esc(r.ratings_webhook_url)}">${esc(r.ratings_webhook_url)}</code><button type="button" class="btn small material-symbols-rounded" data-copy="${esc(r.ratings_webhook_url)}" title="Copy URL" aria-label="Copy URL">content_copy</button><button type="button" class="btn small danger material-symbols-rounded" data-regen-route title="Regenerate URL" aria-label="Regenerate URL">sync_lock</button></div>`
+    ? `<div class="scrm-endpoint"><input type="text" readonly value="${esc(r.ratings_webhook_url)}" title="${esc(r.ratings_webhook_url)}" aria-label="Ratings webhook URL" spellcheck="false" data-copy-field><button type="button" class="btn small material-symbols-rounded" data-copy="${esc(r.ratings_webhook_url)}" title="Copy URL" aria-label="Copy URL">content_copy</button><button type="button" class="btn small danger material-symbols-rounded" data-regen-route title="Regenerate URL" aria-label="Regenerate URL">sync_lock</button></div>`
     : `<div class="scrm-note"><span class="material-symbols-rounded">link</span><span>Save the route to generate a route-specific ratings webhook URL.</span></div>`;
   return `
     <section class="scrm-panel ${activeTab === "ratings" ? "active" : ""}" data-panel="ratings">
@@ -818,7 +821,7 @@ function collect() {
     ignored_filename_patterns: split(root.querySelector("#scr-ignore-patterns")?.value),
     ignored_editions: split(root.querySelector("#scr-ignore-editions")?.value),
   };
-  if (provider === "plex") filters.ignore_live_tv_dvr = !!root.querySelector("#scr-live")?.checked;
+  if (provider === "plex" || provider === "jellyfin" || provider === "emby") filters.ignore_live_tv_dvr = !!root.querySelector("#scr-live")?.checked;
   const scrobble = {};
   const watched = root.querySelector("#scr-watched")?.value;
   const force = root.querySelector("#scr-force")?.value;
@@ -841,6 +844,11 @@ function collect() {
   if (manualMarksEl && ["plex", "jellyfin", "emby", "silo", "tofa"].includes(provider)) watch.manual_marks = !!manualMarksEl.checked;
   if (["crosswatch", "simkl"].includes(String(root.querySelector("#scr-sink")?.value || draft.sink || "").toLowerCase())) watch.anime_mapping = !!root.querySelector("#scr-anime-mapping")?.checked;
   if (String(root.querySelector("#scr-sink")?.value || draft.sink || "").toLowerCase() === "simkl") watch.simkl_rewatches = !!root.querySelector("#scr-simkl-rewatches")?.checked;
+  if (String(root.querySelector("#scr-sink")?.value || draft.sink || "").toLowerCase() === "crosswatch") {
+    watch.crosswatch_rewatches = !!root.querySelector("#scr-cw-rewatches")?.checked;
+    const rewatchWindow = root.querySelector("#scr-cw-rewatch-window")?.value ?? "";
+    if (rewatchWindow !== "") watch.crosswatch_rewatch_window_hours = Number(rewatchWindow);
+  }
   const ratingsMode = root.querySelector("#scr-ratings-mode")?.value || "off";
   const sinkValue = String(sinkEl?.value || draft.sink || "").toLowerCase();
   const previousDestination = draft?.options?.destination || {};
@@ -893,6 +901,7 @@ async function save(regenerate = false) {
   busy(true);
   try {
     const body = collect();
+    if (props.mode === "create") delete body.id;
     if (regenerate) body.regenerate_ratings_webhook = true;
     const data = props.mode === "create"
       ? await request("/api/scrobbler/routes", "POST", body)
@@ -1046,8 +1055,8 @@ export async function mount(shell, incoming = {}) {
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation?.();
-      await navigator.clipboard?.writeText(copy.dataset.copy);
-      flashCopied(copy);
+      if (await window.cwCopyText?.(copy.dataset.copy)) flashCopied(copy);
+      else window.cwSelectCopyField?.(copy.parentElement?.querySelector("[data-copy-field]"));
       preserveVisiblePanel(currentActiveTab());
       return;
     }

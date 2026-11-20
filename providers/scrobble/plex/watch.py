@@ -23,7 +23,7 @@ except Exception:
 from cw_platform.app_version import app_version, user_agent as http_user_agent
 from cw_platform.config_base import load_config, save_config
 from cw_platform.account_match import exact_media_account_name, media_account_allowed
-from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id
+from cw_platform.provider_instances import ensure_instance_block, get_provider_block, normalize_instance_id
 from providers.scrobble.scrobble import (
     Dispatcher,
     ScrobbleSink,
@@ -1877,7 +1877,7 @@ class WatchService:
             server_uuid=server_uuid,
             session_key=f"mark:{rk}:{attrs.get('lastViewedAt') or ''}",
             raw={
-                "Metadata": {"ratingKey": str(rk), "librarySectionID": section},
+                "Metadata": {"ratingKey": str(rk), "librarySectionID": section, "guid": attrs.get("guid") or ""},
                 "librarySectionID": section,
                 "_cw_manual_mark": True,
                 "_cw_preserve_stop": True,
@@ -2550,25 +2550,26 @@ def _library_allowed(cfg: dict[str, Any], payload: dict[str, Any]) -> bool:
     return str(lib_id).strip() in libs
 
 
-def _trakt_post_with_refresh(path: str, body: dict[str, Any], cfg: dict[str, Any]) -> Any:
+def _trakt_post_with_refresh(path: str, body: dict[str, Any], cfg: dict[str, Any], instance_id: Any = None) -> Any:
     from providers.scrobble.trakt import sink as trakt_sink
-    r = trakt_sink._post(path, body, cfg)
-    if r.status_code == 401 and trakt_sink._tok_refresh(cfg):
-        r = trakt_sink._post(path, body, cfg)
+    inst = normalize_instance_id(instance_id)
+    r = trakt_sink._post(path, body, cfg, inst)
+    if r.status_code == 401 and trakt_sink._tok_refresh(inst):
+        r = trakt_sink._post(path, body, cfg, inst)
     return r
 
 
-def _trakt_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: dict[str, Any], logger: Callable[..., None] | None) -> dict[str, Any]:
+def _trakt_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: dict[str, Any], logger: Callable[..., None] | None, instance_id: Any = None) -> dict[str, Any]:
     bucket = "movies" if media_type == "movie" else ("shows" if media_type == "show" else "episodes")
     ids2 = _sanitize_ids(ids)
     if not ids2:
         return {"ok": False, "error": "no_ids"}
     if rating == 0:
         body = {bucket: [{"ids": ids2}]}
-        r = _trakt_post_with_refresh("/sync/ratings/remove", body, cfg)
+        r = _trakt_post_with_refresh("/sync/ratings/remove", body, cfg, instance_id)
     else:
         body = {bucket: [{"ids": ids2, "rating": int(rating)}]}
-        r = _trakt_post_with_refresh("/sync/ratings", body, cfg)
+        r = _trakt_post_with_refresh("/sync/ratings", body, cfg, instance_id)
     try:
         j = r.json()
     except Exception:
@@ -2579,8 +2580,9 @@ def _trakt_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: d
     return {"ok": True, "status": r.status_code, "trakt": j}
 
 
-def _simkl_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: dict[str, Any], logger: Callable[..., None] | None) -> dict[str, Any]:
+def _simkl_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: dict[str, Any], logger: Callable[..., None] | None, instance_id: Any = None) -> dict[str, Any]:
     from providers.scrobble.simkl import sink as simkl_sink
+    cfg = {**cfg, "simkl": simkl_sink._merged_provider_block(cfg, "simkl", instance_id)}
     bucket = "movies" if media_type == "movie" else "shows"
     ids2 = _sanitize_ids(ids)
     if not ids2:
@@ -2602,8 +2604,9 @@ def _simkl_send_rating(media_type: str, ids: dict[str, Any], rating: int, cfg: d
 
 
 
-def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: float, cfg: dict[str, Any], logger: Callable[..., None] | None) -> dict[str, Any]:
-    md_cfg = (cfg.get("mdblist") or {}) if isinstance(cfg, dict) else {}
+def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: float, cfg: dict[str, Any], logger: Callable[..., None] | None, instance_id: Any = None) -> dict[str, Any]:
+    inst = normalize_instance_id(instance_id)
+    md_cfg = get_provider_block(cfg, "mdblist", inst) if isinstance(cfg, dict) else {}
     apikey = str(md_cfg.get("api_key") or "").strip()
     provider_auth = _provider_auth()
     if not provider_auth.is_configured("mdblist", md_cfg):
@@ -2647,7 +2650,7 @@ def _mdblist_send_rating(media_type: str, ids: dict[str, Any], rating: float, cf
                 "POST",
                 url,
                 cfg=cfg,
-                instance_id=(cfg.get("scrobble") or {}).get("watch", {}).get("route_sink_instance") if isinstance((cfg.get("scrobble") or {}).get("watch"), Mapping) else None,
+                instance_id=inst,
                 params={"apikey": apikey},
                 json=body,
                 timeout=tmo,
@@ -2747,7 +2750,15 @@ def process_rating_webhook(
         enable_myanimelist = bool(watch_cfg.get("plex_myanimelist_ratings"))
         enable_silo = bool(watch_cfg.get("plex_silo_ratings"))
 
-    if not (enable_trakt or enable_simkl or enable_mdblist or enable_crosswatch or enable_floppy or enable_punchplay or enable_flicklist or enable_scrob or enable_wetrakr or enable_anilist or enable_kitsu or enable_myanimelist or enable_silo):
+    rating_targets = {
+        name for name, enabled in (
+            ("trakt", enable_trakt), ("simkl", enable_simkl), ("mdblist", enable_mdblist),
+            ("crosswatch", enable_crosswatch), ("floppy", enable_floppy), ("punchplay", enable_punchplay),
+            ("flicklist", enable_flicklist), ("scrob", enable_scrob), ("wetrakr", enable_wetrakr),
+            ("anilist", enable_anilist), ("kitsu", enable_kitsu), ("myanimelist", enable_myanimelist), ("silo", enable_silo),
+        ) if enabled
+    }
+    if not rating_targets:
         return {"ok": True, "ignored": True}
 
     if not payload:
@@ -2787,13 +2798,10 @@ def process_rating_webhook(
     rating_val = _plex_rating_to_10(rating_raw) if rating_raw is not None else 0
     if rating_val is None:
         rating_val = 0
-    from providers.scrobble.plex.ratings_sync import plex_rating_value
+    from providers.scrobble.plex.ratings_sync import episode_rating_skips, plex_rating_value
 
     rating_precise = plex_rating_value(rating_raw)
 
-
-    if media_type == "episode" and not (enable_trakt or enable_crosswatch or enable_punchplay or enable_flicklist or enable_scrob or enable_wetrakr):
-        return {"ok": True, "ignored": True}
 
     acc_key = _account_key(payload)
     rk = str(md.get("ratingKey") or md.get("ratingkey") or "").strip()
@@ -2810,7 +2818,7 @@ def process_rating_webhook(
         from providers.webhooks.plex import _plex_show_ids_from_metadata, _show_ids_from_md
 
         season_show_ids = _show_ids_from_md(md) or _plex_show_ids_from_metadata(cfg, md, logger)
-        return {
+        season_results = {
             "ok": True,
             "action": "rating",
             "media_type": media_type,
@@ -2818,8 +2826,16 @@ def process_rating_webhook(
             "route_id": route_scope,
             "anilist": send_plex_rating(cfg, sink_inst, media_type, md, {}, season_show_ids, rating_precise),
         }
+        _archive_route_ratings(season_results, watch_cfg, payload, md, season_show_ids or {}, rating_precise, sink_inst)
+        return season_results
 
     ids = _all_ids_from_metadata(md)
+    results: dict[str, Any] = {"ok": True, "action": "rating", "media_type": media_type, "rating": rating_precise, "route_id": route_scope}
+    skipped = episode_rating_skips(media_type, rating_targets)
+    results.update(skipped)
+    if not rating_targets.difference(skipped):
+        _archive_route_ratings(results, watch_cfg, payload, md, ids, rating_precise, sink_inst)
+        return results
 
     if (not ids) and rk:
         try:
@@ -2839,30 +2855,36 @@ def process_rating_webhook(
             pass
 
     if not _sanitize_ids(ids):
+        if skipped:
+            _archive_route_ratings(results, watch_cfg, payload, md, ids, rating_precise, sink_inst)
+            return results
         _emit(logger, "rating event without usable external IDs; ignored", "DEBUG")
         return {"ok": True, "ignored": True}
 
-    results: dict[str, Any] = {"ok": True, "action": "rating", "media_type": media_type, "rating": rating_precise, "route_id": route_scope}
     if enable_trakt:
-        results["trakt"] = _trakt_send_rating(media_type, ids, rating_val, cfg, logger)
+        results["trakt"] = _trakt_send_rating(media_type, ids, rating_val, cfg, logger, sink_inst)
     if enable_simkl and media_type in ("movie", "show"):
-        results["simkl"] = _simkl_send_rating(media_type, ids, rating_val, cfg, logger)
+        results["simkl"] = _simkl_send_rating(media_type, ids, rating_val, cfg, logger, sink_inst)
     if enable_mdblist and media_type in ("movie", "show"):
-        results["mdblist"] = _mdblist_send_rating(media_type, ids, rating_precise, cfg, logger)
+        results["mdblist"] = _mdblist_send_rating(media_type, ids, rating_precise, cfg, logger, sink_inst)
     ops_enabled = [
         name
         for name, on in (("crosswatch", enable_crosswatch), ("floppy", enable_floppy), ("punchplay", enable_punchplay), ("flicklist", enable_flicklist), ("scrob", enable_scrob), ("wetrakr", enable_wetrakr), ("kitsu", enable_kitsu), ("myanimelist", enable_myanimelist), ("silo", enable_silo))
-        if on
+        if on and name not in skipped
     ]
     if ops_enabled:
         from providers.scrobble.plex.ratings_sync import dispatch_ops_ratings
 
         show_ids = episode_ids = None
         if media_type == "episode":
-            from providers.webhooks.plex import _episode_ids_from_md, _show_ids_from_md, _plex_show_ids_from_metadata
+            from providers.webhooks.plex import _cw_ids_for_payload, _episode_ids_from_md, _show_ids_from_md
 
             episode_ids = _episode_ids_from_md(md)
-            show_ids = _show_ids_from_md(md) or _plex_show_ids_from_metadata(cfg, md, logger)
+            ids = _cw_ids_for_payload(media_type, md, ids, cfg, logger=logger)
+            show_ids = {
+                **_show_ids_from_md(md),
+                **{key: ids[f"{key}_show"] for key in ("tmdb", "imdb", "tvdb") if ids.get(f"{key}_show")},
+            }
         results.update(
             dispatch_ops_ratings(
                 media_type,
@@ -2880,4 +2902,23 @@ def process_rating_webhook(
         from providers.scrobble.anilist.ratings import send_plex_rating
 
         results["anilist"] = send_plex_rating(cfg, sink_inst, media_type, md, ids, ids if media_type == "show" else None, rating_precise)
+    _archive_route_ratings(results, watch_cfg, payload, md, ids, rating_precise, sink_inst)
     return results
+
+
+def _archive_route_ratings(
+    results: Mapping[str, Any],
+    watch_cfg: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    md: Mapping[str, Any],
+    ids: Mapping[str, Any],
+    rating: Any,
+    sink_inst: str,
+) -> None:
+    from providers.scrobble.plex.ratings_sync import archive_rating_results
+
+    account = (payload.get("Account") or {}).get("title") if isinstance(payload.get("Account"), Mapping) else None
+    archive_rating_results(
+        results, media_type=str(md.get("type") or "").lower().strip(), md=md, ids=ids, account=account, rating=rating,
+        source_instance=watch_cfg.get("route_provider_instance"), instance_for=lambda _sink: sink_inst,
+    )

@@ -43,10 +43,12 @@
       if (toggle.getAttribute('aria-expanded') !== 'true') return;
       if (panel.contains(document.activeElement)) focusToggle();
       header.classList.remove('cw-nav-open');
+      panel.classList.remove('cw-mobile-tools-open');
       toggle.setAttribute('aria-expanded', 'false');
       $('cw-mobile-more')?.setAttribute('aria-expanded', 'false');
       window.cwCloseSettingsMenu?.();
       window.cwCloseAboutMenu?.();
+      window.cwCloseToolsMenu?.();
     };
     toggle.addEventListener('click', () => {
       if (toggle.getAttribute('aria-expanded') === 'true') return close();
@@ -110,7 +112,7 @@
       '<button id="cw-mobile-more" type="button" aria-controls="cw-mobile-navigation" aria-expanded="false"><span class="material-symbols-rounded" aria-hidden="true">menu</span><span>More</span></button>';
     document.body.appendChild(nav);
     document.body.classList.add('cw-has-bottom-nav');
-    const icons = {'tab-main':'home','tab-snapshots':'photo_library','tab-playlists':'queue_music','tab-tracker':'inventory_2','tab-editor':'edit_note','tab-settings':'tune','tab-profile':'bar_chart'};
+    const icons = {'tab-main':'home','tab-snapshots':'photo_library','tab-playlists':'queue_music','tab-tracker':'inventory_2','tab-tools':'handyman','tab-settings':'tune','tab-profile':'bar_chart'};
     document.querySelectorAll('#cw-mobile-navigation .tab').forEach(tab => {
       const icon = document.createElement('span');
       icon.className = 'material-symbols-rounded cw-mobile-destination-icon';
@@ -127,12 +129,64 @@
       openProfileTab('overview');
     };
     extra.addEventListener('click', openMediaHub);
+    const tools = document.createElement('div');
+    tools.className = 'cw-mobile-extra-destinations cw-mobile-tool-destinations';
+    $('tab-tools-menu')?.before(tools);
+    const navPanel = $('cw-mobile-navigation');
+    const showTools = (open) => {
+      navPanel.classList.toggle('cw-mobile-tools-open', open);
+      window.cwCloseToolsMenu?.();
+      (open ? tools.querySelector('.cw-mobile-tools-back') : $('tab-tools'))?.focus();
+    };
+    navPanel.addEventListener('click', event => {
+      if (!navPanel.classList.contains('cw-page-mobile-navigation')) return;
+      const control = event.target.closest('a[href], button, summary');
+      if (control && !control.matches(':disabled, [aria-disabled="true"]')) mobileNavigationFeedback();
+      const opener = event.target.closest('#tab-tools');
+      const back = event.target.closest('.cw-mobile-tools-back');
+      if (!opener && !back) return;
+      event.preventDefault();
+      event.stopPropagation();
+      showTools(!!opener);
+    }, true);
+    const toolItems = () => [...document.querySelectorAll('#cw-tools-menu .cw-menu-item[id^="tab-"]')]
+      .map(item => [
+        item.id.slice(4),
+        item.querySelector('.cw-menu-icon')?.textContent.trim() || 'build',
+        item.querySelector('span:not(.cw-menu-icon)')?.textContent.trim() || item.id.slice(4),
+      ])
+      .filter(([route]) => /^[a-z_]+$/.test(route));
+    const tileNode = (tag, icon, label) => {
+      const node = document.createElement(tag);
+      node.className = 'tab';
+      const mark = document.createElement('span');
+      mark.className = 'material-symbols-rounded';
+      mark.setAttribute('aria-hidden', 'true');
+      mark.textContent = icon;
+      const text = document.createElement('span');
+      text.textContent = label;
+      node.append(mark, text);
+      return node;
+    };
+    const toolTile = ([route, icon, label]) => {
+      const node = tileNode('a', icon, label);
+      node.href = `${routeBase}#${route}`;
+      node.dataset.mobileRoute = route;
+      return node;
+    };
+    const toolsBack = () => {
+      const node = tileNode('button', 'arrow_back', 'Back');
+      node.type = 'button';
+      node.classList.add('cw-mobile-tools-back');
+      return node;
+    };
     nav.addEventListener('click', openMediaHub);
     const renderShortcuts = () => {
       const items = [...fixed, ...shortcuts.map(route => choices.find(item => item[0] === route)).filter(Boolean)];
       nav.querySelectorAll('a').forEach(node => node.remove());
       $('cw-mobile-more').insertAdjacentHTML('beforebegin', items.map(item => link(item)).join(''));
       extra.innerHTML = choices.filter(item => !$(item[0] === 'profile/overview' ? 'tab-profile' : `tab-${item[0]}`) && !shortcuts.includes(item[0])).map(item => link(item, 'class="tab"')).join('');
+      tools.replaceChildren(toolsBack(), ...toolItems().filter(item => !shortcuts.includes(item[0])).map(toolTile));
       for (const route of ['main', 'tracker', 'snapshots', 'playlists', 'editor']) {
         $(`tab-${route}`)?.classList.toggle('cw-mobile-pinned', items.some(item => item[0] === route));
       }
@@ -337,7 +391,7 @@
   function markCurrentPage() {
     const onProfile = window.location.pathname === '/profile';
     const tab = document.querySelector('[data-profile-tab].active')?.dataset.profileTab || window.location.hash.slice(1).split('?')[0] || 'overview';
-    const current = onProfile && ['account','security','preferences'].includes(tab) ? (tab === 'preferences' ? 'preferences' : 'account') : '';
+    const current = onProfile && ['account','security','preferences'].includes(tab) ? 'account' : '';
     menu()?.querySelectorAll('[data-cw-profile-menu-action]').forEach(item => {
       if (item.dataset.cwProfileMenuAction === current) item.setAttribute('aria-current', 'page');
       else item.removeAttribute('aria-current');
@@ -463,7 +517,7 @@
       const icon = settings.querySelector('.cw-mobile-destination-icon');
       if (icon) icon.classList.add('cw-settings-icon');
     }
-    const destinations = ['snapshots','playlists','editor'].map(route => $(`tab-${route}`)).filter(Boolean);
+    const destinations = ['snapshots','playlists'].map(route => $(`tab-${route}`)).filter(Boolean);
     if (!destinations.length) return;
     const anchors = destinations.map(node => {
       const anchor = document.createComment('');
@@ -486,6 +540,7 @@
       close();
       if (open) {
         window.cwCloseSettingsMenu?.();
+        window.cwCloseToolsMenu?.();
         dropdown.classList.remove('hidden');
         toggle.setAttribute('aria-expanded','true');
         destinations[0].focus();

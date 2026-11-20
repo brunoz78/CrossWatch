@@ -1328,11 +1328,16 @@ class TrackerStore(TrackerAutomation):
         status: str = "",
         tag: str = "",
         duplicates: bool = False,
+        shelf: Iterable[str] | None = None,
     ) -> tuple[int, list[tuple[str, Any]]]:
         where, args = self._filters(feature, text=text, media=media, attention=attention, health=health, duplicates=duplicates)
         note_where, note_args = self._note_filters(status=status, tag=tag)
         where.extend(note_where)
         args.extend(note_args)
+        if shelf is not None:
+            shelf_where, shelf_args = self._shelf_filter(shelf)
+            where.append(shelf_where)
+            args.extend(shelf_args)
         if until:
             where.append("when_at < ?")
             args.append(until)
@@ -1359,6 +1364,50 @@ class TrackerStore(TrackerAutomation):
             return total, [(str(key), json.loads(data)) for key, data in rows]
         except Exception:
             raise TrackerUnreadable(feature, [DB_NAME])
+
+    def history_titles(
+        self, *, text: str = "", status: str = "", tag: str = "", sort: str = "recent", media: str = "",
+        offset: int = 0, limit: int = 60,
+    ) -> tuple[int, list[tuple[str, Any, str, int]]]:
+        kinds = "kind='movie'" if media == "movie" else "kind='episode' AND show_key IS NOT NULL" if media == "show" else "(kind='movie' OR (kind='episode' AND show_key IS NOT NULL))"
+        cte = (
+            "WITH titles AS (SELECT item_key, data, find, sort_title, when_at, "
+            f"{_ITEM_NOTE_KEY} AS title_key, COUNT(*) OVER (PARTITION BY {_ITEM_NOTE_KEY}) AS plays, "
+            f"ROW_NUMBER() OVER (PARTITION BY {_ITEM_NOTE_KEY} ORDER BY when_at DESC, item_key DESC) AS position "
+            f"FROM items WHERE scope='' AND feature='history' AND {kinds}) "
+        )
+        where, args = self._note_filters(status=status, tag=tag, key="titles.title_key")
+        where.append("position=1")
+        if text.strip():
+            where.append(
+                f"title_key IN (SELECT {_ITEM_NOTE_KEY} FROM items WHERE scope='' AND feature='history' "
+                f"AND {kinds} AND instr(find, ?) > 0)"
+            )
+            args.append(text.strip().lower())
+        clause = " AND ".join(where)
+        order = {
+            "recent": "when_at DESC, title_key",
+            "oldest": "when_at ASC, title_key",
+            "title": "sort_title, title_key",
+        }.get(sort, "when_at DESC, title_key")
+        with self._db() as conn:
+            if conn is None:
+                return 0, []
+            try:
+                total = int(self._cached(conn, "history_titles", (media, clause, *args), lambda: conn.execute(
+                    f"{cte}SELECT COUNT(*) FROM titles WHERE {clause}", args,
+                ).fetchone()[0]))
+                rows = conn.execute(
+                    f"{cte}SELECT item_key, data, title_key, plays FROM titles WHERE {clause} "
+                    f"ORDER BY {order} LIMIT ? OFFSET ?",
+                    [*args, max(1, min(int(limit), 200)), max(0, int(offset))],
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise TrackerUnreadable("history", [DB_NAME]) from exc
+        try:
+            return total, [(str(key), json.loads(data), str(title_key), int(plays)) for key, data, title_key, plays in rows]
+        except Exception:
+            raise TrackerUnreadable("history", [DB_NAME])
 
     def months(self, feature: str, *, text: str = "", media: str = "", status: str = "", tag: str = "", duplicates: bool = False) -> list[dict[str, Any]]:
         where, args = self._filters(feature, text=text, media=media, duplicates=duplicates)
@@ -1392,6 +1441,28 @@ class TrackerStore(TrackerAutomation):
             where.append(f"EXISTS (SELECT 1 FROM note_tags nt WHERE nt.title_key=({key}) AND nt.tag=?)")
             args.append(tag)
         return where, args
+
+    @staticmethod
+    def _shelf_filter(keys: Iterable[str]) -> tuple[str, list[Any]]:
+        movies: set[str] = set()
+        shows: set[str] = set()
+        for key in keys:
+            entity, _, tmdb = str(key or "").partition(":")
+            if not tmdb.isdigit():
+                continue
+            if entity == "movie":
+                movies.add(tmdb)
+            elif entity == "tv":
+                shows.add(tmdb)
+        parts: list[str] = []
+        args: list[Any] = []
+        if movies:
+            parts.append(f"(kind='movie' AND tmdb IN ({', '.join('?' for _ in movies)}))")
+            args.extend(sorted(movies))
+        if shows:
+            parts.append(f"(kind IN ('show', 'anime') AND tmdb IN ({', '.join('?' for _ in shows)}))")
+            args.extend(sorted(shows))
+        return (f"({' OR '.join(parts)})" if parts else "0"), args
 
     @staticmethod
     def _filters(feature: str, *, text: str = "", media: str = "", attention: bool = False, health: str = "", duplicates: bool = False) -> tuple[list[str], list[Any]]:
