@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "tools" / "i18n" / "strings.json"
 
 JS_GLOBS = ["assets/**/*.js"]
-PY_FILES = ["ui_frontend.py", "api/*.py", "crosswatch.py"]
+PY_FILES = ["ui_frontend.py", "api/*.py", "crosswatch.py", "providers/auth/*.py", "providers/metadata/*.py"]
 SKIP_PARTS = {"i18n", "vendor", "fonts", "img", "pwa"}
 
 ATTRS = ("title", "placeholder", "aria-label", "alt", "data-tip", "data-tooltip", "data-title", "data-label", "label")
