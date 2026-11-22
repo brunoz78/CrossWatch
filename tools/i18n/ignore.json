@@ -483,5 +483,8 @@
  "PublicMetaDB Settings > API",
  "Quick Connect",
  "SIMKL Developer",
- "Trakt Developer"
+ "Trakt Developer",
+ "&outcome=failed",
+ "&pair={0}",
+ "/art/lookup/{0}?{1}"
 ]
