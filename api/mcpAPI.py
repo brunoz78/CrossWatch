@@ -37,7 +37,10 @@ INSTRUCTIONS = (
     "For one missing or wrong item use search_events, get_item_events and get_analyzer_problems. "
     "Use list_sync_context and search_sync_items for saved account state, explain_sync_item for item evidence, "
     "list_saved_mappings and list_anime_overrides for user rules, compare_captures for saved changes, "
-    "get_scheduler_details for scheduling and list_sync_reviews for approvals. Saved state is not live provider state. "
+    "get_scheduler_details for scheduling and list_sync_reviews for approvals. "
+    "Use get_backup_status for backups, get_tracker_status for the CrossWatch Tracker, get_playlists_status for playlists, "
+    "get_progress_status for Continue watching and get_maintenance_status for maintenance jobs. "
+    "Saved state is not live provider state. "
     "Documentation: https://wiki.crosswatch.app/ (page index: https://wiki.crosswatch.app/llms.txt, "
     "docs MCP server: https://wiki.crosswatch.app/~gitbook/mcp)."
 )
@@ -152,7 +155,7 @@ def _tool_config(request: Request, args: dict[str, Any]) -> Any:
 def _tool_log_sessions(request: Request, args: dict[str, Any]) -> Any:
     from api import logsAPI
 
-    channel = _choice(args, "channel", ("sync", "watcher", "debug"), "sync")
+    channel = _choice(args, "channel", ("sync", "watcher", "debug", "captures", "backups", "audits", "system"), "sync")
     limit = _int(args, "limit", 20, 1, 100)
     rows = [row for row in logsAPI.archive().sessions(channel) if logsAPI.allowed(request, row)][:limit]
     return [
@@ -339,10 +342,10 @@ TOOLS: dict[str, tuple[str, str, dict[str, Any], Handler]] = {
     ),
     "list_log_sessions": (
         "List log sessions",
-        "Stored log sessions, newest first, with line, error and warning counts. A sync session is one sync run; watcher and debug sessions are one per day.",
+        "Stored log sessions, newest first, with line, error and warning counts. Sync, capture and backup sessions contain operation logs; watcher, audits and system sessions are grouped by day.",
         _schema(
             {
-                "channel": {"type": "string", "enum": ["sync", "watcher", "debug"], "description": "Defaults to sync."},
+                "channel": {"type": "string", "enum": ["sync", "watcher", "debug", "captures", "backups", "audits", "system"], "description": "Defaults to sync."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Defaults to 20."},
             }
         ),

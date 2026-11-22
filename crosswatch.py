@@ -771,10 +771,14 @@ WATCH_LOG_TAGS = {
     "KODI-WATCH",
     "SCROB-WATCH",
     "STREMIO-WATCH",
+    "SILO-WATCH",
+    "TOFA-WATCH",
     "ANIME-WATCH",
     "TRAKT-SINK",
     "SIMKL-SINK",
     "MDBLIST-SINK",
+    "WETRAKR-SINK",
+    "ANILIST-SINK",
     "FLOPPY-SINK",
     "CROSSWATCH-SINK",
     "FLICKLIST-SINK",
@@ -793,10 +797,14 @@ WATCH_LOG_DEFAULT_TAGS = [
     "KODI-WATCH",
     "SCROB-WATCH",
     "STREMIO-WATCH",
+    "SILO-WATCH",
+    "TOFA-WATCH",
     "ANIME-WATCH",
     "TRAKT-SINK",
     "SIMKL-SINK",
     "MDBLIST-SINK",
+    "WETRAKR-SINK",
+    "ANILIST-SINK",
     "FLOPPY-SINK",
     "CROSSWATCH-SINK",
     "FLICKLIST-SINK",
@@ -932,11 +940,11 @@ def ansi_to_html(line: str) -> str:
 
     return "".join(out)
 
-def _append_log_to_buffer(tag: str, raw_line: str) -> None:
+def _append_log_to_buffer(tag: str, raw_line: str, *, archive_line: bool = True) -> None:
     global WATCH_LOG_NEXT_SEQ
     t = _norm_log_tag(tag)
     safe_line = _redact_secrets_in_text(raw_line)
-    if t in {"SYNC", DIAG_LOG_TAG} or t in WATCH_LOG_TAGS:
+    if archive_line:
         from services.log_archive import capture
         capture(t, safe_line, watcher=t in WATCH_LOG_TAGS)
     html = ansi_to_html(safe_line.rstrip("\n"))
@@ -958,7 +966,7 @@ def _append_log(tag: str, raw_line: str) -> None:
     _append_log_to_buffer(t, raw_line)
     if t != DIAG_LOG_TAG:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _append_log_to_buffer(DIAG_LOG_TAG, f"[{ts}] [{t}] {raw_line}")
+        _append_log_to_buffer(DIAG_LOG_TAG, f"[{ts}] [{t}] {raw_line}", archive_line=False)
 
 def _install_ui_log_forwarder() -> None:
     try:
@@ -1089,11 +1097,13 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
         from services.tracker_storage_maintenance import start as _start_tracker_storage
         from services.tracker_month import start as _start_tracker_month
         from services.tracker_automation import start as _start_tracker_automation
+        from services.tracker_inventory import start as _start_tracker_inventory
 
         _start_tracker_migration(load_config() or {}, _tracker_config_dir)
         _start_tracker_storage(load_config, _tracker_config_dir)
         _start_tracker_month(load_config, _tracker_config_dir)
         _start_tracker_automation(load_config, _tracker_config_dir)
+        _start_tracker_inventory(load_config)
     except Exception as e:
         try:
             _UIHostLogger("SYNC")(f"tracker database move startup error: {e}", level="ERROR")
@@ -1169,10 +1179,12 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
             from services.tracker_storage_maintenance import stop as _stop_tracker_storage
             from services.tracker_month import stop as _stop_tracker_month
             from services.tracker_automation import stop as _stop_tracker_automation
+            from services.tracker_inventory import stop as _stop_tracker_inventory
 
             _stop_tracker_storage()
             _stop_tracker_month()
             _stop_tracker_automation()
+            _stop_tracker_inventory()
         except Exception:
             pass
         try:

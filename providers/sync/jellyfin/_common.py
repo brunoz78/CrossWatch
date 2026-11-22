@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform import capture_mode
 from cw_platform.path_matching import media_paths
 from .._path_matching import path_fallback
 from typing import Any, Mapping, Iterable, Sequence
@@ -43,8 +44,7 @@ def _pair_scope() -> str | None:
 
 
 def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return capture_mode.active("JELLYFIN")
 
 
 def _safe_scope(value: str) -> str:
@@ -1823,8 +1823,8 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
         return path_iid
 
     prio = _merged_guid_priority(adapter)
-    episode_pairs = all_ext_pairs(ids, prio)
     series_pairs = all_ext_pairs(show_ids, prio) if show_ids else []
+    episode_pairs = [p for p in all_ext_pairs(ids, prio) if p not in series_pairs]
     pairs = list(episode_pairs)
 
     if series_pairs:
@@ -2113,10 +2113,11 @@ def resolve_item_ids(adapter: Any, it: Mapping[str, Any], *, feature: str = "his
                 pairs.append(p)
 
     if _targeted_enabled(adapter):
+        series_pairs = all_ext_pairs(show_ids, prio) if show_ids else []
         found = _targeted_lookup_item_ids(
             adapter, it, feature=feature, pairs=pairs,
-            episode_pairs=all_ext_pairs(ids, prio),
-            series_pairs=all_ext_pairs(show_ids, prio) if show_ids else [],
+            episode_pairs=[p for p in all_ext_pairs(ids, prio) if p not in series_pairs],
+            series_pairs=series_pairs,
             selected_libs=selected_libs,
         )
         # Retain a validated native item even if a title search cannot find it.

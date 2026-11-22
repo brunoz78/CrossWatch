@@ -16,6 +16,7 @@ import re
 import time
 import uuid
 
+from cw_platform import capture_mode
 from cw_platform.config_base import CONFIG, load_config
 from cw_platform.modules_registry import load_sync_ops, state_read_features, sync_provider_names
 from cw_platform.provider_instances import (
@@ -29,6 +30,7 @@ from cw_platform.provider_instances import (
 )
 from cw_platform.run_control import SyncCancelled
 from services.capture_statuses import capture_statuses, comparison_statuses, guard_feature_restore, restore_statuses, status_records
+from services.log_archive import logged_operation, job_message
 
 Feature = Literal["watchlist", "ratings", "history", "progress", "collection"]
 CreateFeature = Literal["watchlist", "ratings", "history", "progress", "collection", "all"]
@@ -54,6 +56,8 @@ def _progress_percent(feature_index: int, feature_total: int, stage_fraction: fl
 
 
 def _capture_progress_update(progress_id: str | None, **updates: Any) -> None:
+    if updates.get('stage') and updates.get('message'):
+        job_message(str(updates['message']))
     pid = str(progress_id or "").strip()
     if not pid:
         return
@@ -518,6 +522,24 @@ def _ops_or_raise(provider: str):
     return ops
 
 
+def _build_index_with_progress(ops: Any, cfg_view: Mapping[str, Any], feat: Feature, progress_id: str | None) -> Any:
+    previous = ""
+    try:
+        from providers.sync import _log as provider_log
+
+        previous = provider_log.set_capture_progress_id(str(progress_id or ""))
+    except Exception:
+        provider_log = None  # type: ignore[assignment]
+    try:
+        return ops.build_index(cfg_view, feature=feat) or {}
+    finally:
+        try:
+            if provider_log is not None:  # type: ignore[name-defined]
+                provider_log.set_capture_progress_id(previous)  # type: ignore[name-defined]
+        except Exception:
+            pass
+
+
 def _build_index_capture_mode(
     *,
     ops: Any,
@@ -528,43 +550,8 @@ def _build_index_capture_mode(
     ts: datetime,
     progress_id: str | None = None,
 ) -> Any:
-    prev: dict[str, str | None] = {
-        "CW_CAPTURE_MODE": os.environ.get("CW_CAPTURE_MODE"),
-        "CW_CAPTURE_PROVIDER": os.environ.get("CW_CAPTURE_PROVIDER"),
-        "CW_CAPTURE_INSTANCE": os.environ.get("CW_CAPTURE_INSTANCE"),
-        "CW_CAPTURE_FEATURE": os.environ.get("CW_CAPTURE_FEATURE"),
-        "CW_CAPTURE_ID": os.environ.get("CW_CAPTURE_ID"),
-        "CW_CAPTURE_PROGRESS_ID": os.environ.get("CW_CAPTURE_PROGRESS_ID"),
-    }
-    os.environ["CW_CAPTURE_MODE"] = "1"
-    os.environ["CW_CAPTURE_PROVIDER"] = str(pid or "").strip().upper()
-    os.environ["CW_CAPTURE_INSTANCE"] = normalize_instance_id(instance)
-    os.environ["CW_CAPTURE_FEATURE"] = str(feat or "").strip().lower()
-    os.environ["CW_CAPTURE_ID"] = ts.strftime("%Y%m%dT%H%M%SZ")
-    if progress_id:
-        os.environ["CW_CAPTURE_PROGRESS_ID"] = str(progress_id)
-    else:
-        os.environ.pop("CW_CAPTURE_PROGRESS_ID", None)
-    log_progress_prev = ""
-    try:
-        from providers.sync import _log as provider_log
-
-        log_progress_prev = provider_log.set_capture_progress_id(str(progress_id or ""))
-    except Exception:
-        provider_log = None  # type: ignore[assignment]
-    try:
-        return ops.build_index(cfg_view, feature=feat) or {}
-    finally:
-        try:
-            if provider_log is not None:  # type: ignore[name-defined]
-                provider_log.set_capture_progress_id(log_progress_prev)  # type: ignore[name-defined]
-        except Exception:
-            pass
-        for key, value in prev.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    with capture_mode.capture(pid, normalize_instance_id(instance), str(feat or ""), ts.strftime("%Y%m%dT%H%M%SZ"), str(progress_id or "")):
+        return _build_index_with_progress(ops, cfg_view, feat, progress_id)
 
 
 @contextmanager
@@ -574,49 +561,14 @@ def _capture_mode_env(
     instance: str,
     feat: str,
 ) -> Iterator[None]:
-    prev: dict[str, str | None] = {
-        "CW_CAPTURE_MODE": os.environ.get("CW_CAPTURE_MODE"),
-        "CW_CAPTURE_PROVIDER": os.environ.get("CW_CAPTURE_PROVIDER"),
-        "CW_CAPTURE_INSTANCE": os.environ.get("CW_CAPTURE_INSTANCE"),
-        "CW_CAPTURE_FEATURE": os.environ.get("CW_CAPTURE_FEATURE"),
-        "CW_CAPTURE_ID": os.environ.get("CW_CAPTURE_ID"),
-    }
-    os.environ["CW_CAPTURE_MODE"] = "1"
-    os.environ["CW_CAPTURE_PROVIDER"] = str(pid or "").strip().upper()
-    os.environ["CW_CAPTURE_INSTANCE"] = normalize_instance_id(instance)
-    os.environ["CW_CAPTURE_FEATURE"] = str(feat or "").strip().lower()
-    os.environ["CW_CAPTURE_ID"] = "tools-clear"
-    try:
+    with capture_mode.capture(pid, normalize_instance_id(instance), feat, "tools-clear", capture_mode.progress_id()):
         yield
-    finally:
-        for key, value in prev.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 @contextmanager
 def _crosswatch_write_env() -> Iterator[None]:
-    keys = (
-        "CW_CAPTURE_MODE",
-        "CW_CAPTURE_PROVIDER",
-        "CW_CAPTURE_INSTANCE",
-        "CW_CAPTURE_FEATURE",
-        "CW_CAPTURE_ID",
-        "CW_CAPTURE_PROGRESS_ID",
-    )
-    prev = {key: os.environ.get(key) for key in keys}
-    for key in keys:
-        os.environ.pop(key, None)
-    try:
+    with capture_mode.writes():
         yield
-    finally:
-        for key, value in prev.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 def _state_read_feature_enabled(ops: Any, feature: Feature) -> bool:
@@ -1041,6 +993,7 @@ def _create_single_snapshot(
 
 
 
+@logged_operation('captures', lambda provider, feature, **kwargs: f'{provider} · {feature} capture')
 def create_snapshot(
     provider: str,
     feature: CreateFeature | str,
@@ -1236,6 +1189,7 @@ def _snapshot_sort_stamp(meta: Mapping[str, Any]) -> datetime:
     return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
+@logged_operation('captures', 'Capture retention cleanup')
 def enforce_capture_retention(
     provider: str,
     feature: CreateFeature | str,
@@ -1612,6 +1566,7 @@ def _restore_message(result):
     return message
 
 
+@logged_operation('captures', 'Delete capture')
 def delete_snapshot(path: str, *, delete_children: bool = True) -> dict[str, Any]:
     rel, p = _resolve_snapshot_file(path)
     base = _snapshots_dir().resolve()
@@ -1662,6 +1617,7 @@ def delete_snapshot(path: str, *, delete_children: bool = True) -> dict[str, Any
     return {"ok": len(errors) == 0, "deleted": deleted, "errors": errors}
 
 
+@logged_operation('captures', 'Delete all captures')
 def delete_all_snapshots() -> dict[str, Any]:
     base = _snapshots_dir().resolve()
     deleted: list[str] = []
@@ -1706,6 +1662,7 @@ def delete_all_snapshots() -> dict[str, Any]:
         },
     }
 
+@logged_operation('captures', 'Restore capture')
 def restore_snapshot(
     path: str,
     *,
@@ -1786,6 +1743,7 @@ def restore_snapshot(
     except (Exception, SyncCancelled) as e:
         _capture_progress_error(progress_id, e)
         raise
+@logged_operation('captures', 'Provider cleanup')
 def clear_provider_features(
     provider: str,
     features: Iterable[Feature],

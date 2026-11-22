@@ -17,6 +17,7 @@ from typing import Any, Callable, ParamSpec, TypeVar
 
 from .db import get_conn
 from . import query as _query
+from . import titles as _titles
 from .scrobble_recorder import session_token
 from ..reason_labels import friendly_reason
 
@@ -480,13 +481,14 @@ def _summarize(status: str, events: list[dict[str, Any]], feature: str, dst: str
 
     # aligned when no changes were needed
     if types <= {"plan_created"}:
-        d = _detail(last)
-        changes = sum(int(d.get(k) or 0) for k in ("adds", "removes", "updates"))
-        if changes == 0:
-            src = _P(_pick(events, "source_provider"))
-            route = f"{src} → {dst}" if (src and dst) else (dst or src or "")
-            left = f"{route}, " if route else ""
+        counts = {k: sum(int(_detail(e).get(k) or 0) for e in events) for k in ("adds", "removes", "updates")}
+        src = _P(_pick(events, "source_provider"))
+        route = _run_routes(events) or (f"{src} → {dst}" if (src and dst) else (dst or src or ""))
+        left = f"{route}, " if route else ""
+        if not any(counts.values()):
             return f"{left}{feat_disp or 'Feature'} aligned, no changes needed"
+        parts = [f"{n} to {w}" for w, n in (("add", counts["adds"]), ("remove", counts["removes"]), ("update", counts["updates"])) if n]
+        return f"{left}{feat_disp or 'Feature'} plan, {', '.join(parts)}"
 
     if str(feature or "").lower() == "ratings":
         rat = None
@@ -716,6 +718,7 @@ def _recompute(conn: sqlite3.Connection, group_id: int, now: int) -> None:
     )
     if domain == "scrobble":
         conn.execute("UPDATE event_groups SET activity_hash=? WHERE id=?", (_activity_hash(events[0]), group_id))
+    _titles.mark_dirty_for_groups(conn, (group_id,))
 
 
 
@@ -799,6 +802,7 @@ def correlate(*, conn: sqlite3.Connection | None = None, reset: bool = False) ->
                 gid = int(c.execute("SELECT id FROM event_groups WHERE group_hash=?", (gh,)).fetchone()[0])
                 c.executemany("UPDATE events SET group_id=? WHERE id=?", [(gid, i) for i in ids])
                 touched.add(gid)
+            _titles.assign(c, all_ids)
             for gid in touched:
                 _recompute(c, gid, now)
             if reset:
@@ -808,6 +812,10 @@ def correlate(*, conn: sqlite3.Connection | None = None, reset: bool = False) ->
     except Exception as exc:
         _LOG.warning("event correlation failed: %s", exc, exc_info=True)
         return {"ok": False, "error": "internal_error", "grouped": 0}
+    try:
+        _titles.refresh_dirty(c)
+    except Exception as exc:
+        _LOG.warning("event title refresh failed: %s", exc, exc_info=True)
     return {"ok": True, "grouped": len(rows), "groups_touched": len(touched)}
 
 
@@ -1582,6 +1590,7 @@ def acknowledge_group(group_id: Any, *, by: str | None = None, conn: sqlite3.Con
                 "UPDATE event_groups SET acknowledged_at=?, acknowledged_by=? WHERE id=? AND acknowledged_at IS NULL",
                 (ts, by, gid),
             )
+            _titles.mark_dirty_for_groups(c, (gid,))
         row = c.execute("SELECT acknowledged_at, acknowledged_by FROM event_groups WHERE id=?", (gid,)).fetchone()
     except Exception:
         _LOG.exception("group acknowledge failed")
@@ -1602,6 +1611,7 @@ def unacknowledge_group(group_id: Any, *, conn: sqlite3.Connection | None = None
     try:
         with c:
             c.execute("UPDATE event_groups SET acknowledged_at=NULL, acknowledged_by=NULL WHERE id=?", (gid,))
+            _titles.mark_dirty_for_groups(c, (gid,))
         row = c.execute("SELECT id FROM event_groups WHERE id=?", (gid,)).fetchone()
     except Exception:
         _LOG.exception("group unacknowledge failed")

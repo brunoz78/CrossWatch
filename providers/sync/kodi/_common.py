@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cw_platform import capture_mode
 from cw_platform.config_base import load_config, save_config
 from cw_platform.id_map import canonical_key, ids_from, keys_for_item, minimal as id_minimal
 from cw_platform.provider_instances import ensure_instance_block, normalize_instance_id, resolve_provider_block
@@ -496,7 +497,7 @@ def _progress_signature(item: Mapping[str, Any]) -> tuple[int | None, int | None
 
 
 def _is_capture_mode() -> bool:
-    return str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}
+    return capture_mode.active("KODI")
 
 
 def _load_kodi_feature_baseline(adapter: Any, feature: str) -> Mapping[str, Mapping[str, Any]]:
@@ -716,6 +717,41 @@ def library_result_rows(result: Any, key: str) -> list[Mapping[str, Any]]:
     return [row for row in rows if isinstance(row, Mapping)]
 
 
+def _own_episode_ids(item: Mapping[str, Any]) -> dict[str, str]:
+    ids = item.get("ids") if isinstance(item.get("ids"), Mapping) else {}
+    show_ids = item.get("show_ids") if isinstance(item.get("show_ids"), Mapping) else {}
+    out: dict[str, str] = {}
+    for key in ("tmdb", "tvdb", "imdb"):
+        value = str(ids.get(key) or "").strip().lower()
+        show_value = str(show_ids.get(key) or "").strip().lower()
+        if value and show_value and value != show_value:
+            out[key] = value
+    return out
+
+
+def _episode_id_candidates(item: Mapping[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if id_minimal(item).get("type") != "episode" or not candidates:
+        return candidates
+    wanted = _own_episode_ids(item)
+    if not wanted:
+        return candidates
+    owns = [(candidate, _own_episode_ids(candidate)) for candidate in candidates]
+    matched = [candidate for candidate, own in owns if any(own.get(k) == v for k, v in wanted.items())]
+    if matched:
+        return matched
+    return [candidate for candidate, own in owns if not set(own) & set(wanted)]
+
+
+def _addon_ref(item: Mapping[str, Any]) -> tuple[str, str] | None:
+    from providers.sync.kodi._addon_sync import REF_KEY
+
+    raw = item.get("_kodi_raw")
+    ref = raw.get(REF_KEY) if isinstance(raw, Mapping) else None
+    if isinstance(ref, list) and len(ref) == 2 and ref[0] and ref[1]:
+        return str(ref[0]), str(ref[1])
+    return None
+
+
 class LibraryIndex:
     def __init__(self, movies: Iterable[Mapping[str, Any]], episodes: Iterable[Mapping[str, Any]], tvshows: Iterable[Mapping[str, Any]]):
         self.items: list[dict[str, Any]] = []
@@ -768,10 +804,14 @@ class LibraryIndex:
 
     def resolve(self, item: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
         candidates = [c for c in self.candidates(item) if (to_int(c.get("_kodi_id")) or 0) > 0]
+        candidates = _episode_id_candidates(item, candidates)
         if len(candidates) == 1:
             return candidates[0], "ok"
         if not candidates:
             return None, "not_found"
+        refs = {_addon_ref(c) for c in candidates}
+        if len(refs) == 1 and None not in refs:
+            return min(candidates, key=lambda c: to_int(c.get("_kodi_id")) or 0), "ok"
         return None, "ambiguous"
 
 

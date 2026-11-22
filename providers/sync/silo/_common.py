@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
+from cw_platform import capture_mode
 from cw_platform.run_control import raise_if_cancelled
 
 import requests
@@ -135,6 +137,8 @@ def read_state(name: str, scope: str) -> dict[str, Any]:
 
 
 def write_state(name: str, scope: str, data: Mapping[str, Any]) -> None:
+    if capture_mode.active("SILO"):
+        return
     path = state_path(name, scope)
     with _STATE_LOCK:
         try:
@@ -224,6 +228,10 @@ def problem_of(resp: requests.Response) -> str:
     return ""
 
 
+def _optional_unavailable(status: int) -> bool:
+    return status in (403, 404, 409, 429) or status >= 500
+
+
 def pages(adapter: Any, path: str, *, feature: str, params: Mapping[str, Any] | None = None, allow_disabled: bool = False) -> list[dict[str, Any]] | None:
     out: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -234,8 +242,12 @@ def pages(adapter: Any, path: str, *, feature: str, params: Mapping[str, Any] | 
         if cursor:
             query["cursor"] = cursor
         resp = silo_request(adapter, "GET", path, params=query)
-        if resp.status_code == 409 and allow_disabled and problem_of(resp) in ("capability_disabled", "capability_not_configured"):
-            _dbg(feature, "capability_unavailable", path=path, reason=problem_of(resp))
+        if allow_disabled and _optional_unavailable(resp.status_code):
+            reason = problem_of(resp) or f"http_{resp.status_code}"
+            if resp.status_code == 409 and reason in ("capability_disabled", "capability_not_configured"):
+                _dbg(feature, "capability_unavailable", path=path, reason=reason)
+            else:
+                _warn(feature, "optional_read_unavailable", path=path, status=resp.status_code, reason=reason)
             return None
         if resp.status_code != 200:
             _warn(feature, "read_failed", path=path, status=resp.status_code, problem=problem_of(resp) or None)
@@ -277,6 +289,15 @@ def series_id_of(content_id: str) -> str:
     return f"series-{m.group(1)}-{m.group(2)}" if m else ""
 
 
+def session_content_id(row: Mapping[str, Any]) -> str:
+    return str(row.get("media_item_id") or row.get("content_id") or "").strip()
+
+
+def row_ids(row: Mapping[str, Any]) -> dict[str, str]:
+    ids = {k: str(row.get(f"{k}_id") or "").strip() for k in ("tmdb", "imdb", "tvdb")}
+    return {k: v for k, v in ids.items() if v}
+
+
 class Library:
     def __init__(self) -> None:
         self.movies: dict[str, dict[str, Any]] = {}
@@ -292,10 +313,22 @@ class Library:
         self.path_index: Any = None
         self.title_index: dict[tuple[str, str], list[str]] | None = None
         self.views: dict[frozenset[str], "Library"] = {}
+        self.listed: set[str] = set()
+        self.episode_ids_loaded: set[str] = set()
+        self.series_episodes: dict[str, list[str]] | None = None
+
+    def episodes_of(self, series_id: str) -> list[str]:
+        if self.series_episodes is None:
+            grouped: dict[str, list[str]] = {}
+            for cid, rec in self.episodes.items():
+                grouped.setdefault(rec["series_id"], []).append(cid)
+            self.series_episodes = grouped
+        return self.series_episodes.get(series_id, [])
 
     def subset(self, keep: set[str]) -> "Library":
         out = Library()
         out.scoped = True
+        out.listed = self.listed
         for cid, rec in self.movies.items():
             if cid in keep:
                 out.movies[cid] = rec
@@ -312,9 +345,16 @@ class Library:
                 out.episode_by_coord.setdefault((rec["series_id"], rec["season"], rec["episode"]), cid)
         return out
 
+    def _listed_ids(self, cid: str, row: Mapping[str, Any]) -> dict[str, str]:
+        _kind, ids = ids_from_content_id(cid)
+        listed = row_ids(row)
+        if listed:
+            self.listed.add(cid)
+        return {**ids, **listed}
+
     def add_movie(self, row: Mapping[str, Any]) -> None:
         cid = str(row.get("content_id") or "")
-        _kind, ids = ids_from_content_id(cid)
+        ids = self._listed_ids(cid, row)
         rec = {"content_id": cid, "ids": dict(ids), "title": str(row.get("title") or "").strip(), "year": as_int(row.get("year")), "runtime": as_int(row.get("runtime")),
                "added_at": iso_z(row.get("added_at"))}
         self.movies[cid] = rec
@@ -323,7 +363,7 @@ class Library:
 
     def add_series(self, row: Mapping[str, Any]) -> None:
         cid = str(row.get("content_id") or "")
-        _kind, ids = ids_from_content_id(cid)
+        ids = self._listed_ids(cid, row)
         rec = {"content_id": cid, "ids": dict(ids), "title": str(row.get("title") or "").strip(), "year": as_int(row.get("year")),
                "added_at": iso_z(row.get("added_at"))}
         self.series[cid] = rec
@@ -341,6 +381,7 @@ class Library:
             "series_id": sid,
             "season": s,
             "episode": e,
+            "ids": row_ids(row),
             "title": str(row.get("title") or "").strip(),
             "series_title": str(row.get("series_title") or "").strip(),
             "runtime": as_int(row.get("runtime")),
@@ -484,9 +525,7 @@ def ensure_details(adapter: Any, lib: Library, content_ids: list[str], *, featur
         data = safe_json(resp)
         if not isinstance(data, Mapping):
             continue
-        ids = {k: str(data.get(f"{k}_id") or "").strip() for k in ("tmdb", "imdb", "tvdb")}
-        ids = {k: v for k, v in ids.items() if v}
-        cache[cid] = {"ids": ids, "at": now}
+        cache[cid] = {"ids": row_ids(data), "at": now}
         fetched += 1
     if fetched:
         write_state("details", scope, cache)
@@ -513,8 +552,7 @@ def item_ids(adapter: Any, content_id: str, *, feature: str) -> dict[str, str]:
     data = item_detail(adapter, content_id, feature=feature)
     if not data:
         return {}
-    ids = {k: str(data.get(f"{k}_id") or "").strip() for k in ("tmdb", "imdb", "tvdb")}
-    ids = {k: v for k, v in ids.items() if v}
+    ids = row_ids(data)
     cache[content_id] = {"ids": ids, "at": int(time.time())}
     write_state("details", scope, cache)
     return ids
@@ -553,6 +591,14 @@ def _lookup(table: Mapping[str, str], ids: Mapping[str, str], order: tuple[str, 
     return ""
 
 
+def _series_pending(lib: Library) -> list[str]:
+    return [c for c, rec in lib.series.items() if c not in lib.listed and not ({"tmdb", "imdb"} & set(rec["ids"]))]
+
+
+def _movie_pending(lib: Library) -> list[str]:
+    return [c for c in lib.movies if c not in lib.listed and c.startswith(("movie-imdb-", "movie-tvdb-"))]
+
+
 def resolve_series(adapter: Any, lib: Library, show_ids: Mapping[str, Any] | None, *, feature: str) -> str:
     ids = ids_of_value(show_ids)
     if not ids:
@@ -563,10 +609,49 @@ def resolve_series(adapter: Any, lib: Library, show_ids: Mapping[str, Any] | Non
     if "series" in lib.detail_passes or not ({"tmdb", "imdb"} & set(ids)):
         return ""
     lib.detail_passes.add("series")
-    pending = [c for c, rec in lib.series.items() if not ({"tmdb", "imdb"} & set(rec["ids"]))]
+    pending = _series_pending(lib)
     if pending:
         ensure_details(adapter, lib, pending, feature=feature)
     return _lookup(lib.series_by_id, ids, ("tvdb", "tmdb", "imdb"))
+
+
+def _own_episode_ids(ids: Mapping[str, str], show_ids: Mapping[str, str]) -> dict[str, str]:
+    return {k: v for k, v in ids.items() if show_ids.get(k) and show_ids[k] != v}
+
+
+def _ensure_episode_ids(adapter: Any, lib: Library, series_id: str, *, feature: str) -> bool:
+    if series_id in lib.episode_ids_loaded:
+        return True
+    cids = lib.episodes_of(series_id)
+    if cids and all(lib.episodes[cid].get("ids") for cid in cids):
+        lib.episode_ids_loaded.add(series_id)
+        return True
+    lib.episode_ids_loaded.add(series_id)
+    try:
+        rows = pages(adapter, f"/catalog/items/{quote(series_id, safe='')}/episodes", feature=feature)
+    except SiloSyncError:
+        return False
+    if rows is None:
+        return False
+    for row in rows:
+        rec = lib.episodes.get(str(row.get("content_id") or ""))
+        if rec is not None:
+            rec["ids"] = {**(rec.get("ids") or {}), **row_ids(row)}
+    return True
+
+
+def _episode_by_ids(adapter: Any, lib: Library, series_id: str, wanted: Mapping[str, str], coord_cid: str, *, feature: str) -> tuple[str, bool]:
+    if not _ensure_episode_ids(adapter, lib, series_id, feature=feature):
+        return "", False
+    hits = [cid for cid in lib.episodes_of(series_id)
+            if any((lib.episodes[cid].get("ids") or {}).get(k) == v for k, v in wanted.items())]
+    if len(hits) == 1:
+        return hits[0], False
+    if len(hits) > 1:
+        return "", True
+    have = (lib.episodes.get(coord_cid) or {}).get("ids") or {} if coord_cid else {}
+    shared = set(have) & set(wanted)
+    return "", bool(shared) and all(have[k] != wanted[k] for k in shared)
 
 
 def resolve_movie(adapter: Any, lib: Library, ids_in: Mapping[str, Any] | None, *, feature: str) -> str:
@@ -579,7 +664,7 @@ def resolve_movie(adapter: Any, lib: Library, ids_in: Mapping[str, Any] | None, 
     if "movies" in lib.detail_passes:
         return ""
     lib.detail_passes.add("movies")
-    pending = [c for c in lib.movies if c.startswith(("movie-imdb-", "movie-tvdb-"))]
+    pending = _movie_pending(lib)
     if pending:
         ensure_details(adapter, lib, pending, feature=feature)
     return _lookup(lib.movie_by_id, ids, ("tmdb", "imdb", "tvdb"))
@@ -664,8 +749,7 @@ def path_index(adapter: Any, lib: Library, *, feature: str) -> PathIndex:
     cached = getattr(lib, "path_index", None)
     if cached is not None:
         return cached
-    for name, pending in (("series", [c for c, rec in lib.series.items() if not ({"tmdb", "imdb"} & set(rec["ids"]))]),
-                          ("movies", [c for c in lib.movies if c.startswith(("movie-imdb-", "movie-tvdb-"))])):
+    for name, pending in (("series", _series_pending(lib)), ("movies", _movie_pending(lib))):
         if name not in lib.detail_passes:
             lib.detail_passes.add(name)
             if pending:
@@ -752,6 +836,11 @@ def resolve_item(adapter: Any, lib: Library, item: Mapping[str, Any], *, feature
         s, e = as_int(item.get("season")), as_int(item.get("episode"))
         sid = resolve_series(adapter, lib, show_ids, feature=feature)
         cid = lib.episode_by_coord.get((sid, s, e), "") if sid and s is not None and e is not None else ""
+        wanted = _own_episode_ids(ids_of_value(ids), ids_of_value(show_ids))
+        if sid and wanted:
+            by_id, blocked = _episode_by_ids(adapter, lib, sid, wanted, cid, feature=feature)
+            if by_id or blocked:
+                return by_id, "episode"
         if not cid:
             cid = _by_path(adapter, lib, item, feature)
         if not cid and s is not None and e is not None:
@@ -815,6 +904,39 @@ def runtime_seconds(lib: Library, content_id: str) -> int:
     rec = lib.movies.get(content_id) or lib.episodes.get(content_id) or {}
     minutes = as_int(rec.get("runtime"))
     return minutes * 60 if minutes and minutes > 0 else 0
+
+
+def seconds_of(value: Any) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        seconds = float(str(value).strip())
+    except Exception:
+        return 0
+    return int(round(seconds)) if math.isfinite(seconds) and seconds > 0 else 0
+
+
+def detail_duration_seconds(detail: Mapping[str, Any]) -> int:
+    raw_data = detail.get("user_data")
+    data: Mapping[str, Any] = raw_data if isinstance(raw_data, Mapping) else {}
+    seconds = seconds_of(data.get("duration_seconds")) or seconds_of(detail.get("duration_seconds"))
+    if seconds:
+        return seconds
+    minutes = as_int(detail.get("runtime"))
+    if minutes and minutes > 0:
+        return minutes * 60
+    for version in detail.get("versions") or []:
+        seconds = seconds_of(version.get("duration")) if isinstance(version, Mapping) else 0
+        if seconds:
+            return seconds
+    return 0
+
+
+def item_duration_seconds(adapter: Any, lib: Library, content_id: str, *, feature: str) -> int:
+    seconds = runtime_seconds(lib, content_id)
+    if seconds:
+        return seconds
+    return detail_duration_seconds(item_detail(adapter, content_id, feature=feature))
 
 
 def chunks(rows: list[Any], size: int = WRITE_BATCH) -> list[list[Any]]:

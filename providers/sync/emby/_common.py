@@ -3,6 +3,7 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+from cw_platform import capture_mode
 from cw_platform.path_matching import media_paths
 from .._path_matching import path_fallback
 from cw_platform.interactive_reads import retained_read
@@ -32,8 +33,7 @@ def _pair_scope() -> str | None:
     return None
 
 def _is_capture_mode() -> bool:
-    v = str(os.getenv("CW_CAPTURE_MODE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return capture_mode.active("EMBY")
 
 def _safe_scope(value: str) -> str:
     s = "".join(ch if (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in str(value))
@@ -1770,12 +1770,12 @@ def resolve_item_id(adapter: Any, it: Mapping[str, Any], *, feature: str = "hist
     series_ids = dict(it.get("show_ids") or {})
     prio = _merged_guid_priority(adapter)
     ep_pairs = all_ext_pairs(ids, prio)
+    series_pairs = all_ext_pairs(series_ids, prio) if series_ids else []
     exact_episode_pairs = [
         pref
         for pref in ep_pairs
-        if pref.partition(".")[0] in ("tmdb", "imdb", "tvdb")
+        if pref.partition(".")[0] in ("tmdb", "imdb", "tvdb") and pref not in series_pairs
     ]
-    series_pairs = all_ext_pairs(series_ids, prio) if series_ids else []
     allowed_libs = sorted(selected_libs)
     hint_lib = str(
         it.get("library_id")

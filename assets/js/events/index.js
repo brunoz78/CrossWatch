@@ -2,8 +2,9 @@
 /* CrossWatch - Events page */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
-import {pageBackLink, statisticsReturn, returnFromEvents} from '../page-return.js';
+import {pageBackLink, returnFromEvents} from '../page-return.js';
 import {playbackDetail, playbackTimeline, playbackUpdatedAt} from './playback-timeline.js';
+import {bindCovers, createActivityCard, dayLabel, dayRange, renderRunDetail, renderTitleDetail, runRowsHTML, titleRowsHTML} from './titles.js';
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
@@ -178,7 +179,7 @@ const BADGE = {
   tombstone_created: "Tombstone created",
   tombstone_pruned: "Tombstone pruned",
   cloud_history_read: "Plex cloud history read",
-  plan_created: "Item planned",
+  plan_created: "Sync plan",
   provider_health: "Provider health",
   sync_run_started: "Sync started",
   sync_run_finished: "Sync finished",
@@ -282,7 +283,7 @@ const sevOf = (e) => {
   if (e.event_type === "write_failed") return "error";
   if (e.event_type === "write_succeeded") return isRating(e) ? "rating" : "ok";
   if (["blackbox_promoted", "blackbox_blocked"].includes(e.event_type)) return "error";
-  if (["unresolved_recorded", "plan_created", "api_rate_limit"].includes(e.event_type)) return "warn";
+  if (["unresolved_recorded", "api_rate_limit"].includes(e.event_type)) return "warn";
   if (["tombstone_created", "tombstone_pruned"].includes(e.event_type)) return "warn";
   if (["scrobble_completed", "rating_applied"].includes(e.event_type)) return "ok";
   if (["scrobble_failed", "rating_failed"].includes(e.event_type)) return "error";
@@ -295,6 +296,15 @@ const sevOf = (e) => {
   const s = String(e.severity || "").toLowerCase();
   if (s === "error" || s === "warn" || s === "ok") return s;
   return "info";
+};
+
+const planLine = (e) => {
+  const d = detailOf(e);
+  const route = [e.source_provider, e.destination_provider].filter(Boolean).map((p) => String(p).toUpperCase()).join(" → ");
+  const parts = [["add", d.adds], ["remove", d.removes], ["update", d.updates]].filter(([, n]) => Number(n) > 0).map(([w, n]) => `${Number(n).toLocaleString()} to ${w}`);
+  const known = [d.adds, d.removes, d.updates].some((n) => n != null);
+  const what = parts.length ? parts.join(", ") : known ? "nothing to change" : "";
+  return ["Plan", route, what].filter(Boolean).join(" · ");
 };
 
 const titleLine = (e) => {
@@ -315,7 +325,7 @@ const titleLine = (e) => {
     case "tombstone_created": return "Tombstone created";
     case "tombstone_pruned": return "Tombstone pruned";
     case "cloud_history_read": return `Plex cloud history: ${Number(detailOf(e).cloud_history_entries || 0)} entries included after merging with server history`;
-    case "plan_created": return "Add attempted";
+    case "plan_created": return planLine(e);
     case "provider_health": return `Provider health · ${(e.source_provider || "").toUpperCase()}`;
     case "sync_run_started": return "Sync run started";
     case "sync_run_finished": return "Sync run finished";
@@ -502,6 +512,7 @@ function createDropdown({ label, items, value, onChange, align = "auto" }) {
     reset() { cur = opts[0]?.value ?? ""; render(); },
     setItems(next) { opts = next.slice(); if (!opts.some((i) => i.value === cur)) cur = opts[0]?.value ?? ""; render(); },
     labelOf(v) { return opts.find((i) => i.value === v)?.label ?? String(v ?? ""); },
+    get items() { return opts.map((i) => i.value).filter(Boolean); },
     close,
   };
 }
@@ -555,20 +566,33 @@ export default {
     const initialVisibility = String(props?.visibility || "").trim().toLowerCase();
     const initialMode = String(props?.mode || "").trim().toLowerCase();
     const back = pageBackLink(props?.returnTo, location.href, 'events');
-    if (statisticsReturn(props?.returnContext)) back.label = 'Sync activity';
     let runFilter = String(props?.runId || props?.run_id || "").trim();
     let visibility = ["open", "acknowledged", "all"].includes(initialVisibility) ? initialVisibility : ls("cw.events.visibility", "all");
     if (runFilter || initialGroupId) visibility = ["open", "acknowledged", "all"].includes(initialVisibility) ? initialVisibility : "all";
     let order = ls("cw.events.order", "newest");
-    let mode = ["grouped", "raw"].includes(initialMode) ? initialMode : ls("cw.events.mode", "grouped");
-    if (initialGroupId) mode = "grouped";
+    const MODES = { sync: ["titles", "runs", "raw"], scrobble: ["titles", "raw"] };
+    const MODE_ITEMS = { titles: { label: "Titles", icon: "movie" }, runs: { label: "Runs", icon: "sync" }, grouped: { label: "Grouped", icon: "account_tree" }, raw: { label: "Raw events", icon: "list" } };
+    const modesFor = (d) => MODES[d] || ["grouped", "raw"];
+    const modeFor = (d, first = false) => {
+      if (first && (initialGroupId || initialMode === "grouped")) return "grouped";
+      const want = first ? initialMode : "";
+      if (want && modesFor(d).includes(want)) return want;
+      const saved = ls(`cw.events.mode.${d}`, "");
+      return modesFor(d).includes(saved) ? saved : modesFor(d)[0];
+    };
+    let mode = "grouped";
+    const grouped = () => mode === "grouped";
     let domain = ["sync", "scrobble", "audit", ...JOB_DOMAINS].includes(initialDomain) ? initialDomain : ls("cw.events.domain", "sync");
     let detailTab = ls("cw.events.detailtab", "details");
     lset("cw.events.order", order);
 
-    let needsAttention = false;
+    let quick = "all";
+    let selectedDay = null;
+    const openQuietRuns = new Set();
+    let titleTab = ls("cw.events.titletab", "path");
+    let tmdbOn = false;
     const checked = new Set();
-    const state = { items: [], page: 0, total: 0, selected: null, relExpanded: false, collapsed: new Set(), childLoading: new Set(), didInitialSelect: false };
+    const state = { items: [], page: 0, total: 0, selected: null, selectedPair: "", relExpanded: false, collapsed: new Set(), childLoading: new Set(), didInitialSelect: false, runs: [], preparing: false };
     const dropdowns = [];
 
     root.innerHTML = `
@@ -589,26 +613,40 @@ export default {
 
         <div class="ev-toolbar">
           <div class="ev-toolbar-row">
-            <label class="ev-search"><span class="material-symbols-rounded" aria-hidden="true">search</span><input id="ev-q" type="search" aria-label="Search events" placeholder="Search title, item, reason, run…"></label>
-
-            <span id="ev-attention"></span>
-            <span id="ev-range"></span>
-            <button class="ev-tbtn" id="ev-more" type="button" aria-label="Filters and display options" aria-expanded="false" aria-controls="ev-morefilters"><span class="material-symbols-rounded" aria-hidden="true">tune</span><span>Filters</span><span class="ev-more-dot" id="ev-more-dot" hidden></span><span class="material-symbols-rounded ev-tbtn-caret" aria-hidden="true">expand_more</span></button>
-            <button class="ev-tbtn ev-tbtn-refresh" id="ev-refresh" type="button" aria-label="Refresh events"><span class="material-symbols-rounded" aria-hidden="true">refresh</span><span>Refresh</span></button>
+            <div class="ev-search" id="ev-searchbar">
+              <span class="material-symbols-rounded" aria-hidden="true">search</span>
+              <span class="ev-mf-summary" id="ev-mf-summary" hidden></span>
+              <input id="ev-q" type="search" aria-label="Search events" placeholder="Search title, provider, reason…" autocomplete="off">
+              <button class="ev-filter-btn" id="ev-more" type="button" aria-label="Filters" aria-expanded="false" aria-controls="ev-morefilters" title="Filters"><span class="material-symbols-rounded" aria-hidden="true">tune</span><span class="ev-more-count" id="ev-more-dot" hidden></span></button>
+            </div>
+            <button class="ev-refresh" id="ev-refresh" type="button" aria-label="Refresh events" title="Refresh"><span class="material-symbols-rounded" aria-hidden="true">refresh</span></button>
           </div>
-          <div class="ev-morefilters" id="ev-morefilters" hidden>
-            <div class="ev-mf-row">
-              <span id="ev-cat"></span>
-              <span id="ev-review"></span>
-              <label class="ev-date" id="ev-since-wrap" hidden><span class="material-symbols-rounded" aria-hidden="true">event</span><input id="ev-since" type="date" aria-label="Since"></label>
-              <label class="ev-date" id="ev-until-wrap" hidden><span class="material-symbols-rounded" aria-hidden="true">event</span><input id="ev-until" type="date" aria-label="Until"></label>
-              <div class="ev-filters" id="ev-filters"></div>
-            ${isAdmin ? `<button class="ev-tbtn" id="ev-clear" type="button" title="Delete all events from the archive"><span class="material-symbols-rounded" aria-hidden="true">delete_sweep</span><span>Clear</span></button>` : ``}
-
+          <div class="ev-quick" id="ev-quick" role="group" aria-label="Quick views"></div>
+          <div class="ev-morefilters" id="ev-morefilters" role="dialog" aria-label="Filters" hidden>
+            <div class="ev-mf-grid">
+              <div class="ev-mf-field" data-f="range"><span class="ev-mf-label">When</span><span id="ev-range"></span>
+                <label class="ev-date" id="ev-since-wrap" hidden><span class="material-symbols-rounded" aria-hidden="true">event</span><input id="ev-since" type="date" aria-label="Since"></label>
+                <label class="ev-date" id="ev-until-wrap" hidden><span class="material-symbols-rounded" aria-hidden="true">event</span><input id="ev-until" type="date" aria-label="Until"></label>
+              </div>
+              <div class="ev-mf-field" data-f="outcome"><span class="ev-mf-label">Outcome</span><span id="ev-cat"></span></div>
+              <div class="ev-mf-field" data-f="review"><span class="ev-mf-label">Review</span><span id="ev-review"></span></div>
+              <div class="ev-mf-field" data-f="type"><span class="ev-mf-label">Type</span><span id="ev-f-type"></span></div>
+              <div class="ev-mf-field" data-f="provider"><span class="ev-mf-label" id="ev-f-provider-label">Provider</span><span id="ev-f-provider"></span></div>
+              <div class="ev-mf-field" data-f="to"><span class="ev-mf-label">To</span><span id="ev-f-to"></span></div>
+              <div class="ev-mf-field" data-f="origin"><span class="ev-mf-label">Origin</span><span id="ev-f-origin"></span></div>
+              <div class="ev-mf-field" data-f="feature"><span class="ev-mf-label">Feature</span><span id="ev-f-feature"></span></div>
+              <div class="ev-mf-field" data-f="pair"><span class="ev-mf-label">Pair</span><span id="ev-f-pair"></span></div>
+              <div class="ev-mf-field" data-f="profile"><span class="ev-mf-label">Profile</span><span id="ev-f-profile"></span></div>
+            </div>
+            <div class="ev-mf-foot">
+              <button type="button" class="ev-linkbtn" id="ev-mf-reset">Clear all filters</button>
+              <button type="button" class="ev-tbtn ev-mf-done" id="ev-mf-done">Done</button>
+              <span class="ev-mf-tip" id="ev-mf-tip">Tip: type from:plex or to:trakt</span>
+              ${isAdmin ? `<button class="ev-tbtn" id="ev-clear" type="button" title="Delete all events from the archive"><span class="material-symbols-rounded" aria-hidden="true">delete_sweep</span><span>Clear archive</span></button>` : ``}
             </div>
           </div>
-          <div class="ev-mf-summary" id="ev-mf-summary" hidden></div>
         </div>
+        <div id="ev-activity-host"></div>
 
         <div class="ev-layout">
           <div class="ev-col-list">
@@ -639,7 +677,8 @@ export default {
     const listEl = Q("#ev-list", root);
     const detailEl = Q("#ev-detail", root);
     const footEl = Q("#ev-foot", root);
-    const filtersEl = Q("#ev-filters", root);
+    const quickEl = Q("#ev-quick", root);
+    const activityHost = Q("#ev-activity-host", root);
     const toastEl = Q("#ev-toast", root);
     const qEl = Q("#ev-q", root);
     const countEl = Q("#ev-count", root);
@@ -781,8 +820,15 @@ export default {
       })();
     }
 
-    const hiddenDds = [ddType, ddProvider, ddOrigin, ddFeature, ddPair, ...(isAdmin ? [ddProfile] : [])];
-    for (const dd of hiddenDds) filtersEl.appendChild(dd.el);
+    const ddTo = createDropdown({ label: "Any destination", items: [{ value: "", label: "Any destination" }], onChange: () => load(0) });
+    Q("#ev-f-type", root).appendChild(ddType.el);
+    Q("#ev-f-provider", root).appendChild(ddProvider.el);
+    Q("#ev-f-to", root).appendChild(ddTo.el);
+    Q("#ev-f-origin", root).appendChild(ddOrigin.el);
+    Q("#ev-f-feature", root).appendChild(ddFeature.el);
+    Q("#ev-f-pair", root).appendChild(ddPair.el);
+    if (isAdmin) Q("#ev-f-profile", root).appendChild(ddProfile.el);
+    const hiddenDds = [ddType, ddProvider, ddTo, ddOrigin, ddFeature, ddPair, ...(isAdmin ? [ddProfile] : [])];
     dropdowns.push(ddCategory, ddRange, ...hiddenDds);
 
     const ddSort = createDropdown({
@@ -799,23 +845,68 @@ export default {
       onChange: (v) => { visibility = v; lset("cw.events.visibility", v); load(0); },
     });
     Q("#ev-review", root).appendChild(seg.el);
-    const attentionSeg = createSegmented({
-      items: [{value: "all", label: "All activity"}, {value: "attention", label: "Needs attention"}],
-      value: "all",
-      onChange: value => { needsAttention = value === "attention"; load(0); },
-    });
-    Q("#ev-attention", root).appendChild(attentionSeg.el);
 
+    const QUICK = {
+      titles: [["all", "Everything"], ["attention", "Needs attention"], ["watched", "Watched"], ["ratings", "Ratings"], ["watchlist", "Watchlist"], ["collection", "Collections"], ["removals", "Removals"]],
+      grouped: [["all", "All activity"], ["attention", "Needs attention"]],
+    };
+    const needsAttention = () => quick === "attention";
+    const renderQuick = () => {
+      const items = (domain === "scrobble" && mode === "titles" ? QUICK.titles.filter(([v]) => ["all", "attention", "watched", "ratings"].includes(v)) : QUICK[mode]) || [];
+      quickEl.hidden = !items.length;
+      const attn = titles() ? Number(state.attentionTotal || 0) : 0;
+      quickEl.innerHTML = items.map(([v, l]) => `<button type="button" class="ev-qchip${v === quick ? " on" : ""}" data-q="${esc(v)}" aria-pressed="${v === quick}">${v === "attention" && attn ? `<span class="ev-qdot" aria-hidden="true"></span>` : ""}${esc(l)}${v === "attention" && attn ? `<span class="ev-qcount">${esc(attn.toLocaleString())}</span>` : ""}</button>`).join("")
+        + (titles() && quick === "attention" ? `<button type="button" class="ev-tbtn ev-qreview" id="ev-review-all" hidden><span class="material-symbols-rounded" aria-hidden="true">done_all</span><span>Mark all reviewed</span></button>` : "");
+      Q("#ev-review-all", quickEl)?.addEventListener("click", () => reviewAll());
+      quickEl.querySelectorAll(".ev-qchip").forEach((b) => b.addEventListener("click", () => {
+        if (b.dataset.q === quick) return;
+        quick = b.dataset.q;
+        renderQuick();
+        load(0);
+      }));
+    };
 
-    const modeSeg = createSegmented({
-      cls: "ev-seg-mode",
-      items: [{ value: "grouped", label: "Grouped", icon: "account_tree" }, { value: "raw", label: "Raw events", icon: "list" }],
-      value: mode,
-      onChange: (v) => { mode = v; needsAttention = false; attentionSeg.value = "all"; Q("#ev-attention", root).hidden = v === "raw"; lset("cw.events.mode", v); ddCategory.el.style.display = (v === "grouped") ? "" : "none"; state.selected = null; clearDetail(); load(0); },
-    });
-    Q("#ev-mode", root).appendChild(modeSeg.el);
-    ddCategory.el.style.display = (mode === "grouped") ? "" : "none";
-    Q("#ev-attention", root).hidden = mode === "raw";
+    const titles = () => mode === "titles";
+    const runsMode = () => mode === "runs";
+    const TITLE_OUTCOMES = [{ value: "", label: "Any outcome" }, { value: "done", label: "Done" }, { value: "failed", label: "Failed" }, { value: "skipped", label: "Skipped" }, { value: "already", label: "Already there" }, { value: "pending", label: "In progress" }];
+    const setField = (name, on) => { const f = Q(`.ev-mf-field[data-f="${name}"]`, root); if (f) f.hidden = !on; };
+    const applyFieldUI = () => {
+      const audit = domain === "audit";
+      const capture = JOB_DOMAINS.includes(domain);
+      const backup = domain === "backup";
+      const sync = domain === "sync";
+      const t = titles(), r = runsMode(), g = grouped(), raw = mode === "raw";
+      ddCategory.setItems(t ? TITLE_OUTCOMES : (OUTCOME_ITEMS[domain] || OUTCOME_ITEMS.sync));
+      ddType.setItems(typeItems(domain));
+      if (!sync || t || r) { ddFeature.reset(); ddPair.reset(); }
+      if (audit || backup || r) ddProvider.reset();
+      if (audit || capture || t || r) ddOrigin.reset();
+      if (!t) ddTo.reset();
+      if (t || r) ddType.reset();
+      setField("range", !r);
+      setField("outcome", t || g);
+      setField("review", !r);
+      setField("type", g || raw);
+      setField("provider", !r && !audit && !backup);
+      setField("to", t);
+      setField("origin", (g || raw) && !audit && !capture);
+      setField("feature", (g || raw) && sync);
+      setField("pair", (g || raw) && sync);
+      setField("profile", isAdmin && !audit);
+      Q("#ev-f-provider-label", root).textContent = t ? "From" : "Provider";
+      Q("#ev-mf-tip", root).hidden = !t;
+      Q(".ev-bulk", root).hidden = t || r;
+      Q("#ev-sort", root).hidden = r;
+      qEl.placeholder = r ? "Filter runs…" : t ? "Search title, provider, reason…" : "Search title, item, reason, run…";
+    };
+
+    const modeHost = Q("#ev-mode", root);
+    const renderModeSeg = () => {
+      const items = [...modesFor(domain)];
+      if (mode === "grouped" && !items.includes("grouped")) items.splice(1, 0, "grouped");
+      const segm = createSegmented({ cls: "ev-seg-mode", items: items.map((v) => ({ value: v, ...MODE_ITEMS[v] })), value: mode, onChange: (v) => setMode(v) });
+      modeHost.replaceChildren(segm.el);
+    };
 
     const canAudit = isAdmin && !String(window.CW?.OverviewProfile?.id || "").trim();
     let view = initialDomain && ["sync", "scrobble", "audit", ...JOB_DOMAINS].includes(initialDomain) ? initialDomain : ls("cw.events.view", domain === "scrobble" ? "scrobble" : "sync");
@@ -830,20 +921,52 @@ export default {
     let statsView = null;
     let statsModule = null;
 
+    let activity = null;
+    let firstDomain = true;
+    const applyActivityUI = () => {
+      const show = domain === "sync" && view !== "statistics";
+      activityHost.hidden = !show;
+      if (show && !activity) {
+        activity = createActivityCard(activityHost, {
+          fetchJson: fjson,
+          store: { get: (k, d) => ls(`cw.events.activity.${k}`, d), set: (k, v) => lset(`cw.events.activity.${k}`, v) },
+          onPickDay: (index) => pickDay(index),
+        });
+        activity.setSelected(selectedDay);
+        void activity.load();
+      }
+    };
+
+    const applyModeUI = () => {
+      renderModeSeg();
+      renderQuick();
+      applyFieldUI();
+      applyActivityUI();
+    };
+
     const applyDomainUI = () => {
-      const scrobble = domain === "scrobble";
-      const audit = domain === "audit";
-      const capture = JOB_DOMAINS.includes(domain);
-      const backup = domain === "backup";
-      ddCategory.setItems(OUTCOME_ITEMS[domain] || OUTCOME_ITEMS.sync);
-      ddType.setItems(typeItems(domain));
-      if (scrobble || audit || capture) { ddFeature.reset(); ddPair.reset(); }
-      if (audit || backup) ddProvider.reset();
-      if (audit || capture) ddOrigin.reset();
-      ddFeature.el.style.display = (scrobble || audit || capture) ? "none" : "";
-      ddPair.el.style.display = (scrobble || audit || capture) ? "none" : "";
-      ddProvider.el.style.display = (audit || backup) ? "none" : "";
-      ddOrigin.el.style.display = (audit || capture) ? "none" : "";
+      mode = modeFor(domain, firstDomain);
+      firstDomain = false;
+      quick = "all";
+      applyModeUI();
+    };
+
+    const setMode = (v) => {
+      mode = v;
+      quick = "all";
+      if (MODES[domain] && v !== "grouped") lset(`cw.events.mode.${domain}`, v);
+      state.selected = null;
+      state.items = [];
+      clearDetail();
+      applyModeUI();
+      load(0);
+    };
+
+    const pickDay = (index) => {
+      selectedDay = index;
+      activity?.setSelected(index);
+      if (index != null) { dateRange = "all"; ddRange.value = "all"; syncRangeUI(); }
+      load(0);
     };
 
     const VIEW_TABS = [
@@ -904,7 +1027,7 @@ export default {
     const placeProfileDd = () => {
       if (!isAdmin) return;
       const stats = view === "statistics";
-      const host = stats ? tabsRightEl : filtersEl;
+      const host = stats ? tabsRightEl : Q("#ev-f-profile", root);
       if (ddProfile.el.parentElement !== host) host.insertBefore(ddProfile.el, host.firstChild);
       ddProfile.el.style.display = domain === "audit" && !stats ? "none" : "";
     };
@@ -913,6 +1036,7 @@ export default {
       const stats = view === "statistics";
       toolbarEl.style.display = stats ? "none" : "";
       layoutEl.hidden = stats;
+      applyActivityUI();
       statsEl.hidden = !stats;
       tabsRightEl.hidden = !stats;
       renderViewTabs();
@@ -951,6 +1075,7 @@ export default {
     };
 
     const rangeEpoch = () => {
+      if (selectedDay != null) { const r = dayRange(selectedDay); return { since: String(r.since), until: String(r.until) }; }
       const nowSec = Math.floor(Date.now() / 1000);
       if (dateRange === "24h") return { since: String(nowSec - 86400), until: "" };
       if (dateRange === "7d") return { since: String(nowSec - 7 * 86400), until: "" };
@@ -968,8 +1093,9 @@ export default {
       return "Custom range";
     };
 
-    const hiddenActive = () => !!(visibility !== "all" || (grouped() && ddCategory.value) || eventScope || runFilter || ddType.value || ddProvider.value || ddOrigin.value || ddFeature.value || ddPair.value || (dateRange && dateRange !== "all"));
-    const filtersActive = () => needsAttention || !!(qEl.value.trim() || (grouped() && ddCategory.value) || hiddenActive());
+    const outcomeOn = () => (grouped() || titles()) && ddCategory.value;
+    const hiddenActive = () => !!(visibility !== "all" || outcomeOn() || eventScope || runFilter || (selectedDay != null && !runsMode()) || ddType.value || ddProvider.value || ddTo.value || ddOrigin.value || ddFeature.value || ddPair.value || (dateRange && dateRange !== "all"));
+    const filtersActive = () => quick !== "all" || !!(qEl.value.trim() || hiddenActive());
 
     const clearHidden = (k) => {
       const all = !k;
@@ -982,6 +1108,8 @@ export default {
       if (all || k === "feature") ddFeature.reset();
       if (all || k === "pair") ddPair.reset();
       if (all || k === "run") runFilter = "";
+      if (all || k === "day") { selectedDay = null; activity?.setSelected(null); }
+      if (all || k === "to") ddTo.reset();
       if (isAdmin && (all || k === "profile")) { eventScope = ""; ddProfile.value = ""; }
       if (view === "statistics") loadStats();
       else load(0);
@@ -989,25 +1117,27 @@ export default {
 
     const updateHidden = () => {
       const chips = [];
-      if (visibility !== "all") chips.push({ k: "review", label: visibility === "open" ? "Unreviewed" : "Reviewed" });
-      if (grouped() && ddCategory.value) chips.push({ k: "outcome", label: ddCategory.labelOf(ddCategory.value) });
-      if (runFilter) chips.push({ k: "run", label: `Run: ${runFilter}` });
+      if (selectedDay != null && !runsMode()) chips.push({ k: "day", label: dayLabel(selectedDay) });
+      if (visibility !== "all" && !runsMode()) chips.push({ k: "review", label: visibility === "open" ? "Unreviewed" : "Reviewed" });
+      if (outcomeOn()) chips.push({ k: "outcome", label: ddCategory.labelOf(ddCategory.value) });
+      if (runFilter) chips.push({ k: "run", label: runsMode() ? "Run selected" : "One run" });
       if (dateRange && dateRange !== "all") chips.push({ k: "range", label: dateRange === "custom" ? customRangeLabel() : RANGE_LABEL[dateRange] });
       if (ddType.value) chips.push({ k: "type", label: ddType.labelOf(ddType.value) });
-      if (ddProvider.value) chips.push({ k: "provider", label: ddProvider.labelOf(ddProvider.value) });
+      if (ddProvider.value) chips.push({ k: "provider", label: titles() ? `From: ${ddProvider.labelOf(ddProvider.value)}` : ddProvider.labelOf(ddProvider.value) });
+      if (ddTo.value) chips.push({ k: "to", label: `To: ${ddTo.labelOf(ddTo.value)}` });
       if (ddOrigin.value) chips.push({ k: "origin", label: `Origin: ${ddOrigin.labelOf(ddOrigin.value)}` });
       if (ddFeature.value) chips.push({ k: "feature", label: ddFeature.labelOf(ddFeature.value) });
       if (ddPair.value) chips.push({ k: "pair", label: ddPair.labelOf(ddPair.value) });
       if (isAdmin && eventScope) chips.push({ k: "profile", label: ddProfile.labelOf(eventScope) });
       const active = chips.length > 0;
       moreDotEl.hidden = !active;
+      moreDotEl.textContent = active ? String(chips.length) : "";
       moreBtn.classList.toggle("has-active", active);
+      moreBtn.setAttribute("aria-label", active ? `Filters, ${chips.length} active` : "Filters");
       if (!active) { summaryEl.hidden = true; summaryEl.innerHTML = ""; return; }
       summaryEl.hidden = false;
-      summaryEl.innerHTML = chips.map((c) => `<button type="button" class="ev-chip" data-k="${esc(c.k)}"><span>${esc(c.label)}</span><span class="material-symbols-rounded" aria-hidden="true">close</span></button>`).join("")
-        + `<button type="button" class="ev-chip ev-chip-clear" id="ev-chip-clear">Clear all</button>`;
+      summaryEl.innerHTML = chips.map((c) => `<button type="button" class="ev-chip" data-k="${esc(c.k)}" aria-label="${esc(`Remove filter ${c.label}`)}"><span>${esc(c.label)}</span><span class="material-symbols-rounded" aria-hidden="true">close</span></button>`).join("");
       summaryEl.querySelectorAll(".ev-chip[data-k]").forEach((b) => b.addEventListener("click", () => clearHidden(b.dataset.k)));
-      Q("#ev-chip-clear", summaryEl)?.addEventListener("click", () => clearHidden());
     };
 
     const buildQuery = (page) => {
@@ -1022,7 +1152,7 @@ export default {
       if (runFilter) p.set("run_id", runFilter);
       if (grouped() && ddCategory.value) p.set((domain === "scrobble" || domain === "audit" || JOB_DOMAINS.includes(domain)) ? "status" : "category", ddCategory.value);
       p.set("domain", domain);
-      if (needsAttention && grouped()) p.set("category", "problems");
+      if (needsAttention() && grouped()) p.set("category", "problems");
       if (grouped() && domain === "scrobble") p.set("activities", "true");
       const { since, until } = rangeEpoch();
       if (since) p.set("since", since);
@@ -1035,7 +1165,31 @@ export default {
       return p.toString();
     };
 
-    const pageCount = () => Math.max(1, Math.ceil((state.total || 0) / PAGE_SIZE));
+    const TITLE_PAGE_SIZE = 25;
+    const pageSize = () => titles() ? TITLE_PAGE_SIZE : PAGE_SIZE;
+    const pageCount = () => Math.max(1, Math.ceil((state.total || 0) / pageSize()));
+
+    const titlesQuery = (page) => {
+      const p = new URLSearchParams();
+      const q = qEl.value.trim();
+      if (q) p.set("q", q);
+      p.set("domain", domain);
+      if (ddCategory.value) p.set("outcome", ddCategory.value);
+      if (visibility === "open") p.set("review", "unreviewed");
+      else if (visibility === "acknowledged") p.set("review", "reviewed");
+      if (quick === "attention") p.set("attention", "true");
+      else if (quick !== "all") p.set("what", quick);
+      if (ddProvider.value) p.set("source", ddProvider.value);
+      if (ddTo.value) p.set("destination", ddTo.value);
+      if (runFilter) p.set("run_id", runFilter);
+      const { since, until } = rangeEpoch();
+      if (since) p.set("since", since);
+      if (until) p.set("until", until);
+      p.set("order", order);
+      p.set("limit", String(TITLE_PAGE_SIZE));
+      p.set("offset", String((page || 0) * TITLE_PAGE_SIZE));
+      return p.toString();
+    };
 
     // rows
     const groupRowHTML = (g, opts = {}) => {
@@ -1099,8 +1253,6 @@ export default {
       </div>`;
     };
 
-    const grouped = () => mode === "grouped";
-
     const findGroup = (id) => {
       const s = String(id);
       for (const g of state.items) {
@@ -1159,7 +1311,9 @@ export default {
       ++selectionSequence;
       layoutEl.classList.remove("show-detail");
       state.selected = null;
-      detailEl.innerHTML = `<div class="ev-empty ev-empty-detail"><span class="material-symbols-rounded" aria-hidden="true">touch_app</span><div>Select an ${grouped() ? "activity" : "event"} to see details and current context.</div></div>`;
+      state.selectedPair = "";
+      const what = titles() ? "a title to see where it went" : runsMode() ? "a run to see what it changed" : grouped() ? "an activity to see details and current context" : "an event to see details and current context";
+      detailEl.innerHTML = `<div class="ev-empty ev-empty-detail"><span class="material-symbols-rounded" aria-hidden="true">touch_app</span><div>Select ${what}.</div></div>`;
     };
 
     const noun = () => "event";
@@ -1191,12 +1345,12 @@ export default {
       const pc = pageCount();
       const total = state.total || 0;
       if (!total) { footEl.innerHTML = ""; pageLabelEl.textContent = "Page 0 of 0"; return; }
-      const start = state.page * PAGE_SIZE + 1;
-      const end = Math.min(total, state.page * PAGE_SIZE + state.items.length);
+      const start = state.page * pageSize() + 1;
+      const end = Math.min(total, state.page * pageSize() + state.items.length);
       pageLabelEl.textContent = `Page ${state.page + 1} of ${pc}`;
 
       const cur = state.page;
-      const label = grouped() ? "activities" : "events";
+      const label = titles() ? "titles" : grouped() ? "activities" : "events";
       footEl.innerHTML = `
         <div class="ev-showing">Showing ${start.toLocaleString()} to ${end.toLocaleString()} of ${total.toLocaleString()} ${label}</div>
         <div class="ev-pagenums">
@@ -1243,7 +1397,62 @@ export default {
       }
     };
 
+    const runMatches = (run, needle) => !needle || [run.status, run.dry_run ? "dry run" : "", ...(run.pair_rows || []).flatMap((r) => [r.feature, r.src_provider, r.dst_provider, r.src_instance, r.dst_instance])].join(" ").toLowerCase().includes(needle);
+    const visibleRuns = () => state.runs.filter((run) => runMatches(run, qEl.value.trim().toLowerCase()));
+
+    const bindTitleRows = () => {
+      listEl.querySelectorAll(".ev-trow[data-tid], .ev-rrow[data-run], .ev-rghead[data-run]").forEach((el) => {
+        const id = el.dataset.tid || el.dataset.run;
+        const open = () => select(id, el);
+        el.addEventListener("click", open);
+        el.addEventListener("keydown", (event) => {
+          if (event.target !== el || !["Enter", " "].includes(event.key)) return;
+          event.preventDefault();
+          open();
+        });
+      });
+      listEl.querySelectorAll(".ev-rquiet[data-group]").forEach((btn) => btn.addEventListener("click", () => {
+        const key = btn.dataset.group;
+        if (btn.getAttribute("aria-expanded") === "true") openQuietRuns.delete(key);
+        else openQuietRuns.add(key);
+        renderList();
+        listEl.querySelector(`.ev-rquiet[data-group="${CSS.escape(key)}"]`)?.focus();
+      }));
+    };
+
     const renderList = () => {
+      if (runsMode()) {
+        const runs = visibleRuns();
+        countEl.textContent = selectedDay != null ? `${dayLabel(selectedDay)} · ${runs.length.toLocaleString()} ${runs.length === 1 ? "run" : "runs"}` : "Pick a day";
+        footEl.innerHTML = "";
+        pageLabelEl.textContent = "";
+        Q("#ev-prev-top", root).disabled = true;
+        Q("#ev-next-top", root).disabled = true;
+        listEl.innerHTML = selectedDay == null
+          ? `<div class="ev-empty ev-empty-list"><span class="material-symbols-rounded" aria-hidden="true">calendar_month</span><div class="ev-empty-head">No sync runs yet.</div><div class="ev-empty-hint">Runs appear here after the first sync.</div></div>`
+          : `<div class="ev-runs">${runRowsHTML(runs, { selected: state.selected, selectedPair: state.selectedPair, open: openQuietRuns, openAll: !!qEl.value.trim() })}</div>`;
+        bindTitleRows();
+        return;
+      }
+      if (titles()) {
+        countEl.textContent = `${(state.total || 0).toLocaleString()} ${state.total === 1 ? "title" : "titles"}`;
+        const reviewAllBtn = Q("#ev-review-all", quickEl);
+        if (reviewAllBtn) reviewAllBtn.hidden = !state.total;
+        updateHeadPager();
+        if (!state.items.length) {
+          listEl.innerHTML = state.preparing
+            ? `<div class="ev-empty ev-empty-list"><span class="material-symbols-rounded ev-spin" aria-hidden="true">progress_activity</span><div class="ev-empty-head">Building the title list…</div><div class="ev-empty-hint">Older events are being sorted by title. This happens once.</div></div>`
+            : emptyState();
+          Q("#ev-empty-reset", listEl)?.addEventListener("click", resetFilters);
+          renderPager();
+          return;
+        }
+        listEl.innerHTML = `${state.preparing ? `<div class="ev-tnotice">Still adding older events to this list…</div>` : ""}<div class="ev-titles">${titleRowsHTML(state.items, { tmdbOn, selected: state.selected })}</div>`;
+        bindCovers(listEl);
+        bindTitleRows();
+        renderPager();
+        return;
+      }
       const label = grouped() ? (state.total === 1 ? "activity" : "activities") : (state.total === 1 ? "event" : "events");
       countEl.textContent = `${(state.total || 0).toLocaleString()} ${label}`;
       updateHeadPager();
@@ -1270,6 +1479,8 @@ export default {
       renderPager();
     };
 
+    const wideDetail = () => !matchMedia("(max-width:900px)").matches;
+
     const load = async (page) => {
       checked.clear();
       updateSelection();
@@ -1277,6 +1488,58 @@ export default {
       const previousPage = state.page;
       if (page != null) state.page = page;
       updateHidden();
+      if (runsMode()) {
+        if (selectedDay == null) {
+          await activity?.load();
+          if (!alive || sequence !== loadSequence) return;
+          const latest = activity?.latestDay?.();
+          if (latest != null) { selectedDay = latest; activity.setSelected(latest); updateHidden(); }
+        }
+        if (selectedDay == null) { state.runs = []; renderList(); return; }
+        listEl.innerHTML = `<div class="ev-empty ev-empty-list"><span class="material-symbols-rounded ev-spin" aria-hidden="true">progress_activity</span><div class="ev-empty-head">Loading runs…</div></div>`;
+        try {
+          const r = dayRange(selectedDay);
+          const data = await fjson(`/api/events/calendar/day?since=${r.since}&until=${r.until + 1}&limit=300`);
+          if (!alive || sequence !== loadSequence) return;
+          state.runs = Array.isArray(data?.runs) ? data.runs : [];
+          if (state.selected && !state.runs.some((run) => String(run.run_id) === String(state.selected))) clearDetail();
+          renderList();
+          if (runFilter) {
+            const id = runFilter;
+            runFilter = "";
+            updateHidden();
+            if (state.runs.some((run) => String(run.run_id) === id)) await select(id, null, { reveal: true });
+          }
+          const firstRun = listEl.querySelector(".ev-rrow[data-run]");
+          if (!state.selected && firstRun && wideDetail()) await select(firstRun.dataset.run, firstRun, { reveal: false });
+        } catch (err) {
+          if (!alive || sequence !== loadSequence) return;
+          listEl.innerHTML = `<div class="ev-empty ev-empty-list"><span class="material-symbols-rounded" aria-hidden="true">error</span><div class="ev-empty-head">Failed to load runs</div><div class="ev-empty-hint">${esc(err.message)}</div></div>`;
+        }
+        return;
+      }
+      if (titles()) {
+        try {
+          const data = await fjson(`/api/events/titles?${titlesQuery(state.page)}`);
+          if (!alive || sequence !== loadSequence) return;
+          state.items = data.items || [];
+          state.total = data.total || 0;
+          const attn = Number(data.attention_total || 0);
+          if (attn !== Number(state.attentionTotal || 0)) { state.attentionTotal = attn; renderQuick(); }
+          state.preparing = !!data.preparing;
+          const pc = pageCount();
+          if (state.page > 0 && state.page >= pc) return load(pc - 1);
+          if (state.selected && !state.items.some((row) => String(row.id) === String(state.selected))) clearDetail();
+          renderList();
+          if (!state.selected && state.items.length && wideDetail()) await select(state.items[0].id, null, { reveal: false });
+          if (state.preparing) setTimeout(() => { if (alive && titles() && sequence === loadSequence) load(state.page); }, 4000);
+          if (state.page !== previousPage) revealSection(layoutEl);
+        } catch (err) {
+          if (!alive || sequence !== loadSequence) return;
+          listEl.innerHTML = `<div class="ev-empty ev-empty-list"><span class="material-symbols-rounded" aria-hidden="true">error</span><div class="ev-empty-head">Failed to load</div><div class="ev-empty-hint">${esc(err.message)}</div></div>`;
+        }
+        return;
+      }
       const url = grouped()
         ? ((domain === "scrobble" || domain === "audit" || JOB_DOMAINS.includes(domain)) ? `/api/events/groups?${buildQuery(state.page)}` : `/api/events/tree?${buildQuery(state.page)}`)
         : `/api/events/search?view=events&${buildQuery(state.page)}`;
@@ -1446,9 +1709,7 @@ export default {
       }
 
       const ph = c.provider_health;
-      if (!ph || ph.status_available === false) {
-        cards.push(card("Provider health", pill("Unknown", "neutral"), ["Status unavailable"]));
-      } else {
+      if (ph && ph.status_available !== false) {
         const entries = Object.entries(ph.providers || {});
         const anyDown = entries.some(([, h]) => h.configured !== false && h.status !== "unknown" && !h.connected);
         const anyUnknown = entries.some(([, h]) => h.status === "unknown" || h.configured === false);
@@ -1492,7 +1753,7 @@ export default {
       unresolved_cleared: "Unresolved state cleared.",
       blackbox_promoted: "Promoted to blackbox after repeated failures.",
       blackbox_blocked: "Blocked by blackbox.",
-      plan_created: "Included in the sync plan.",
+      plan_created: "What this sync planned to change on the destination.",
       provider_health: "Provider health checked.",
       sync_run_started: "Sync run started.",
       sync_run_finished: "Sync run completed.",
@@ -1673,6 +1934,11 @@ export default {
       const modeTxt = modeLabel(cx.pairMode) || "–";
       const st = String(g.status || "").toLowerCase();
       const isProblem = ["failed", "unresolved", "blackboxed", "warning"].includes(st);
+      const isRun = g.operation === "run" || events.some(e => ["sync_run_started", "sync_run_finished"].includes(e.event_type));
+      const summary = String(g.summary || item || "");
+      const summaryBreak = isRun ? summary.indexOf(", ") : -1;
+      const headline = summaryBreak > 0 ? summary.slice(0, summaryBreak) : summary;
+      const supporting = summaryBreak > 0 ? summary.slice(summaryBreak + 2) : "";
 
       const pill = (text, cls) => `<span class="ev-pill ${cls}">${esc(text)}</span>`;
       const card = (title, pillHTML, lines, extra = "") => `
@@ -1728,7 +1994,13 @@ export default {
 
       const kvGrid = (rows) => `<div class="ev-kv">${rows.map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${v}</div>`).join("")}</div>`;
 
-      const detailsPane =
+      const detailsPane = isRun
+        ? `<div class="ev-dsec"><h5>Run details</h5>${kvGrid([
+          ["Records", esc(String(g.event_count || events.length))],
+          ["Started", esc(TS(g.first_event_at))],
+          [st === "running" ? "Last update" : "Finished", esc(TS(g.last_event_at))],
+        ])}</div>`
+        :
         `<div class="ev-dsec"><h5>Event</h5>${kvGrid([
           ["Status", `<span class="ev-pill ${sv}">${esc(statusLabel(g.status, g.domain))}</span>`],
           ["Title", esc(g.summary || "–")],
@@ -1834,7 +2106,8 @@ export default {
             <button class="ev-hbtn" id="ev-copy" type="button" title="Copy thread"><span class="material-symbols-rounded" aria-hidden="true">content_copy</span><span>Copy</span></button>
             <button class="ev-hbtn ev-hbtn-accent${g.acknowledged_at ? " on" : ""}" id="ev-ack-detail" type="button"><span class="material-symbols-rounded" aria-hidden="true">${ackIcon}</span><span>${ackLabel}</span></button>
           </div>
-          <div class="ev-dtitle">${esc(g.summary || item || "")}</div>
+          <div class="ev-dtitle">${esc(headline)}</div>
+          ${supporting ? `<p class="ev-outcome">${withProviderLogos(supporting)}</p>` : ""}
           ${item ? `<div class="ev-ditem">${esc(item)}</div>` : ""}
         </div>
         ${summaryCards ? `<div class="ev-scards">${summaryCards}</div>` : ""}
@@ -1971,6 +2244,7 @@ export default {
       const events = Array.isArray(detail.events) && detail.events.length ? detail.events : (eventOverride ? [eventOverride] : []);
       const e = eventOverride || events[events.length - 1] || g;
       const sv = sevOf(e);
+      const logRun = e.run_id || events.find(row => row.run_id)?.run_id;
       detailEl.innerHTML = `
         <div class="ev-dhead">
           <div class="ev-dhead-row">
@@ -1980,8 +2254,10 @@ export default {
           </div>
           <div class="ev-dtitle">${esc(g.summary || e.title || titleLine(e))}</div>
         </div>
+        ${logRun ? '<button class="ev-hbtn" type="button" data-job-logs><span class="material-symbols-rounded" aria-hidden="true">terminal</span>View logs</button>' : ''}
         <h4>${String(e.feature || "") === "backup" ? "Backup" : "Capture"}</h4><div class="ev-kv">${captureRowsHTML(e)}</div>
         <details class="ev-tech"><summary>Raw data</summary><div class="ev-tech-body"><pre>${esc(JSON.stringify({ group: detail.group || null, events }, null, 2))}</pre></div></details>`;
+      Q('[data-job-logs]', detailEl)?.addEventListener('click', () => window.openLogs?.({runId: logRun, channel: e.feature === 'backup' ? 'backups' : 'captures'}));
     };
 
     const renderAuditDetail = (detail, eventOverride = null) => {
@@ -2044,26 +2320,25 @@ export default {
       const ps = c.pair_state;
       const routeShort = provShort(e.source_provider, e.destination_provider) || "–";
       const pairLabel = (ps && ps.matched && ps.label) ? `${ps.label}${ps.mode ? ` (${modeLabel(ps.mode).toLowerCase()})` : ""}` : (ps && ps.label ? `${ps.label} — not matched` : (e.pair_key || "–"));
-      const origin = e.origin_provider ? instLabel(e.origin_provider, e.origin_instance) : "unknown";
+      const origin = e.origin_provider ? instLabel(e.origin_provider, e.origin_instance) : "";
       const conf = e.origin_confidence ? `<span class="ev-conf">${esc(String(e.origin_confidence))} confidence</span>` : "";
-      const dest = instLabel(e.destination_provider, e.destination_instance) || "–";
+      const dest = instLabel(e.destination_provider, e.destination_instance) || "";
       const runTime = e.source_mtime ? TS(e.source_mtime) : "";
 
       const kv = [
-        ["Type", esc(String(e.event_type || "").replace(/_/g, " "))],
-        ["Feature", esc(FEATURE_LABEL[e.feature] || e.feature || "–")],
-        ["Operation", esc(e.operation || "–")],
-        ["Route", esc(routeShort)],
-        ["Origin", `${esc(origin)}${conf ? ` ${conf}` : ""}`],
+        ["Feature", esc(FEATURE_LABEL[e.feature] || e.feature || "")],
+        ["Operation", esc(e.operation || "")],
+        ["Route", routeShort === "–" ? "" : esc(routeShort)],
+        ["Origin", origin ? `${esc(origin)}${conf ? ` ${conf}` : ""}` : ""],
         ["Destination", esc(dest)],
-        ["Pair", esc(pairLabel)],
-        ["Run", e.run_id ? `<span class="mono">${esc(e.run_id)}</span>` : "–"],
+        ["Pair", pairLabel === "–" ? "" : esc(pairLabel)],
+        ["Run", e.run_id ? `<span class="mono">${esc(e.run_id)}</span>` : ""],
         ...(e.event_type === "cloud_history_read" ? [["Cloud history entries included", esc(d.cloud_history_entries ?? 0)], ["Total merged history entries", esc(d.history_entries ?? 0)]] : []),
         ...(cloudResultsHTML(e) ? [["Plex Discover fallback", cloudResultsHTML(e)]] : []),
-        ["Reason", esc(e.reason || e.reason_code || "–")],
-        ["Source", e.source_file ? `<span class="mono">${esc(e.source_file)}</span>` : esc(e.source_kind || "–")],
-        ["Run time", runTime ? esc(runTime) : "–"],
-      ].map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${v}</div>`).join("");
+        ["Reason", esc(e.reason || e.reason_code || "")],
+        ["Source", e.source_file ? `<span class="mono">${esc(e.source_file)}</span>` : esc(e.source_kind || "")],
+        ["Run time", runTime ? esc(runTime) : ""],
+      ].filter(([, v]) => v !== "").map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${v}</div>`).join("");
 
       const item = titleOf(e);
       const parts = [];
@@ -2095,19 +2370,52 @@ export default {
       Q("#ev-open-analyzer", detailEl)?.addEventListener("click", () => { try { window.openAnalyzer?.(); } catch {} });
     };
 
-    const select = async (id, el, { reveal = true } = {}) => {
+    const titleCtx = () => ({
+      tmdbOn,
+      tab: titleTab,
+      fetchJson: fjson,
+      onTab: (name) => { titleTab = name; lset("cw.events.titletab", name); },
+      openTitle: (tid) => select(tid),
+      review: (item) => reviewTitle(item),
+      showRun: (item) => showRun(item),
+    });
+
+    const select = async (id, el, { reveal = true, pair = el?.dataset.pair ?? (state.selected === String(id) ? state.selectedPair : "") } = {}) => {
       const sequence = ++selectionSequence;
       if (reveal) {
         if (!layoutEl.classList.contains("show-detail")) listReturnPosition = window.scrollY;
         layoutEl.classList.add("show-detail");
       }
       state.selected = String(id);
+      state.selectedPair = runsMode() ? pair : "";
       state.relExpanded = false;
-      listEl.querySelectorAll(".ev-row.sel").forEach((n) => n.classList.remove("sel"));
-      (el || listEl.querySelector(`.ev-row[data-id="${id}"]`))?.classList.add("sel");
+      listEl.querySelectorAll(".ev-row.sel, .ev-trow.sel, .ev-rrow.sel").forEach((n) => n.classList.remove("sel"));
+      const rowSel = titles() ? `.ev-trow[data-tid="${CSS.escape(String(id))}"]` : runsMode() ? `.ev-rrow[data-run="${CSS.escape(String(id))}"]` : `.ev-row[data-id="${CSS.escape(String(id))}"]`;
+      if (runsMode()) listEl.querySelectorAll(rowSel).forEach((n) => n.classList.add("sel"));
+      else (el || listEl.querySelector(rowSel))?.classList.add("sel");
+      if (runsMode()) {
+        if (pair && !listEl.querySelector(`${rowSel}[data-pair="${CSS.escape(pair)}"]`)) openQuietRuns.add(pair);
+        renderList();
+        const run = state.runs.find((r) => String(r.run_id) === String(id));
+        if (run) renderRunDetail(detailEl, run, {
+          tmdbOn,
+          pair,
+          selectPair: key => select(id, null, {reveal: false, pair: key}),
+          fetchJson: fjson,
+          showTitles: (runId) => showTitles(runId),
+          openTitle: (runId, tid) => { showTitles(runId); void select(tid); },
+        });
+        if (reveal) revealSection(Q(".ev-col-detail", root));
+        return;
+      }
       detailEl.innerHTML = `<div class="ev-empty ev-empty-detail"><span class="material-symbols-rounded ev-spin" aria-hidden="true">progress_activity</span><div>Loading context…</div></div>`;
       try {
-        if (grouped()) {
+        if (titles()) {
+          const data = await fjson(`/api/events/titles/${encodeURIComponent(id)}`);
+          if (!alive || sequence !== selectionSequence) return;
+          if (!data?.ok || !data.item) throw new Error("not found");
+          renderTitleDetail(detailEl, data.item, titleCtx());
+        } else if (grouped()) {
           const detail = await fjson(`/api/events/groups/${encodeURIComponent(id)}?run_items_limit=${RUN_ITEMS_PAGE_SIZE}&run_items_offset=0`);
           if (!alive || sequence !== selectionSequence) return;
           if (!detail || detail.ok === false) throw new Error("not found");
@@ -2164,7 +2472,9 @@ export default {
           }
         }
         const provItems = [...provs].sort();
-        ddProvider.setItems([{ value: "", label: "Any provider" }, ...provItems.map((p) => ({ value: p, label: p }))]);
+        const provLabel = (p) => window.CW?.ProviderMeta?.label?.(p) || p;
+        ddProvider.setItems([{ value: "", label: "Any provider" }, ...provItems.map((p) => ({ value: p, label: provLabel(p) }))]);
+        ddTo.setItems([{ value: "", label: "Any destination" }, ...provItems.map((p) => ({ value: p, label: provLabel(p) }))]);
         ddOrigin.setItems([{ value: "", label: "Any origin" }, ...provItems.map((p) => ({ value: p, label: p }))]);
         ddPair.setItems([{ value: "", label: "Any pair" }, ...pairs]);
       } catch {}
@@ -2172,8 +2482,76 @@ export default {
 
     const resetFilters = () => {
       qEl.value = "";
-      needsAttention = false; attentionSeg.value = "all";
+      quick = "all";
+      renderQuick();
       clearHidden();
+    };
+
+    const reviewTitle = async (item) => {
+      const action = item.acknowledged_at ? "unacknowledge" : "acknowledge";
+      try {
+        const res = await fjson(`/api/events/titles/${encodeURIComponent(item.id)}/${action}`, { method: "POST" });
+        if (!res?.ok) throw new Error("failed");
+      } catch {
+        showToast("Could not update the review state. Refresh and try again.", null, "error");
+        return;
+      }
+      await load(state.page);
+      await select(item.id, null, { reveal: false });
+      showToast(action === "acknowledge" ? "Marked reviewed." : "Marked unreviewed.", action === "acknowledge" ? async () => reviewTitle({ ...item, acknowledged_at: Date.now() }) : null);
+    };
+
+    const reviewAll = async () => {
+      const total = state.total || 0;
+      if (!total || !window.confirm(`Mark ${total.toLocaleString()} ${total === 1 ? "title" : "titles"} that need attention as reviewed?\n\nOnly failed destinations matching the current filters are marked.`)) return;
+      const btn = Q("#ev-review-all", quickEl);
+      if (btn) btn.disabled = true;
+      const query = Object.fromEntries(new URLSearchParams(titlesQuery(0)));
+      const body = { confirm: true, domain };
+      for (const key of ["q", "outcome", "source", "destination", "what", "run_id", "since", "until"]) if (query[key]) body[key] = query[key];
+      try {
+        const res = await fjson("/api/events/titles/acknowledge", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+        if (!res?.ok) throw new Error("failed");
+        clearDetail();
+        await load(0);
+        showToast(`${Number(res.titles || 0).toLocaleString()} ${res.titles === 1 ? "title" : "titles"} marked reviewed.`);
+      } catch {
+        showToast("Could not mark them reviewed. Refresh and try again.", null, "error");
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    };
+
+    const showTitles = (runId) => {
+      runFilter = String(runId || "");
+      selectedDay = null;
+      activity?.setSelected(null);
+      setMode("titles");
+    };
+
+    const showRun = (item) => {
+      const at = Number(item?.first_event_at || item?.last_event_at || 0);
+      if (at) selectedDay = Math.floor((at - new Date().getTimezoneOffset() * 60) / 86400);
+      activity?.setSelected(selectedDay);
+      runFilter = String(item?.run_id || "");
+      setMode("runs");
+    };
+
+    const PROVIDER_TOKEN = /(^|\s)(from|to):([a-z0-9_-]+)(?=\s|$)/i;
+    const applySearchTokens = () => {
+      if (!titles()) return false;
+      let changed = false;
+      for (let guard = 0; guard < 4; guard += 1) {
+        const m = qEl.value.match(PROVIDER_TOKEN);
+        if (!m) break;
+        const want = m[3].toUpperCase();
+        const known = ddProvider.items.find((v) => v === want) || ddProvider.items.find((v) => v.startsWith(want));
+        if (!known) break;
+        if (m[2].toLowerCase() === "from") ddProvider.value = known; else ddTo.value = known;
+        qEl.value = (qEl.value.slice(0, m.index) + qEl.value.slice(m.index + m[0].length)).replace(/\s+/g, " ").trim();
+        changed = true;
+      }
+      return changed;
     };
 
     let refreshing = false;
@@ -2181,33 +2559,55 @@ export default {
       if (refreshing) return;
       refreshing = true;
       const btn = Q("#ev-refresh", root);
-      btn?.classList.add("busy");
+      if (btn) { btn.disabled = true; btn.classList.add("is-spinning"); }
       try {
-        await Promise.all([populateFilters(), load(state.page)]);
-        if (alive && state.items.length) {
+        await Promise.all([populateFilters(), load(state.page), activity && domain === "sync" ? activity.load() : null, new Promise((done) => setTimeout(done, 450))]);
+        if (alive && (state.items.length || state.runs.length)) {
           renderList();
           if (state.selected) await select(state.selected, null, {reveal: false});
         }
-      } finally { refreshing = false; btn?.classList.remove("busy"); }
+      } finally {
+        refreshing = false;
+        if (btn) { btn.disabled = false; btn.classList.remove("is-spinning"); }
+      }
     };
 
     let searchTimer = null;
-    qEl.addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => load(0), 250); });
+    qEl.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      if (runsMode()) { renderList(); return; }
+      searchTimer = setTimeout(() => { applySearchTokens(); load(0); }, 250);
+    });
+    qEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && applySearchTokens()) { clearTimeout(searchTimer); load(0); }
+      if (event.key === "Backspace" && !qEl.value && !summaryEl.hidden) {
+        const last = [...summaryEl.querySelectorAll(".ev-chip[data-k]")].pop();
+        if (last) { event.preventDefault(); clearHidden(last.dataset.k); }
+      }
+    });
     sinceEl.addEventListener("change", () => load(0));
     untilEl.addEventListener("change", () => load(0));
 
-    Q("#ev-more", root).addEventListener("click", (ev) => {
-      const btn = ev.currentTarget;
-      const open = moreWrap.hasAttribute("hidden");
-      if (open) moreWrap.removeAttribute("hidden"); else moreWrap.setAttribute("hidden", "");
-      btn.setAttribute("aria-expanded", String(open));
-      btn.classList.toggle("on", open);
-    });
-    if (runFilter) {
-      moreWrap.removeAttribute("hidden");
-      moreBtn.setAttribute("aria-expanded", "true");
-      moreBtn.classList.add("on");
-    }
+    const setFiltersOpen = (open) => {
+      moreWrap.hidden = !open;
+      moreBtn.setAttribute("aria-expanded", String(open));
+      moreBtn.classList.toggle("on", open);
+    };
+    moreBtn.addEventListener("click", () => setFiltersOpen(moreWrap.hidden));
+    const onFiltersDown = (event) => {
+      if (moreWrap.hidden || moreWrap.contains(event.target) || moreBtn.contains(event.target)) return;
+      if (event.target.closest?.(".ev-dd-menu")) return;
+      setFiltersOpen(false);
+    };
+    const onFiltersKey = (event) => {
+      if (event.key !== "Escape" || moreWrap.hidden || document.querySelector(".ev-dd-menu")) return;
+      setFiltersOpen(false);
+      moreBtn.focus();
+    };
+    document.addEventListener("pointerdown", onFiltersDown, true);
+    document.addEventListener("keydown", onFiltersKey);
+    Q("#ev-mf-reset", root).addEventListener("click", () => resetFilters());
+    Q("#ev-mf-done", root).addEventListener("click", () => { setFiltersOpen(false); moreBtn.focus(); });
 
     Q("#ev-refresh", root).addEventListener("click", () => doRefresh());
     Q("#ev-clear", root)?.addEventListener("click", async () => {
@@ -2238,9 +2638,12 @@ export default {
       clearTimeout(toastTimer);
       window.removeEventListener("pointermove", onSplitMove, true);
       window.removeEventListener("pointerup", endSplit, true);
+      document.removeEventListener("pointerdown", onFiltersDown, true);
+      document.removeEventListener("keydown", onFiltersKey);
       document.body.style.userSelect = "";
       for (const dd of [...dropdowns, ddSort]) dd.close();
       statsView?.destroy();
+      activity?.destroy();
       cleanup = null;
       hideView = null;
       showView = null;
@@ -2251,6 +2654,10 @@ export default {
     void populateFilters().then(() => {
       if (alive && state.items.length) renderList();
     });
+    void fjson("/api/config/meta", { cache: "no-store" }).then((m) => {
+      tmdbOn = m?.tmdb_configured === true;
+      if (alive && tmdbOn && titles() && state.items.length) renderList();
+    }).catch(() => {});
     if (view !== "statistics") await load(0);
   },
   hide() { hideView?.(); },

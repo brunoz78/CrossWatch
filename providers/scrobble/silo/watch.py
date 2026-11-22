@@ -40,7 +40,7 @@ from providers.scrobble.manual_marks import (
 from providers.scrobble.routes import watch_poll_seconds
 from providers.scrobble.scrobble import Dispatcher, ScrobbleEvent, ScrobbleSink, mask_account
 from providers.scrobble.sources import source_enabled
-from providers.sync.silo._common import as_int, ids_from_content_id, item_detail, item_ids, library, safe_json, selected_libraries, series_id_of, silo_request
+from providers.sync.silo._common import as_int, ids_from_content_id, item_detail, item_ids, library, safe_json, seconds_of, selected_libraries, series_id_of, session_content_id, silo_request
 from providers.scrobble.routes import progress_step
 
 BASE_POLL_SECONDS = 10.0
@@ -217,7 +217,7 @@ class SiloWatchService:
             return default
 
     def _metadata(self, row: Mapping[str, Any]) -> dict[str, Any] | None:
-        cid = str(row.get("content_id") or "").strip()
+        cid = session_content_id(row)
         media_type = _session_kind(cid, row)
         if not cid or media_type not in ("movie", "episode"):
             return None
@@ -246,11 +246,13 @@ class SiloWatchService:
             season, number = as_int(detail.get("season_number")), as_int(detail.get("episode_number"))
         if season is None or number is None:
             return None
+        new_shape = str(row.get("media_type") or "").strip().lower() == "episode" and "series_name" not in row
+        episode_title = row.get("media_title") if new_shape else row.get("episode_name")
         return {
             "media_type": "episode",
             "ids": ids,
-            "title": str(row.get("series_name") or "").strip() or None,
-            "episode_title": str(row.get("episode_name") or "").strip() or None,
+            "title": str(row.get("series_title") or row.get("series_name") or "").strip() or None,
+            "episode_title": str(episode_title or "").strip() or None,
             "year": None,
             "season": season,
             "number": number,
@@ -314,7 +316,7 @@ class SiloWatchService:
         return content_id not in lib.movies and content_id not in lib.episodes
 
     def _create_session(self, row: Mapping[str, Any], source_key: str) -> dict[str, Any] | None:
-        cid = str(row.get("content_id") or "").strip()
+        cid = session_content_id(row)
         if cid and self._outside_whitelist(cid):
             if source_key not in self._skipped:
                 self._skipped.add(source_key)
@@ -331,7 +333,7 @@ class SiloWatchService:
         session = {
             "session_key": f"silo:{self._instance_id}:{source_key}:{row.get('started_at') or ''}",
             "source_session_key": source_key,
-            "content_id": str(row.get("content_id") or ""),
+            "content_id": cid,
             "profile_id": str(row.get("profile_id") or ""),
             "client": str(row.get("client_label") or row.get("client_name") or ""),
             "meta": meta,
@@ -446,14 +448,53 @@ class SiloWatchService:
             raise RuntimeError("invalid_response")
         return [dict(r) for r in rows if isinstance(r, Mapping)]
 
-    def _profile_ids(self, cfg: Mapping[str, Any], block: Mapping[str, Any]) -> set[str]:
-        out = {str(block.get("profile_id") or "")}
+    def _account_instances(self, cfg: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+        out: dict[str, tuple[str, str]] = {}
+        for user_inst in list_sync_user_ids(cfg, "silo", self._instance_id):
+            blk = provider_block(cfg, user_inst)
+            uid = str(blk.get("account_user_id") or "").strip()
+            if uid and uid not in out and is_configured(blk):
+                out[uid] = (user_inst, str(blk.get("account_primary_profile_id") or blk.get("profile_id") or ""))
+        return out
+
+    def _account_profile_ids(self, cfg: Mapping[str, Any], uid: str) -> set[str]:
+        out: set[str] = set()
+        for user_inst in list_sync_user_ids(cfg, "silo", self._instance_id):
+            blk = provider_block(cfg, user_inst)
+            if str(blk.get("account_user_id") or "").strip() == uid:
+                out.add(str(blk.get("profile_id") or ""))
+        out.discard("")
+        return out
+
+    def _fetch_account_sessions(self, cfg: Mapping[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
+        rows: list[dict[str, Any]] = []
+        held: set[str] = set()
+        for uid, (inst, primary) in self._account_instances(cfg).items():
+            reader = SimpleNamespace(config=cfg, instance_id=inst, session=self.session)
+            try:
+                resp = silo_request(reader, "GET", SESSIONS_PATH, headers={"X-Profile-Id": primary} if primary else None)
+                if resp.status_code != 200:
+                    raise RuntimeError(f"http:{int(resp.status_code)}")
+                data = safe_json(resp)
+                items = data.get("items") if isinstance(data, Mapping) else None
+                if not isinstance(items, list):
+                    raise RuntimeError("invalid_response")
+                rows.extend(dict(r) for r in items if isinstance(r, Mapping))
+            except Exception as exc:
+                held |= self._account_profile_ids(cfg, uid)
+                self._log_error_limited(f"account:{uid}:{type(exc).__name__}", f"Silo sessions of another account unavailable: {exc}")
+        return rows, held
+
+    def _wants_users(self) -> bool:
         needs = getattr(self._dispatch, "needs_user_resolution", None)
         try:
-            wants_users = bool(needs()) if callable(needs) else False
+            return bool(needs()) if callable(needs) else False
         except Exception:
-            wants_users = False
-        if wants_users:
+            return False
+
+    def _profile_ids(self, cfg: Mapping[str, Any], block: Mapping[str, Any]) -> set[str]:
+        out = {str(block.get("profile_id") or "")}
+        if self._wants_users():
             for user_inst in list_sync_user_ids(cfg, "silo", self._instance_id):
                 pid = str(get_instance_block(cfg, "silo", user_inst).get("profile_id") or "")
                 if pid:
@@ -474,12 +515,17 @@ class SiloWatchService:
             self._mark_offline(exc)
             return bool(self._sessions)
         self._mark_online()
+        held: set[str] = set()
+        if self._wants_users():
+            known = {str(r.get("id") or "") for r in rows}
+            extra, held = self._fetch_account_sessions(cfg)
+            rows += [r for r in extra if str(r.get("id") or "") not in known]
         profiles = self._profile_ids(cfg, block)
         seen: set[str] = set()
         active = False
         now = time.time()
         for row in rows:
-            seen_cid = str(row.get("content_id") or "").strip()
+            seen_cid = session_content_id(row)
             seen_pid = str(row.get("profile_id") or "").strip()
             if seen_cid and seen_pid:
                 self._marks.note_session(f"{seen_pid}:{seen_cid}", now)
@@ -500,7 +546,7 @@ class SiloWatchService:
                 self._log_error_limited(f"{type(exc).__name__}:{source_key}", f"Silo session poll failed: {exc}")
         self._skipped &= seen
         for source_key in list(self._sessions.keys()):
-            if source_key in seen:
+            if source_key in seen or str(self._sessions[source_key].get("profile_id") or "") in held:
                 continue
             misses = self._missing.get(source_key, 0) + 1
             self._missing[source_key] = misses
@@ -540,7 +586,7 @@ class SiloWatchService:
                 account=name or None,
                 server_uuid=None,
                 session_key=None,
-                raw={"_cw_session_identity": {"user_id": pid, "name": name}, "_cw_manual_mark": True},
+                raw={"_cw_session_identity": {"user_id": pid, "name": name}, "_cw_manual_mark": True, "_cw_user_probe": True},
             )
             try:
                 allowed = bool(accepts(probe)) if callable(accepts) else True
@@ -610,8 +656,8 @@ class SiloWatchService:
             lookup = series if meta.get("media_type") == "episode" else cid
             detail = item_detail(self, lookup, feature="watch") if lookup else {}
             meta["title"] = str(detail.get("title") or "").strip() or None
-        seconds = as_int(row.get("duration_seconds"))
-        duration_ms = seconds * 1000 if seconds and seconds > 0 else None
+        seconds = seconds_of(row.get("duration_seconds"))
+        duration_ms = seconds * 1000 if seconds else None
         server = str(self._block(self._active_cfg()).get("server_url") or "")
         session = {
             "session_key": f"silo:{self._instance_id}:mark:{pid}:{cid}:{row.get('updated_at') or ''}",

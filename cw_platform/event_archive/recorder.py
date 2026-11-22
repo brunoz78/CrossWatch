@@ -369,7 +369,7 @@ class RunRecorder:
             self._capture_pair_scope()
             return
 
-        if event in ("one:plan", "two:plan"):
+        if event == "one:plan":
             src, dst = self._ctx_providers()
             self._add(
                 event_type="plan_created",
@@ -380,6 +380,22 @@ class RunRecorder:
                 destination_instance=self._di or None,
                 detail={k: f.get(k) for k in ("adds", "removes", "updates", "src_count", "dst_count")},
             )
+            self._flush()
+            return
+
+        if event == "two:plan":
+            a, b = self._ctx_providers()
+            for src, si, dst, di, side in ((a, self._si, b, self._di, "B"), (b, self._di, a, self._si, "A")):
+                self._add(
+                    event_type="plan_created",
+                    operation="plan",
+                    source_provider=src or None,
+                    destination_provider=dst or None,
+                    source_instance=si or None,
+                    destination_instance=di or None,
+                    detail={"adds": f.get(f"add_to_{side}"), "removes": f.get(f"rem_from_{side}"),
+                            "updates": f.get(f"upd_to_{side}")},
+                )
             self._flush()
             return
 
@@ -568,6 +584,9 @@ class RunRecorder:
                 matches = match_details(row.get("match_details"))
                 if matches:
                     diagnostics["match_details"] = matches
+                ids = compact_ids(it)
+                if ids:
+                    diagnostics["ids"] = ids
                 base = dict(
                     source_provider=src or None, destination_provider=dst or None,
                     source_instance=si or None, destination_instance=di or None,
@@ -581,6 +600,23 @@ class RunRecorder:
                     self._add(event_type="blackbox_promoted", operation="quarantine", severity="warn",
                               reason_code="flapper", reason="flapper", **base)
             self._flush()
+            return
+
+        if event == "archive:item_successes":
+            src, si, dst, di = self._destination_route(f.get("dst"), f.get("destination_instance"))
+            rows = [row for row in (f.get("items") or []) if isinstance(row, Mapping) and row.get("key")]
+            if rows and dst:
+                self._flush(force=True)
+                try:
+                    from .titles import record_successes
+
+                    record_successes(
+                        self._conn, run_id=self._run_id, feature=str(f.get("feature") or self._feature or ""),
+                        op=str(f.get("op") or "add"), source=(src, si), destination=(dst, di),
+                        items=[{**dict(row), **_item_fields(row), "ids": compact_ids(row)} for row in rows],
+                    )
+                except Exception as exc:
+                    _LOG.warning("event title success record failed: %s", exc)
             return
 
         if event == "archive:item_resolutions":
@@ -707,6 +743,12 @@ def _item_fields(it: Mapping[str, Any]) -> dict[str, Any]:
         "episode": episode,
         "match_basis": _first_id_token(ids) or _first_id_token(show_ids),
     }
+
+
+def compact_ids(it: Mapping[str, Any]) -> dict[str, str]:
+    from .titles import compact_ids as _compact
+
+    return _compact(_as_map(it.get("ids")), _as_map(it.get("show_ids")))
 
 
 def _first_id_token(ids: Mapping[str, Any]) -> str | None:

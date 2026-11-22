@@ -3,6 +3,8 @@
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
 const REQUEST_TIMEOUT_MS = 600_000;
+const POLL_MS = 1500;
+const POLL_MISSES = 3;
 const MAX_QUESTION = 1000;
 const SUGGESTIONS = [
   "Is everything healthy?",
@@ -90,6 +92,9 @@ export const ACTIONS = {
   open_pairs: { label: "Open sync pairs", icon: "sync_alt", run: () => goSettings("pairs") },
   open_scrobbler: { label: "Open scrobbler", icon: "sensors", run: () => goSettings("scrobbler") },
   open_scheduling: { label: "Open scheduling", icon: "schedule", run: () => goSettings("scheduling") },
+  open_backups: { label: "Open Backup & Restore", icon: "backup", run: () => window.showTab?.("backups") },
+  open_tracker: { label: "Open Tracker", icon: "fact_check", run: () => window.showTab?.("tracker") },
+  open_playlists: { label: "Open Playlists", icon: "playlist_play", run: () => window.showTab?.("playlists") },
 };
 
 const history = [];
@@ -111,6 +116,7 @@ function esc(value) {
 export const PROPOSALS = {
   run_pair: { icon: "sync" },
   create_capture: { icon: "photo_camera" },
+  create_backup: { icon: "backup" },
   refresh_anime_mapping: { icon: "refresh" },
   test_connections: { icon: "hub" },
 };
@@ -193,6 +199,24 @@ export async function runProposal(proposal) {
         const percent = Math.max(0, Math.min(100, Number(progress.percent) || 0));
         proposalState(proposal, "running", `Capturing… ${Math.round(percent)}%`);
       }
+    } else if (proposal.action === "create_backup") {
+      const data = await actionRequest("/api/backups/create", { managed: true }, deadline);
+      const id = data.job?.id;
+      if (!id) throw new Error("Backup progress is unavailable");
+      proposalState(proposal, "running", "Backup queued…");
+      while (true) {
+        if (Date.now() >= deadline) throw new Error("The backup is still running. Check Backup & Restore");
+        await new Promise(resolve => window.setTimeout(resolve, Math.min(2000, deadline - Date.now())));
+        const status = await actionRequest("/api/backups/status", undefined, deadline);
+        const job = (status.jobs || []).find(row => row?.id === id);
+        if (!job) throw new Error("The backup job is no longer listed. Check Backup & Restore");
+        if (job.stage === "complete") {
+          message = job.warning ? `Backup saved. ${job.warning}` : "Backup saved";
+          break;
+        }
+        if (job.stage === "failed") throw new Error(String(job.error || "Backup failed"));
+        proposalState(proposal, "running", `Backup ${String(job.stage || "running")}…`);
+      }
     } else if (proposal.action === "refresh_anime_mapping") {
       const data = await actionRequest("/api/anime-mapping/update", { force: false }, deadline);
       message = data.updated ? (data.identity_updated && !data.mappings_updated ? "Anime identity data updated" : "Anime mapping updated")
@@ -215,7 +239,7 @@ export function evidenceButtons(evidence, messageIndex) {
 
 export function openEvidence(ref) {
   if (!ref) return;
-  if (ref.kind === "log" && typeof ref.session_id === "string" && ["sync", "watcher", "debug"].includes(ref.channel)) window.openLogs?.({sessionId: ref.session_id, channel: ref.channel, runId: ref.run_id});
+  if (ref.kind === "log" && typeof ref.session_id === "string" && ["sync", "watcher", "debug", "captures", "backups", "audits", "system"].includes(ref.channel)) window.openLogs?.({sessionId: ref.session_id, channel: ref.channel, runId: ref.run_id});
   else if (ref.kind === "event" && Number.isSafeInteger(ref.group_id) && ref.group_id > 0) window.openEvents?.({groupId: ref.group_id, visibility: "all"});
   else if (ref.kind === "mappings") ACTIONS.open_mappings.run();
   else if (ref.kind === "anime") ACTIONS.open_anime_overrides.run();
@@ -358,6 +382,13 @@ function when(at) {
   return new Date(Number(at)).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
+function failure(status) {
+  if (status === 504 || status === 524) {
+    return `The connection to CrossWatch was cut off (HTTP ${status}). A reverse proxy in front of CrossWatch did not get an answer in time. Try again in a moment.`;
+  }
+  return `HTTP ${status}`;
+}
+
 async function api(path, body) {
   const ctrl = new AbortController();
   const timeout = window.setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
@@ -370,7 +401,11 @@ async function api(path, body) {
   try {
     const res = await fetch("/api/assistant" + path, opts);
     const data = await res.json().catch(() => null);
-    if (!res.ok || data?.ok === false) throw new Error(String(data?.error || `HTTP ${res.status}`));
+    if (!res.ok || data?.ok === false) {
+      const err = new Error(String(data?.error || failure(res.status)));
+      err.answered = data !== null;
+      throw err;
+    }
     return data;
   } catch (err) {
     if (err?.name === "AbortError") throw new Error("That took too long. Try a narrower question.");
@@ -378,6 +413,25 @@ async function api(path, body) {
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+async function chat(payload) {
+  const started = Date.now();
+  const job = await api("/jobs", payload);
+  let misses = 0;
+  while (Date.now() - started < REQUEST_TIMEOUT_MS) {
+    await new Promise((resolve) => window.setTimeout(resolve, POLL_MS));
+    let data;
+    try {
+      data = await api(`/jobs/${encodeURIComponent(String(job.job_id || ""))}`);
+    } catch (err) {
+      if (err?.answered || ++misses >= POLL_MISSES) throw err;
+      continue;
+    }
+    misses = 0;
+    if (!data.pending) return data;
+  }
+  throw new Error("That took too long. Try a narrower question.");
 }
 
 function injectCss() {
@@ -484,7 +538,7 @@ async function ask(question) {
   setBusy(true);
   try {
     const messages = history.filter((item) => !item.error).map(({ role, content }) => ({ role, content }));
-    const data = await api("/chat", { messages, scope: view.scope, context: view.context });
+    const data = await chat({ messages, scope: view.scope, context: view.context });
     const proposals = (Array.isArray(data.proposals) ? data.proposals : []).filter(p => p && Object.hasOwn(PROPOSALS, p.action)).slice(0, 3).map(p => ({ action: p.action, title: p.title, params: p.params, status: "ready" }));
     history.push({ role: "assistant", content: data.reply || "The model gave an empty answer.", tools: data.tools || [], actions: data.actions || [], sources: data.sources || [], followups: data.followups || [], evidence: data.evidence || [], proposals, at: Date.now() });
   } catch (err) {

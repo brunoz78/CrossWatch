@@ -169,26 +169,29 @@ def test_watchlist_uses_titles_api_for_missing_titles_when_enabled(silo: Any) ->
     assert res["confirmed_keys"] == ["tmdb:555"]
 
 
-def test_ratings_star_mapping_and_written_value_round_trip(silo: Any) -> None:
+def test_ratings_read_and_write_ten_point_scale(silo: Any) -> None:
+    from cw_platform.rating_scales import rating_scale
     from providers.sync.silo import _ratings
 
     adapter, server = silo
     sent: list[Any] = []
     server.on("PUT", "/ratings/movie-tmdb-100", lambda kw: sent.append(kw["json"]) or ResponseStub(204, None))
     server.on("PUT", "/ratings/series-tvdb-300", lambda kw: sent.append(kw["json"]) or ResponseStub(204, None))
-    stored = [{"item_id": "movie-tmdb-100", "rating": 4, "rated_at": "2026-10-27T18:00:00.000Z"}, {"item_id": "series-tvdb-300", "rating": 2, "rated_at": "2026-10-27T18:00:00.000Z"}, {"item_id": "episode-tvdb-300-1-1", "rating": 5, "rated_at": "2026-10-27T18:00:00.000Z"}]
+    stored = [{"item_id": "movie-tmdb-100", "rating": 7, "rated_at": "2026-10-27T18:00:00.000Z"}, {"item_id": "series-tvdb-300", "rating": 10, "rated_at": "2026-10-27T18:00:00.000Z"}, {"item_id": "episode-tvdb-300-1-1", "rating": 5, "rated_at": "2026-10-27T18:00:00.000Z"}]
     server.on("GET", "/ratings", lambda kw: _page(stored))
 
-    res = adapter.add("ratings", [{"type": "movie", "ids": {"tmdb": "100"}, "rating": 7}, {"type": "show", "ids": {"tvdb": "300"}, "rating": 10}, {"type": "episode", "show_ids": {"tvdb": "300"}, "season": 1, "episode": 1, "rating": 8}])
+    res = adapter.add("ratings", [{"type": "movie", "ids": {"tmdb": "100"}, "rating": 7}, {"type": "show", "ids": {"tvdb": "300"}, "rating": 9.5}, {"type": "episode", "show_ids": {"tvdb": "300"}, "season": 1, "episode": 1, "rating": 8}])
     idx = _ratings.build_index(adapter)
 
-    assert sent == [{"rating": 4}, {"rating": 5}]
+    assert sent == [{"rating": 7}, {"rating": 10}]
     assert res["unresolved"][0]["status"] == "unsupported_type"
     assert idx["tmdb:100"]["rating"] == 7
     assert idx["tmdb:100"]["rated_at"] == "2026-10-27T18:00:00Z"
-    assert idx["tvdb:300"]["rating"] == 4
+    assert idx["tvdb:300"]["rating"] == 10
     assert len(idx) == 2
-    assert [_ratings.stars_for(v) for v in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] == [1, 1, 2, 2, 3, 3, 4, 4, 5, 5]
+    assert [_ratings.silo_rating(v) for v in (0, 0.4, 1, 4.5, 6, 10, 11, "x")] == [None, 1, 1, 5, 6, 10, 10, None]
+    assert rating_scale("SILO")["values"] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert rating_scale("SILO")["max"] == 10 and rating_scale("SILO")["display_factor"] == 1
 
 
 def test_history_index_uses_completed_progress_and_card_coordinates(silo: Any) -> None:
@@ -245,6 +248,7 @@ def test_history_add_without_duration_is_unresolved_and_remove_unmarks(silo: Any
     adapter, server = silo
     _common.library(adapter).movies["movie-tmdb-100"]["runtime"] = None
     server.on("GET", "/progress", lambda kw: _page([]))
+    server.on("GET", "/catalog/items/movie-tmdb-100", lambda kw: ResponseStub(200, {"content_id": "movie-tmdb-100", "runtime": None, "versions": []}))
     res = adapter.add("history", [{"type": "movie", "ids": {"tmdb": "100"}, "watched_at": "2024-06-01T20:00:00Z"}])
     assert res["unresolved"][0]["status"] == "missing_duration"
     assert server.count("POST", "/sync/progress") == 0
@@ -255,6 +259,39 @@ def test_history_add_without_duration_is_unresolved_and_remove_unmarks(silo: Any
     assert res["confirmed_keys"] == ["tmdb:100"]
     assert server.calls[-1]["json"] == {"targets": [{"content_id": "movie-tmdb-100", "scope": "item"}]}
 
+
+def test_history_add_without_runtime_uses_file_duration(silo: Any) -> None:
+    from providers.sync.silo import _common
+
+    adapter, server = silo
+    _common.library(adapter).movies["movie-tmdb-100"]["runtime"] = None
+    sent: list[Any] = []
+    after: list[dict[str, Any]] = []
+
+    def write(kw: dict[str, Any]) -> ResponseStub:
+        sent.append(kw["json"])
+        after.extend({"media_item_id": e["media_item_id"], "completed": True, "updated_at": e["updated_at"]} for e in kw["json"]["items"])
+        return ResponseStub(200, {"items": [{"index": i, "media_item_id": e["media_item_id"], "status": "success"} for i, e in enumerate(kw["json"]["items"])], "summary": {}})
+
+    server.on("GET", "/catalog/items/movie-tmdb-100", lambda kw: ResponseStub(200, {"content_id": "movie-tmdb-100", "runtime": None, "user_data": {}, "versions": [{"file_id": "f1", "duration": 6850}]}))
+    server.on("POST", "/sync/progress", write)
+    server.on("GET", "/progress", lambda kw: _page(after))
+
+    res = adapter.add("history", [{"type": "movie", "ids": {"tmdb": "100"}, "watched_at": "2024-06-01T20:00:00Z"}])
+
+    assert sent[0]["items"][0]["duration_ms"] == 6_850_000
+    assert res["confirmed_keys"] == ["tmdb:100"]
+
+
+def test_detail_duration_order_and_decimal_values() -> None:
+    from providers.sync.silo._common import detail_duration_seconds
+
+    assert detail_duration_seconds({"user_data": {"duration_seconds": 6900.4}, "runtime": 115, "versions": [{"duration": 6906}]}) == 6900
+    assert detail_duration_seconds({"duration_seconds": "5400.0", "runtime": 115}) == 5400
+    assert detail_duration_seconds({"user_data": {"duration_seconds": 0}, "runtime": 115, "versions": [{"duration": 6906}]}) == 6900
+    assert detail_duration_seconds({"runtime": None, "versions": [{"duration": None}, {"duration": 2673}]}) == 2673
+    assert detail_duration_seconds({"runtime": 0, "versions": [], "user_data": None}) == 0
+    assert detail_duration_seconds({"user_data": {"duration_seconds": "nan"}, "versions": [{"duration": float("inf")}]}) == 0
 
 def test_progress_index_and_write_verification(silo: Any) -> None:
     from providers.sync.silo import _progress
@@ -296,6 +333,38 @@ def test_show_with_only_tmdb_resolves_through_cached_series_details(silo: Any, t
     lib = _common.library(adapter)
     assert lib.series["series-tvdb-300"]["ids"] == {"tvdb": "300", "tmdb": "77", "imdb": "tt77"}
     assert server.count("GET", "/catalog/items/series-tvdb-300") == 1
+
+
+def test_catalog_row_ids_skip_detail_lookups(silo: Any) -> None:
+    from providers.sync.silo import _common
+
+    adapter, server = silo
+    listed = {
+        "movie": [{**MOVIES[0], "tmdb_id": "100", "imdb_id": "tt100"}, {**MOVIES[1], "tmdb_id": "200", "imdb_id": "tt0000200"}, MOVIES[2]],
+        "series": [{**SERIES[0], "tvdb_id": "300", "tmdb_id": "77", "imdb_id": "tt77"}],
+        "episode": EPISODES,
+    }
+    server.on("GET", "/catalog", lambda kw: _page(listed[kw["params"]["type"]]))
+    server.on("PUT", "/ratings/series-tvdb-300", lambda kw: ResponseStub(204, None))
+    server.on("PUT", "/ratings/movie-imdb-tt0000200", lambda kw: ResponseStub(204, None))
+
+    res = adapter.add("ratings", [{"type": "show", "ids": {"tmdb": "77"}, "rating": 6}, {"type": "show", "ids": {"tmdb": "78"}, "rating": 6}, {"type": "movie", "ids": {"tmdb": "200"}, "rating": 6}])
+
+    assert res["confirmed_keys"] == ["tmdb:77#show", "tmdb:200"]
+    assert not [c for c in server.calls if c["path"].startswith("/catalog/items/")]
+    lib = _common.library(adapter)
+    assert lib.movies["movie-tmdb-100"]["ids"] == {"tmdb": "100", "imdb": "tt100"}
+    assert lib.series["series-tvdb-300"]["ids"] == {"tvdb": "300", "tmdb": "77", "imdb": "tt77"}
+
+
+def test_older_server_without_row_ids_still_looks_up_details(silo: Any) -> None:
+    adapter, server = silo
+    server.on("PUT", "/ratings/movie-imdb-tt0000200", lambda kw: ResponseStub(204, None))
+
+    res = adapter.add("ratings", [{"type": "movie", "ids": {"tmdb": "200"}, "rating": 6}])
+
+    assert res["confirmed_keys"] == ["tmdb:200"]
+    assert server.count("GET", "/catalog/items/movie-imdb-tt0000200") == 1
 
 
 def test_episode_minimal_carries_enriched_show_ids(silo: Any) -> None:
@@ -357,6 +426,29 @@ def test_disabled_titles_keep_last_known_titles_instead_of_dropping_them(silo: A
 
     server.on("GET", "/watchlist/titles", lambda kw: _page([]))
     assert _watchlist.build_index(adapter) == {}
+
+
+@pytest.mark.parametrize("status,problem", [(403, "permission_denied"), (404, "not_found"), (502, "upstream_unreachable"), (503, "service_unavailable"), (429, "rate_limited")])
+def test_failing_request_titles_keep_library_watchlist(silo: Any, status: int, problem: str) -> None:
+    from providers.sync.silo import _watchlist
+
+    adapter, server = silo
+    server.on("GET", "/watchlist", lambda kw: _page([{"content_id": "movie-tmdb-100"}]))
+    server.on("GET", "/watchlist/titles", lambda kw: _page([{"tmdb_id": 555, "media_type": "movie", "title": "Remote"}]))
+    assert sorted(_watchlist.build_index(adapter)) == ["tmdb:100", "tmdb:555"]
+
+    server.on("GET", "/watchlist/titles", lambda kw: ResponseStub(status, {"type": PROBLEM + problem}))
+    assert sorted(_watchlist.build_index(adapter)) == ["tmdb:100", "tmdb:555"]
+
+
+def test_unauthorized_request_titles_still_fail_the_watchlist(silo: Any) -> None:
+    from providers.sync.silo import _common, _watchlist
+
+    adapter, server = silo
+    server.on("GET", "/watchlist", lambda kw: _page([{"content_id": "movie-tmdb-100"}]))
+    server.on("GET", "/watchlist/titles", lambda kw: ResponseStub(401, {"type": PROBLEM + "authentication_required"}))
+    with pytest.raises(_common.SiloSyncError):
+        _watchlist.build_index(adapter)
 
 
 def test_unexpected_extra_pages_raise_for_unpaged_lists(silo: Any) -> None:

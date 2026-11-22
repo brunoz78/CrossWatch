@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from .._path_matching import path_fallback, resolve_path
 from . import _discover_history
+from cw_platform import capture_mode
 from cw_platform.interactive_reads import retained_read, replace_retained, replaying, use_review_reads
 
 from concurrent.futures import ThreadPoolExecutor
@@ -204,6 +205,7 @@ DATE_NO_DATE = "confirmed_watched_no_date"
 DATE_WRITE_FAILED = "write_failed"
 
 _TOKEN_KEYS = ("tmdb", "imdb", "tvdb", "plex")
+_EPISODE_ID_KEYS = ("tmdb", "tvdb", "imdb")
 
 # Internal tuning defaults.
 _DATE_TOLERANCE_SEC = 60
@@ -238,6 +240,23 @@ def _item_show_tokens(item: Mapping[str, Any]) -> set[str]:
     return external or toks
 
 
+def _own_episode_ids(ids: Any, show_ids: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not isinstance(ids, Mapping) or not isinstance(show_ids, Mapping):
+        return out
+    for key in _EPISODE_ID_KEYS:
+        value = str(ids.get(key) or "").strip().lower()
+        show_value = str(show_ids.get(key) or "").strip().lower()
+        if value and show_value and value != show_value:
+            out[key] = value
+    return out
+
+
+def _episode_ids_conflict(wanted: Mapping[str, str], have: Mapping[str, str]) -> bool:
+    shared = set(wanted) & set(have)
+    return bool(shared) and all(wanted[k] != have[k] for k in shared)
+
+
 def _item_se(item: Mapping[str, Any]) -> tuple[int | None, int | None]:
     s = item.get("season") if item.get("season") is not None else item.get("season_number")
     e = item.get("episode") if item.get("episode") is not None else item.get("episode_number")
@@ -253,7 +272,7 @@ def _item_se(item: Mapping[str, Any]) -> tuple[int | None, int | None]:
 
 
 class HistoryCatalog:
-    __slots__ = ("by_rk", "movie_tokens", "show_tokens", "episode_index", "movie_title_year", "live_complete")
+    __slots__ = ("by_rk", "movie_tokens", "show_tokens", "episode_index", "episode_id_index", "movie_title_year", "live_complete")
 
     def __init__(self) -> None:
         self.live_complete = False
@@ -261,6 +280,7 @@ class HistoryCatalog:
         self.movie_tokens: dict[str, str] = {}
         self.show_tokens: dict[str, str] = {}
         self.episode_index: dict[tuple[str, int, int], set[str]] = {}
+        self.episode_id_index: dict[str, set[str]] = {}
         self.movie_title_year: dict[tuple[str, int | None], set[str]] = {}
 
     def add(self, entry: Mapping[str, Any]) -> None:
@@ -312,6 +332,8 @@ class HistoryCatalog:
             if s_i is not None and e_i is not None:
                 for tok in show_toks:
                     self.episode_index.setdefault((tok, s_i, e_i), set()).add(rk)
+            for key, value in _own_episode_ids(e["ids"], e["show_ids"]).items():
+                self.episode_id_index.setdefault(f"{key}:{value}", set()).add(rk)
 
     @staticmethod
     def _title_year(title: Any, year: Any) -> tuple[str, int | None] | None:
@@ -339,11 +361,27 @@ class HistoryCatalog:
 
         if kind in ("episode", "season", "show"):
             show_tokens = _item_show_tokens(item)
+            wanted = _own_episode_ids(ids_from(item), extract_show_ids(item)) if kind == "episode" else {}
+            if wanted:
+                id_rks: set[str] = set()
+                for key, value in wanted.items():
+                    id_rks |= self.episode_id_index.get(f"{key}:{value}", set())
+                if len(id_rks) == 1:
+                    rk = next(iter(id_rks))
+                    e = self.by_rk.get(rk) or {}
+                    return rk, (CLASS_IN_CATALOG_WATCHED if e.get("watched") else CLASS_IN_CATALOG_UNWATCHED)
+                if len(id_rks) > 1:
+                    return None, CLASS_RESOLVE_AMBIGUOUS
             s, ep = _item_se(item)
             if s is not None and ep is not None and show_tokens:
                 rks: set[str] = set()
                 for tok in show_tokens:
                     rks |= self.episode_index.get((tok, int(s), int(ep)), set())
+                if wanted:
+                    rks = {
+                        rk for rk in rks
+                        if not _episode_ids_conflict(wanted, _own_episode_ids((self.by_rk.get(rk) or {}).get("ids"), (self.by_rk.get(rk) or {}).get("show_ids")))
+                    }
                 if len(rks) == 1:
                     rk = next(iter(rks))
                     e = self.by_rk.get(rk) or {}
@@ -1501,7 +1539,7 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
         if workers > 1 and len(rows) > 1:
             executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="plex-history")
             try:
-                row_iter = executor.map(_process_history_row, rows)
+                row_iter = capture_mode.scoped_map(executor, _process_history_row, rows)
                 for i, result in enumerate(row_iter, start=1):
                     if prog:
                         prog.tick(i, total=total)
@@ -1538,7 +1576,7 @@ def build_index(adapter: Any, since: int | None = None, limit: int | None = None
                                   if (row.get("ids") or {}).get("plex")
                                   and str(row["ids"]["plex"]) not in cat.by_rk})
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="plex-history-state") as executor:
-                fetched = executor.map(lambda rk: _pms_fetch_metadata_row(adapter, rk, strict=True), rating_keys)
+                fetched = capture_mode.scoped_map(executor, lambda rk: _pms_fetch_metadata_row(adapter, rk, strict=True), rating_keys)
                 live_rows.update(zip(rating_keys, fetched))
         for saved in recorded.values():
             rk = str((saved.get("ids") or {}).get("plex") or "")
@@ -1881,7 +1919,7 @@ def add(adapter: Any, items: Iterable[Mapping[str, Any]]) -> tuple[int, list[dic
                 scrobble_ok = []
                 with ThreadPoolExecutor(max_workers=write_workers, thread_name_prefix="plex-scrobble") as ex:
                     for done_n, success in enumerate(
-                        ex.map(lambda t: _scrobble_with_date(srv, t[2], t[3]), to_scrobble), 1
+                        capture_mode.scoped_map(ex, lambda t: _scrobble_with_date(srv, t[2], t[3]), to_scrobble), 1
                     ):
                         scrobble_ok.append(success)
                         write_progress.tick(done_n)

@@ -16,6 +16,7 @@ except Exception:  # pragma: no cover
     def cw_log(provider: str, feature: str, level: str, msg: str, **fields: Any) -> None:  # type: ignore[no-redef]
         pass
 
+from cw_platform import capture_mode
 from cw_platform.id_map import minimal as id_minimal, canonical_key
 from cw_platform.tracker_store import RestorePoint, TrackerStore, TrackerUnreadable
 
@@ -33,7 +34,7 @@ def pair_scoped() -> bool:
 
 
 def _capture_mode() -> bool:
-    return _truthy_env("CW_CAPTURE_MODE")
+    return capture_mode.active("CROSSWATCH")
 
 
 def _pair_scope() -> str | None:

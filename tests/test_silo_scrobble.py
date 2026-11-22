@@ -152,6 +152,44 @@ def test_watcher_episode_reported_as_series(monkeypatch: pytest.MonkeyPatch, ser
     assert ev.title == "Line of Fire (2026)" and ev.ids["tvdb_show"] == "477711" and ev.ids["tvdb_episode"] == "9001"
 
 
+def _history_shaped(**extra: Any) -> dict[str, Any]:
+    row = _session(**extra)
+    row["media_item_id"] = row.pop("content_id")
+    row.pop("series_name")
+    row.pop("episode_name")
+    row.setdefault("series_title", "")
+    return row
+
+
+def test_watcher_reads_history_shaped_movie_row(monkeypatch: pytest.MonkeyPatch, server: FakeServer) -> None:
+    rows = [_history_shaped()]
+    server.on("GET", "/profiles/household/sessions", lambda kw: ResponseStub(200, {"items": rows}))
+    server.on("GET", "/catalog/items/movie-tmdb-100", lambda kw: ResponseStub(200, {"content_id": "movie-tmdb-100", "tmdb_id": "100"}))
+    svc, got = _watcher(monkeypatch)
+
+    assert svc._tick() is True
+
+    ev = got.events[0]
+    assert ev.action == "start" and ev.media_type == "movie" and ev.title == "Alpha"
+    assert ev.ids == {"tmdb": "100"} and ev.raw["content_id"] == "movie-tmdb-100"
+
+
+def test_watcher_reads_history_shaped_episode_row(monkeypatch: pytest.MonkeyPatch, server: FakeServer) -> None:
+    cid = "episode-tvdb-477711-1-5"
+    rows = [_history_shaped(content_id=cid, media_type="episode", media_title="Cul-De-Sac", series_title="Line of Fire (2026)", season_number=1, episode_number=5)]
+    server.on("GET", "/profiles/household/sessions", lambda kw: ResponseStub(200, {"items": rows}))
+    server.on("GET", f"/catalog/items/{cid}", lambda kw: ResponseStub(200, {"content_id": cid, "series_id": "series-tvdb-477711", "tvdb_id": "9001"}))
+    server.on("GET", "/catalog/items/series-tvdb-477711", lambda kw: ResponseStub(200, {"content_id": "series-tvdb-477711", "tvdb_id": "477711"}))
+    svc, got = _watcher(monkeypatch)
+
+    svc._tick()
+
+    ev = got.events[0]
+    assert ev.media_type == "episode" and ev.season == 1 and ev.number == 5
+    assert ev.title == "Line of Fire (2026)" and ev.raw["content_id"] == cid
+    assert svc._sessions["s-1"]["meta"]["episode_title"] == "Cul-De-Sac"
+
+
 @pytest.mark.parametrize(
     "completed_at,left,expected",
     [
@@ -301,6 +339,33 @@ def test_sink_progress_and_already_watched_paths(server: FakeServer) -> None:
     assert sink.send(_event("pause", 50.0, "episode"), _sink_cfg())["reason"] == "destination_already_watched"
 
 
+def test_sink_progress_without_runtime_uses_file_duration(server: FakeServer) -> None:
+    from providers.scrobble.silo.sink import SiloSink
+
+    _catalog(server)
+    sent: list[Any] = []
+    server.on("GET", "/catalog/items/episode-tvdb-300-1-1", lambda kw: ResponseStub(200, {"content_id": "episode-tvdb-300-1-1", "runtime": None, "user_data": {}, "user_state": {"played": False}, "versions": [{"file_id": "f1", "duration": 2673}]}))
+    server.on("POST", "/sync/progress", lambda kw: sent.append(kw["json"]) or ResponseStub(200, {"items": [{"index": 0, "media_item_id": "episode-tvdb-300-1-1", "status": "success"}], "summary": {}}))
+    sink = SiloSink(cfg_provider=_sink_cfg, instance_id="default")
+
+    res = sink.send(_event("start", 10.0, "episode"), _sink_cfg())
+
+    assert res == {"ok": True}
+    assert sent[0]["items"][0] == {"media_item_id": "episode-tvdb-300-1-1", "duration_ms": 2_673_000, "position_ms": 267_300}
+
+
+def test_sink_without_any_duration_fails_start(server: FakeServer) -> None:
+    from providers.scrobble.silo.sink import SiloSink
+
+    _catalog(server)
+    server.on("GET", "/catalog/items/episode-tvdb-300-1-1", lambda kw: ResponseStub(200, {"content_id": "episode-tvdb-300-1-1", "runtime": None, "user_data": {}, "user_state": {"played": False}, "versions": []}))
+    sink = SiloSink(cfg_provider=_sink_cfg, instance_id="default")
+
+    res = sink.send(_event("start", 10.0, "episode"), _sink_cfg())
+
+    assert res.get("ok") is False
+    assert not [c for c in server.calls if c["method"] == "POST" and c["path"] == "/sync/progress"]
+
 def test_sink_unmatched_is_not_retryable(server: FakeServer) -> None:
     from providers.scrobble.scrobble import ScrobbleEvent
     from providers.scrobble.silo.sink import SiloSink
@@ -342,7 +407,7 @@ def test_plex_rating_forwarded_to_silo_movies_and_shows_only(server: FakeServer)
 
     assert "silo" in OPS_RATING_SINKS and "silo" in RATING_SINKS and "silo" in routes.ROUTE_RATING_SINKS
     res = send_rating("silo", _cfg(), "default", {"type": "movie", "ids": {"tmdb": "100"}, "rating": 8}, 8.0)
-    assert res["ok"] is True and sent == [{"rating": 4}]
+    assert res["ok"] is True and sent == [{"rating": 8}]
     cleared = send_rating("silo", _cfg(), "default", {"type": "movie", "ids": {"tmdb": "100"}}, None)
     assert cleared["ok"] is True and sent[-1] == "deleted"
     ep = send_rating("silo", _cfg(), "default", {"type": "episode", "show_ids": {"tvdb": "300"}, "season": 1, "episode": 1}, 7.0)
