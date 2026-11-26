@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LOCALES = ROOT / "assets" / "locales"
 LANG = "de"
+SAME_FILE = Path(__file__).resolve().parent / "locale_same.json"  # keys whose German text equals the English one
 VAR = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 RICH = re.compile(r"\[\[/?[a-z]+\]\]")
 
@@ -82,7 +83,7 @@ def save(lang: str, trees: dict[str, dict]) -> None:
     folder = LOCALES / lang
     folder.mkdir(exist_ok=True)
     for name, tree in trees.items():
-        (folder / f"{name}.json").write_text(json.dumps(tree, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (folder / f"{name}.json").write_text(json.dumps(tree, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
 def main() -> int:
@@ -96,6 +97,7 @@ def main() -> int:
     german = {name: flatten(tree) for name, tree in load(LANG).items()} if (LOCALES / LANG).exists() else {}
     runtime = locale_file.load(LANG)
     extra = json.loads(Path(args.apply).read_text(encoding="utf-8")) if args.apply else {}
+    same = set(json.loads(SAME_FILE.read_text(encoding="utf-8"))) if SAME_FILE.exists() else set()
 
     open_keys: dict[str, str] = {}
     out: dict[str, dict] = {}
@@ -105,10 +107,10 @@ def main() -> int:
         merged: dict[str, str] = {}
         for key, text in flat_en.items():
             kept = flat_de.get(key)
-            if kept == text:  # English placeholder from an earlier run, still open
+            if kept == text and key not in same:  # English placeholder from an earlier run, still open
                 kept = None
             value = extra.get(key) or kept or from_runtime(text, runtime)
-            if value is None and same_as_english(text):
+            if value is None and (same_as_english(text) or key in same):
                 value = text
             if value is None:
                 open_keys[key] = text
