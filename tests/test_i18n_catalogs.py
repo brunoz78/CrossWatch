@@ -47,7 +47,7 @@ def test_registry_lists_english_first_and_dutch() -> None:
     assert i18n.DEFAULT_LANGUAGE == "en"
 
 
-@pytest.mark.parametrize("code", ["en", "nl"])
+@pytest.mark.parametrize("code", ["en", "nl", "de"])
 def test_catalog_files_are_valid_json_without_duplicate_keys(code: str) -> None:
     files = sorted((LOCALES / code).glob("*.json"))
     assert [path.stem for path in files] == ["app", "common", "media", "settings"]
@@ -149,14 +149,16 @@ def test_localize_html_resolves_tokens_with_arguments() -> None:
 def test_clean_language_accepts_only_registered_codes() -> None:
     assert i18n.clean_language("NL") == "nl"
     assert i18n.clean_language(" nl ") == "nl"
-    for value in (None, "", "de", "nl-BE", "../en", 5):
+    for value in (None, "", "xx", "nl-BE", "../en", 5):
         assert i18n.clean_language(value) == "en"
 
 
 def test_account_preference_wins_over_browser_cookie() -> None:
     request = _Request({i18n.LANGUAGE_COOKIE: "nl"})
     assert i18n.request_language(request, None) == "nl"
-    assert i18n.request_language(request, {"preferences": {"language": "en"}}) == "en"
+    # Fork: the default (English, also an unset preference) follows the cookie.
+    assert i18n.request_language(request, {"preferences": {"language": "en"}}) == "nl"
+    assert i18n.request_language(_Request({i18n.LANGUAGE_COOKIE: "en"}), {"preferences": {"language": "de"}}) == "de"
     assert i18n.request_language(_Request(), {"preferences": {"language": "nl"}}) == "nl"
     assert i18n.request_language(_Request(), {"preferences": {}}) == "en"
     assert i18n.request_language(None, None) == "en"

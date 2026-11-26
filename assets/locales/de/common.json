@@ -1,0 +1,224 @@
+{
+  "common": {
+    "actions": {
+      "viewAll": "Alle anzeigen",
+      "refresh": "Aktualisieren",
+      "scrollLeft": "Nach links scrollen",
+      "scrollRight": "Nach rechts scrollen",
+      "manage": "Verwalten",
+      "enable": "Aktivieren",
+      "unlink": "Trennen",
+      "logOut": "Abmelden",
+      "copy": "Kopieren",
+      "open": "Öffnen",
+      "restart": "Neu starten",
+      "close": "Schliessen",
+      "stickySave": "Fixierter Speichern-Knopf",
+      "back": "Zurück",
+      "clear": "Leeren",
+      "remove": "Entfernen",
+      "clearAll": "Alles leeren",
+      "cancel": "Abbrechen",
+      "apply": "Übernehmen",
+      "resetDefaults": "Standard wiederherstellen",
+      "save": "Speichern",
+      "change": "Ändern",
+      "turnOn": "Einschalten",
+      "continue": "Weiter",
+      "link": "Verknüpfen",
+      "view": "Ansehen",
+      "tryAgain": "Erneut versuchen",
+      "loadMore": "Mehr laden",
+      "hide": "Ausblenden",
+      "delete": "Löschen",
+      "confirm": "Bestätigen",
+      "edit": "Bearbeiten"
+    },
+    "media": {
+      "watchlist": "Watchlist",
+      "seasonN": "Staffel {{n}}",
+      "episode": "Episode",
+      "season": "Staffel",
+      "movie": "Film",
+      "show": "Anzeigen",
+      "unknownTitle": "Unbekannter Titel",
+      "untitled": "Ohne Titel",
+      "watched": "Gesehen",
+      "episodeN": "Episode {{n}}",
+      "movies": "Filme",
+      "episodes": "Episoden",
+      "anime": "Anime",
+      "shows": "Serien",
+      "seasons": "Staffeln"
+    },
+    "status": {
+      "loading": "Lädt...",
+      "disabled": "Deaktiviert",
+      "enabled": "Aktiv",
+      "off": "Aus",
+      "done": "Fertig",
+      "configured": "Eingerichtet",
+      "notConfigured": "Nicht eingerichtet",
+      "connected": "Verbunden",
+      "notConnected": "Nicht verbunden",
+      "unknown": "Unbekannt",
+      "pleaseWait": "Bitte warten",
+      "on": "On",
+      "saving": "Saving...",
+      "unavailable": "Nicht verfügbar",
+      "loadingShort": "Lädt",
+      "noData": "Keine Daten",
+      "failed": "Fehlgeschlagen"
+    },
+    "units": {
+      "minutes": "Minuten",
+      "hours": "Stunden",
+      "secShort": "s"
+    },
+    "labels": {
+      "advanced": "Erweitert",
+      "other": "Andere",
+      "filters": "Filter",
+      "provider": "Anbieter",
+      "sort": "Sortieren",
+      "default": "Standard",
+      "rating": "Bewertung",
+      "yes": "Ja",
+      "no": "No"
+    },
+    "selection": {
+      "label": "Gewählte Einträge",
+      "selected": "gewählt",
+      "visible": "Sichtbar",
+      "allResults": "Alle Ergebnisse",
+      "selectAll": "Alle auswählen",
+      "selectNone": "Keine auswählen",
+      "select": "Auswählen"
+    },
+    "time": {
+      "today": "Heute",
+      "last7Days": "Letzte 7 Tage",
+      "last30Days": "Letzte 30 Tage",
+      "olderThan30Days": "Älter als 30 Tage",
+      "justNow": "gerade eben",
+      "tomorrow": "Morgen",
+      "yesterday": "Gestern"
+    },
+    "language": {
+      "label": "Sprache",
+      "hintAccount": "In deinem Konto gespeichert. Die Seite lädt neu, um es anzuwenden.",
+      "hintBrowser": "In diesem Browser gespeichert. Die Seite lädt neu, um es anzuwenden.",
+      "reloadPending": "Sprache gespeichert. Speichere oder verwirf deine Änderungen und lade die Seite dann neu.",
+      "reloadNow": "Jetzt neu laden",
+      "saving": "Sprache wird gespeichert…",
+      "invalid": "Diese Sprache ist nicht verfügbar.",
+      "saveFailed": "Die Sprache konnte nicht gespeichert werden."
+    },
+    "notifications": {
+      "newOne": "Neue Benachrichtigung",
+      "newCount_one": "{{count}} neue Benachrichtigung",
+      "newCount_other": "{{count}} neue Benachrichtigungen",
+      "titleWithNew_one": "Benachrichtigungen ({{count}} neu)",
+      "titleWithNew_other": "Benachrichtigungen ({{count}} neu)",
+      "clearOne": "Benachrichtigung entfernen: {{title}}",
+      "clear": "Benachrichtigung entfernen",
+      "title": "Benachrichtigungen",
+      "settings": "Benachrichtigungs-Einstellungen",
+      "close": "Benachrichtigungen schliessen",
+      "banner": "Banner für neue Benachrichtigungen",
+      "pushDevice": "Push-Benachrichtigungen auf diesem Gerät",
+      "sendTest": "Test-Benachrichtigung senden",
+      "view": "Benachrichtigungen anzeigen",
+      "dismissBanner": "Benachrichtigungsbanner schliessen",
+      "new": "Neu",
+      "caughtUp": "Du bist auf dem neuesten Stand",
+      "emptyHint": "Neue Benachrichtigungen erscheinen hier.",
+      "loading": "Lade Benachrichtigungen…",
+      "viewReviews": "Abgleich-Prüfungen anzeigen",
+      "push": {
+        "iosHomeScreen": "Füge CrossWatch auf iPhone und iPad zum Home-Bildschirm hinzu und öffne es von dort, um Push-Benachrichtigungen zu nutzen.",
+        "iosVersion": "Push-Benachrichtigungen brauchen iOS oder iPadOS 16.4 oder neuer.",
+        "unsupported": "Dieser Browser unterstützt keine Push-Benachrichtigungen.",
+        "needsHttps": "Braucht HTTPS. Öffne CrossWatch über eine sichere Adresse, um Push-Benachrichtigungen zu nutzen.",
+        "blocked": "Benachrichtigungen sind für diese Seite blockiert. Erlaube sie in den Website-Einstellungen des Browsers.",
+        "on": "Dieses Gerät erhält neue Benachrichtigungen, auch wenn CrossWatch geschlossen ist.",
+        "offer": "Neue Benachrichtigungen auf diesem Gerät erhalten, auch wenn CrossWatch geschlossen ist.",
+        "unavailable": "Push-Benachrichtigungen sind gerade nicht verfügbar.",
+        "enableFailed": "Push-Benachrichtigungen konnten nicht eingeschaltet werden.",
+        "notAllowed": "Benachrichtigungen wurden für diese Seite nicht erlaubt.",
+        "changeFailed": "Push-Benachrichtigungen konnten nicht geändert werden.",
+        "testSent": "Test-Benachrichtigung gesendet. Erscheint nichts, prüfe in den Systemeinstellungen des Geräts, ob Benachrichtigungen für diesen Browser erlaubt sind.",
+        "testFailed": "Die Test-Benachrichtigung konnte nicht gesendet werden."
+      },
+      "unavailable": "Benachrichtigungen nicht verfügbar",
+      "loadFailed": "Benachrichtigungen konnten nicht geladen werden."
+    },
+    "copy": {
+      "failed": "Kopieren fehlgeschlagen",
+      "copiedCheck": "Kopiert ✓"
+    },
+    "paging": {
+      "previous": "Vorherige Seite",
+      "next": "Nächste Seite",
+      "previousShort": "Zurück",
+      "nextShort": "Weiter"
+    },
+    "touchHelp": {
+      "information": "Information",
+      "close": "Schliessen",
+      "openSettings": "Einstellungen öffnen"
+    },
+    "cardActions": {
+      "actions": "Aktionen"
+    },
+    "api": {
+      "busyDelete": "Eine Synchronisierung oder Datenbankwartung läuft. Warte, bis sie fertig ist, und lösche das Paar dann erneut."
+    },
+    "profileSelect": {
+      "default": "Standard"
+    },
+    "viewCache": {
+      "refreshFailed": "Aktualisieren fehlgeschlagen. Gespeicherte Ergebnisse werden gezeigt.",
+      "loadFailed": "{{label}} konnte nicht geladen werden.",
+      "notPrepared": "Die Ansicht konnte nicht vorbereitet werden. Bitte erneut versuchen.",
+      "retry": "Erneut versuchen"
+    },
+    "mobile": {
+      "confirmTitle": "Aktion bestätigen",
+      "continue": "Weiter",
+      "filters": "Filter",
+      "done": "Fertig",
+      "remove": "Entfernen",
+      "cancel": "Abbrechen",
+      "ok": "OK",
+      "section": "Bereich"
+    },
+    "mobileSettings": {
+      "title": "Handy-Einstellungen",
+      "visibility": "Sichtbarkeit",
+      "playingCard": "Karte «Läuft gerade»",
+      "showOnDevice": "In der Handy-Ansicht dieses Geräts anzeigen",
+      "notifications": "Benachrichtigungen",
+      "alerts": "Benachrichtigungshinweise",
+      "alertsSub": "Banner und Vibration (falls unterstützt), solange geöffnet",
+      "push": "Push-Benachrichtigungen",
+      "pushSub": "Neue Benachrichtigungen auf diesem Gerät erhalten, auch wenn CrossWatch geschlossen ist",
+      "touch": "Rückmeldung bei Berührung",
+      "haptics": "Haptisches Feedback",
+      "hapticsSub": "Kurze Vibration beim Tippen auf Menüs",
+      "unsupported": "Von diesem Browser nicht unterstützt",
+      "disabledMain": "In den Haupteinstellungen ausgeschaltet",
+      "disabledProfile": "In deinen Profileinstellungen ausgeschaltet"
+    },
+    "pwa": {
+      "install": "CrossWatch installieren",
+      "addHome": "Füge CrossWatch zu deinem Startbildschirm hinzu.",
+      "dismiss": "Ausblenden",
+      "installBtn": "Installieren",
+      "notNow": "Nicht jetzt",
+      "gotIt": "Verstanden",
+      "best": "Füge es für die beste Bedienung zu deinem Startbildschirm hinzu.",
+      "tapShare": "Tippe auf «Teilen» (⬆︎) → «Zum Home-Bildschirm»."
+    }
+  }
+}
