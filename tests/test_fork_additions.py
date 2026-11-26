@@ -13,6 +13,10 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
     monkeypatch.setenv("CONFIG_BASE", str(tmp_path))
+    from cw_platform import config_base as _cb
+
+    # The config base may already be resolved by other imports; pin it like the upstream fixture.
+    monkeypatch.setattr(_cb, "CONFIG", tmp_path, raising=False)
     from fastapi.testclient import TestClient
     import crosswatch
 

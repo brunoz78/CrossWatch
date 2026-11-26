@@ -22,6 +22,8 @@ _I18N_DIR = _ROOT / "assets" / "i18n"
 _COOKIE_RE = re.compile(r"(?:^|;\s*)cw_lang=([a-z]{2})")
 _HEAD_RE = re.compile(rb"<head(?:\s[^>]*)?>", re.IGNORECASE)
 _HTML_LANG_RE = re.compile(rb'<html([^>]*?)\slang="[a-zA-Z-]*"', re.IGNORECASE)
+# Language the page was rendered in by the built-in translation (assets/locales).
+_PAGE_LANG_RE = re.compile(rb'window\.__cwLanguage=\{"code":"([a-z]{2,3})"')
 
 
 def _version(name: str) -> str:
@@ -67,7 +69,14 @@ class I18nMiddleware:
             return
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers") or []}
-        lang = pick_language(headers.get("cookie", ""), headers.get("accept-language", ""))
+        cookie = headers.get("cookie", "")
+        lang = pick_language(cookie, headers.get("accept-language", ""))
+        if lang != "en" and not _COOKIE_RE.search(cookie):
+            # No language chosen yet: let the built-in translation follow the browser
+            # language (or CW_UI_LANG) as well, by passing it on as the cw_lang cookie.
+            merged = f"{cookie}; cw_lang={lang}" if cookie else f"cw_lang={lang}"
+            raw = [(k, v) for k, v in scope.get("headers") or [] if k.lower() != b"cookie"]
+            scope = {**scope, "headers": [*raw, (b"cookie", merged.encode("latin-1"))]}
         start: Message | None = None
         chunks: list[bytes] = []
 
@@ -99,6 +108,13 @@ def _inject(body: bytes, lang: str) -> bytes:
     m = _HEAD_RE.search(body)
     if not m or b"/assets/i18n/i18n.js" in body:
         return body
+    page = _PAGE_LANG_RE.search(body)
+    if page:
+        # The page already follows the language of the built-in translation (account
+        # preference or cw_lang cookie); the runtime translator only fills its gaps.
+        found = page.group(1).decode()
+        lang = found if found in SUPPORTED_LANGS else "en"
+        return body[: m.end()] + _tags(lang) + body[m.end():]
     body = body[: m.end()] + _tags(lang) + body[m.end():]
     return _HTML_LANG_RE.sub(lambda h: b"<html" + h.group(1) + b' lang="' + lang.encode() + b'" data-cw-lang="' + lang.encode() + b'"', body, count=1)
 

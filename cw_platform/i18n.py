@@ -250,7 +250,10 @@ def cookie_language(request: Any) -> str:
 
 
 def request_language(request: Any = None, user: Any = None) -> str:
-    if isinstance(user, dict):
+    # Fork change: an account whose language is the default (also what an unset
+    # preference becomes) follows the browser's cw_lang cookie. The language switch
+    # writes that cookie too, so an explicit choice of English stays English.
+    if isinstance(user, dict) and user_language(user) != DEFAULT_LANGUAGE:
         return user_language(user)
     return cookie_language(request)
 

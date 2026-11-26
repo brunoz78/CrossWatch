@@ -15,7 +15,8 @@
     const m = document.cookie.match(/(?:^|;\s*)cw_lang=([a-z]{2})/);
     return m ? m[1] : "";
   };
-  const lang = (document.documentElement.getAttribute("data-cw-lang") || readCookie() || "en").toLowerCase();
+  // The server injects the dictionary only for the page language (see i18n_frontend.py).
+  const lang = (document.documentElement.getAttribute("data-cw-lang") || window.CW_I18N_DICT?.lang || readCookie() || "en").toLowerCase();
   const dict = (window.CW_I18N_DICT && window.CW_I18N_DICT.lang === lang) ? window.CW_I18N_DICT : null;
   const strings = dict?.strings || {};
   const active = !!dict && lang !== "en";
@@ -130,6 +131,7 @@
       if (SKIP.has(n.nodeName)) return true;
       if (n.isContentEditable) return true;
       if (n.hasAttribute("data-no-i18n") || n.getAttribute("translate") === "no") return true;
+      if (n.nodeName === "OPTION" && n.hasAttribute("lang")) return true; // language names stay native
       if (!attrs && isIcon(n)) return true;
     }
     return false;
@@ -175,6 +177,7 @@
       acceptNode(n) {
         if (n.nodeType === 1 && isIcon(n)) { doAttrs(n); return NodeFilter.FILTER_REJECT; }
         if (n.nodeType === 1 && (SKIP.has(n.nodeName) || n.hasAttribute("data-no-i18n"))) return NodeFilter.FILTER_REJECT;
+        if (n.nodeType === 1 && n.nodeName === "OPTION" && n.hasAttribute("lang")) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
     });
