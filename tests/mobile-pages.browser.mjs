@@ -2,6 +2,7 @@
 /* CrossWatch - Phone workflows for Editor, Tracker, Events and Analyzer */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 
+import './i18n-browser-setup.mjs';
 import test from "node:test";
 import assert from "node:assert/strict";
 import {readFile, readdir, mkdir} from "node:fs/promises";
@@ -62,7 +63,7 @@ async function fixture(t, kind, theme = "flat-dark", width = 390, options = {}) 
     const attrs=theme==="original"?'class="cw-theme-original"':`data-cw-theme="${theme}" class="cw-theme-${theme==="flat-light"?"light":"dark"}"`;
     const scripts=kind==="editor"?[...editorModules.map(name=>"editor/"+name),"editor.js"]:kind==="tracker"?["tracker.js"]:[];
     const mount=kind==="analyzer"?`import('/assets/js/analyzer/index.js').then(()=>Analyzer.mount(document.querySelector('#page-analyzer')))` :kind==="events"?`import('/assets/js/events/index.js').then(m=>m.default.mount(document.querySelector('#page-events'),{mode:'raw'}))`:kind==="tracker"?`TrackerPage.mount(document.querySelector('#page-tracker'))`:"Promise.resolve()";
-    return route.fulfill({contentType:"text/html",body:`<!doctype html><html ${attrs} data-tab="${kind}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${[...styles,theme==="original"?"themes/original-coverage":"themes/flat"].map(file=>`<link rel="stylesheet" href="/assets/${file}.css">`).join("")}</head><body><main id="layout"><section id="page-${kind}" class="cw-themed-page"></section></main><script>window.CW={AuthState:{read:()=>({isAdmin:true})}};</script><script src="/assets/helpers/provider-meta.js"></script><script src="/assets/helpers/selection-bar.js"></script><script src="/assets/helpers/dialog-focus.js"></script>${scripts.map(file=>`<script src="/assets/js/${file}"></script>`).join("")}<script>window.ready=${mount};</script></body></html>`});
+    return route.fulfill({contentType:"text/html",body:`<!doctype html><html ${attrs} data-tab="${kind}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${[...styles,theme==="original"?"themes/original-coverage":"themes/flat"].map(file=>`<link rel="stylesheet" href="/assets/${file}.css">`).join("")}</head><body><main id="layout"><section id="page-${kind}" class="tab-page cw-themed-page"></section></main><script>window.CW={AuthState:{read:()=>({isAdmin:true})}};</script><script src="/assets/helpers/provider-meta.js"></script><script src="/assets/helpers/selection-bar.js"></script><script src="/assets/helpers/mobile-experience.js"></script><script src="/assets/helpers/dialog-focus.js"></script>${scripts.map(file=>`<script src="/assets/js/${file}"></script>`).join("")}<script>window.ready=${mount};</script></body></html>`});
   });
   await page.goto("https://mobile-pages.test/");
   await page.evaluate(() => window.ready);
@@ -73,8 +74,30 @@ async function fixture(t, kind, theme = "flat-dark", width = 390, options = {}) 
 
 async function screenshot(page, name) {
   if (!process.env.CW_MOBILE_PAGES_SCREENSHOTS) return;
+  await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))));
   await mkdir(process.env.CW_MOBILE_PAGES_SCREENSHOTS,{recursive:true});
   await page.screenshot({path:`${process.env.CW_MOBILE_PAGES_SCREENSHOTS}/${name}.png`,fullPage:true});
+}
+
+for (const theme of ['original','flat-dark','flat-light']) for (const kind of ['events','analyzer','editor','tracker']) {
+  test(`${theme} ${kind}: pagination stays on one row on phones`, async t => {
+    const rows = Array.from({length:65}, (_, i) => ({...items[0],key:`movie:${i}`,title:`Movie ${i}`}));
+    const {page} = await fixture(t,kind,theme,360,['editor','tracker'].includes(kind)?{items:rows}:{});
+    const selector = {events:'.ev-pagenums',analyzer:'.an-pagination',editor:'#cw-pager',tracker:'.trk-pager-nav'}[kind];
+    const pager = page.locator(selector);
+    await pager.waitFor();
+    for (const width of [320,360,384,412,740]) {
+      await page.setViewportSize({width,height:844});
+      const boxes = await pager.locator(':scope > button:visible').evaluateAll(nodes => nodes.map(node => {const r=node.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}));
+      assert.equal(boxes.length,2);
+      assert.ok(Math.abs(boxes[0].y-boxes[1].y)<1,JSON.stringify(boxes));
+      for (const box of boxes) assert.ok(box.height>=44&&box.width>=44&&box.x>=0&&box.x+box.width<=width,JSON.stringify({box,width,parents:await pager.evaluate(node=>{const result=[];for(let p=node;p;p=p.parentElement)result.push([p.className,p.clientWidth,getComputedStyle(p).minWidth]);return result;})}));
+      assert.equal(await pager.evaluate(node=>node.scrollWidth>node.clientWidth),false);
+      await screenshot(page,`${theme}-${kind}-pager-${width}`);
+    }
+    await page.setViewportSize({width:1440,height:1000});
+    if(['events','analyzer'].includes(kind))assert.equal(await pager.locator(':scope > button:visible').count(),4);
+  });
 }
 
 async function noOverflow(page) {
@@ -83,6 +106,58 @@ async function noOverflow(page) {
 }
 
 for(const theme of ["original","flat-dark","flat-light"]) {
+  test(`${theme}: mobile Editor keeps history compact and secondary tools in a sheet`, async t => {
+    const history = [{...items[0],title:'Resident Evil',watched_at:'2026-11-07T16:35:14Z'}, {...reviewItems[1],series_title:'House of the Dragon',watched_at:'2026-11-07T18:45:08Z'}];
+    const {page} = await fixture(t,'editor',theme,390,{kind:'history',editable:true,items:history});
+    await page.addScriptTag({url:'/assets/helpers/icon-select.js'});
+    assert.equal(await page.locator('.cw-mobile-sort select').isVisible(),true);
+    assert.equal(await page.locator('.cw-mobile-sort .cw-icon-select').count(),0);
+    assert.equal(await page.locator('.cw-mobile-sort select option:checked').textContent(),'Title');
+    await page.locator('.cw-mobile-sort select').selectOption('extra');
+    assert.equal(await page.locator('.cw-mobile-sort select option:checked').textContent(),'Watched on');
+    for (const row of await page.locator('#cw-tbody tr').all()) {
+      assert.ok((await row.boundingBox()).height < 190);
+      assert.equal(await row.locator('.cw-action-buttons>button:visible').count(),1);
+    }
+    await page.locator('.cw-editor-tools-toggle').click();
+    const options = page.getByRole('dialog',{name:'Editor options'});
+    await options.getByLabel('Rows per page').selectOption('50');
+    assert.equal(await page.locator('#cw-page-size').inputValue(),'50');
+    await options.getByRole('button',{name:'Advanced view',exact:true}).click();
+    await page.waitForFunction(()=>!document.querySelector('#page-editor').classList.contains('cw-editor-simple'));
+    for (const id of ['cw-columns-btn','cw-advanced-toggle','cw-saved-mappings','cw-add']) assert.equal(await page.locator(`#${id}`).isVisible(),false);
+    await page.locator('.cw-editor-tools-toggle').click();
+    for (const name of ['Simple view','Columns','Saved mappings','Add row']) assert.equal(await options.getByRole('button',{name,exact:true}).isVisible(),true);
+    await screenshot(page,`${theme}-editor-options`);
+    await page.goBack();
+    await options.waitFor({state:'hidden'});
+    await page.locator('.cw-editor-tools-toggle').click();
+    await options.getByRole('button',{name:'Columns',exact:true}).click();
+    await page.locator('.cw-columns-pop').waitFor();
+    await page.locator('.cw-columns-pop').getByRole('button',{name:'Close',exact:true}).click();
+    await page.locator('.cw-columns-pop').waitFor({state:'hidden'});
+    assert.equal(await page.locator('.cw-editor-tools-toggle').evaluate(node=>node===document.activeElement),true);
+    const row = page.locator('#cw-tbody tr').first();
+    await row.locator('.cw-mobile-fields-toggle').click();
+    await row.locator('.cw-mobile-title-input').fill('Updated movie');
+    await row.locator('.cw-mobile-fields-toggle').click();
+    assert.equal(await row.locator('.cw-mobile-row-title').textContent(),'Updated movie');
+    assert.equal(await page.locator('#cw-save').isVisible(),true);
+    await page.evaluate(() => document.documentElement.style.setProperty('--cw-bottom-nav-height','64px'));
+    assert.equal(await page.locator('#cw-change-bar').evaluate(node=>getComputedStyle(node).bottom),'76px');
+    await noOverflow(page);
+    await screenshot(page,`${theme}-editor-history-compact`);
+    await page.locator('.cw-editor-tools-toggle').click();
+    await options.getByRole('button',{name:'Add row',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelectorAll('#cw-tbody tr').length===3);
+    assert.equal(await page.locator('#cw-tbody tr.cw-mobile-fields-open').count(),1);
+    await page.locator('#cw-tbody tr.cw-mobile-fields-open .cw-mobile-title-input').fill('New title');
+    await page.setViewportSize({width:1440,height:900});
+    assert.equal(await page.locator('.cw-editor-tools-toggle').isVisible(),false);
+    assert.equal(await page.locator('#cw-advanced-toggle').isVisible(),true);
+    assert.equal(await page.locator('#cw-add').isVisible(),true);
+  });
+
   test(`${theme}: review narrow Tracker titles and attention rows`, async t => {
     const {page} = await fixture(t, "tracker", theme, 320, {items:reviewItems});
     const rows = page.locator(".trk-list tbody tr");
@@ -314,8 +389,9 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           for(const id of ['#ev-more','#ev-refresh']) assert.ok((await page.locator(id).boundingBox()).height>=44,id);
           await page.locator('#ev-more').tap();
           assert.equal(await page.locator('#ev-morefilters').isVisible(),true);
+          await page.locator('#ev-morefilters').evaluate(el=>Promise.all(el.getAnimations().map(animation=>animation.finished)));
           const sheet=await page.locator('#ev-morefilters').boundingBox();
-          assert.ok(Math.abs(sheet.y+sheet.height-height)<=1&&sheet.width>=width-1);
+          assert.ok(Math.abs(sheet.y+sheet.height-height)<=1&&sheet.width>=width-1, JSON.stringify(sheet));
           assert.equal(await page.locator('#ev-cat').isVisible(),false);
           assert.equal(await page.locator('#ev-mode').isVisible(),true);
           await noOverflow(page);
@@ -327,7 +403,8 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           assert.equal(await page.locator('.ev-toolbar').isVisible(),false);
           await noOverflow(page);
           await screenshot(page,`${theme}-${kind}-${width}-detail`);
-          await page.locator('#ev-detail-back').tap();
+          await page.goBack();
+          await page.locator('.ev-col-list').waitFor();
           assert.equal(await page.locator('.ev-col-list').isVisible(),true);
           state.eventTotal=1000;
           await page.locator('#ev-refresh').tap();
@@ -343,7 +420,7 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           await page.locator('#an-mobile-filters').tap();
           assert.equal(await page.locator('#an-feature').isVisible(),true);
           await page.locator('#an-feature').selectOption('history');
-          await page.locator('#an-mobile-filters').tap();
+          await page.locator('.cw-page-panel-sheet').getByRole('button',{name:'Done',exact:true}).tap();
           assert.equal(await page.locator('#an-feature').inputValue(),'history');
           assert.equal(await page.locator('#an-mobile-view').isVisible(),true);
           assert.equal(await page.locator('#an-detail').isVisible(),false);
@@ -360,7 +437,8 @@ for(const theme of ["original","flat-dark","flat-light"]) {
           assert.equal(await page.locator('#an-close-detail').isVisible(),true);
           await noOverflow(page);
           await screenshot(page,`${theme}-${kind}-${width}-detail`);
-          await page.locator('#an-close-detail').tap();
+          await page.goBack();
+          await page.locator('.an-list-column').waitFor();
           assert.equal(await page.locator('.an-list-column').isVisible(),true);
           assert.ok(Math.abs(await page.evaluate(()=>scrollY)-scroll)<3);
           assert.equal(await page.evaluate(()=>document.activeElement?.dataset.row),'1');

@@ -12,6 +12,7 @@ import pytest
 
 from api import profileAPI
 from services import shelf_store
+from tests.i18n_source import english_source
 
 ROOT = Path(__file__).resolve().parents[1]
 ADMIN = shelf_store.ADMIN_OWNER
@@ -179,7 +180,7 @@ def test_collection_shelf_filters() -> None:
     assert titles("not_on_server") == ["Disc Only", "Tracker Only"]
     assert titles("not_on_shelf") == ["Server Only"]
     assert titles("not_on_shelf", shelf_filter="lent") == ["Server Only"]
-    assert titles("unwatched", watched=lambda media, tmdb: tmdb == "3") == ["Disc Only", "Ripped"]
+    assert titles("unwatched", watched=lambda media, tmdb, imdb="": tmdb == "3") == ["Disc Only", "Ripped"]
     ripped = next(item for item in profileAPI.build_profile_collection_payload(state, {}, shelf="shelf")["items"] if item["title"] == "Ripped")
     assert ripped["shelf"]["on_server"] is True
     assert "on_server" not in shelf_store.summaries(ADMIN)["movie:1"]
@@ -310,13 +311,13 @@ def test_errors_only_return_known_messages() -> None:
 
 
 def test_shelf_ui_is_wired() -> None:
-    html = (ROOT / "ui_frontend.py").read_text("utf-8")
+    html = english_source((ROOT / "ui_frontend.py").read_text("utf-8"))
     assert 'id="profile-collection-shelf"' in html and 'data-collection-display="shelf"' in html and 'id="profile-collection-shelfstats"' in html
     assert 'data-collection-display="case"' not in html
-    modal = (ROOT / "assets/js/profile-media-modal.js").read_text("utf-8")
+    modal = english_source((ROOT / "assets/js/profile-media-modal.js").read_text("utf-8"))
     assert 'lazyScript("shelf-editor.js", "ShelfEditor")' in modal and "collectionSection()" in modal
-    meta = (ROOT / "assets/helpers/media-meta.js").read_text("utf-8")
+    meta = english_source((ROOT / "assets/helpers/media-meta.js").read_text("utf-8"))
     assert "pill: shelfPill" in meta and "shelfBand" not in meta
-    tracker = (ROOT / "assets/js/tracker.js").read_text("utf-8")
+    tracker = english_source((ROOT / "assets/js/tracker.js").read_text("utf-8"))
     assert "Add to collection" in tracker and 'data-trk-media="${name}"' not in tracker and "[data-trk-mi=\"format\"]" in tracker
-    assert "CW ||= {}).ShelfEditor" in (ROOT / "assets/js/shelf-editor.js").read_text("utf-8")
+    assert "CW ||= {}).ShelfEditor" in english_source((ROOT / "assets/js/shelf-editor.js").read_text("utf-8"))

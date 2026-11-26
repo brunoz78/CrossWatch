@@ -6,6 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {readFileSync} from "node:fs";
 import vm from "node:vm";
+import './i18n-vm-setup.mjs';
 
 const editor = readFileSync(new URL("../assets/js/editor.js",import.meta.url),"utf8");
 const table = readFileSync(new URL("../assets/js/editor/table-controller.js",import.meta.url),"utf8");
@@ -46,5 +47,5 @@ test("Editor handoff never selects matching keys from a substituted profile",asy
   const {sandbox,state,messages}=fixture({fallback:true});
   await sandbox.openRecoveredHistory();
   assert.equal(state.selected.size,0);
-  assert.match(messages.at(-1),/profile is unavailable/);
+  assert.match(messages.at(-1),/tracker instance is unavailable/);
 });

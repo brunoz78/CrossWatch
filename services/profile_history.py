@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, tzinfo
 from typing import Any, Callable, Mapping
 
@@ -137,6 +139,7 @@ def _scrobble_rows(user_filter: Mapping[str, Any] | None) -> list[dict[str, Any]
         if not isinstance(item, Mapping) or str(item.get("kind") or "").strip().lower() not in _SCROBBLE_KINDS:
             continue
         row = dw._activity_row(item)
+        row["key"] = f"scrobble:{row['id']}"
         if dw._sources_match_user(row.get("sources"), user_filter):
             rows.append(row)
     return rows
@@ -451,10 +454,22 @@ def build_history_payload(
 
 
 _LOOKUP_KEY = "_tmdb_lookup"
+_RATING_LOOKUP_KEY = "_rating_lookup"
+_IMDB_MEDIA_KEY = "_imdb_media"
+_IMDB_STATE_KEY = "_imdb_resolve"
+_IMDB_RETRY_SECONDS = 600.0
+_RESOLVE_LOCK = threading.Lock()
+_LOOKUP_LOCK = threading.Lock()
+_RESOLVER = ThreadPoolExecutor(max_workers=2, thread_name_prefix="imdb-resolve")
 
 
 def _tmdb_tokens(*values: Any) -> set[str]:
     return {str(value).strip() for value in values if value not in (None, "", 0) and str(value).strip()}
+
+
+def _imdb_token(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text.startswith("tt") and text[2:].isdecimal() else ""
 
 
 def _row_tmdb_keys(row: Mapping[str, Any]) -> set[str]:
@@ -464,28 +479,145 @@ def _row_tmdb_keys(row: Mapping[str, Any]) -> set[str]:
     show_ids: Mapping[str, Any] = raw_show if isinstance(raw_show, Mapping) else {}
     typ = row.get("_type")
     if typ == "movie":
-        return {f"movie:{token}" for token in _tmdb_tokens(ids.get("tmdb"), row.get("tmdb"))}
-    if typ in {"show", "anime"}:
-        return {f"show:{token}" for token in _tmdb_tokens(ids.get("tmdb"), row.get("tmdb"), ids.get("tmdb_show"))}
-    if typ in {"season", "episode"}:
-        return {f"show:{token}" for token in _tmdb_tokens(show_ids.get("tmdb"), ids.get("tmdb_show"), row.get("tmdb"))}
-    return set()
+        prefix, tokens, imdb = "movie", _tmdb_tokens(ids.get("tmdb"), row.get("tmdb")), ids.get("imdb")
+    elif typ in {"show", "anime"}:
+        prefix, tokens, imdb = "show", _tmdb_tokens(ids.get("tmdb"), row.get("tmdb"), ids.get("tmdb_show")), ids.get("imdb")
+    elif typ in {"season", "episode"}:
+        prefix, tokens, imdb = "show", _tmdb_tokens(show_ids.get("tmdb"), ids.get("tmdb_show"), row.get("tmdb")), show_ids.get("imdb")
+    else:
+        return set()
+    if tokens:
+        return {f"{prefix}:{token}" for token in tokens}
+    imdb = _imdb_token(imdb)
+    return {f"{prefix}:imdb:{imdb}"} if imdb else set()
 
 
-def rows_for_tmdb(index: dict[str, Any], media: str, tmdb: Any) -> list[dict[str, Any]]:
-    lookup = index.get(_LOOKUP_KEY)
-    if not isinstance(lookup, dict):
-        lookup = {}
+def _tmdb_lookup(index: dict[str, Any]) -> dict[str, Any]:
+    cached = index.get(_LOOKUP_KEY)
+    if isinstance(cached, dict):
+        return cached
+    with _LOOKUP_LOCK:
+        cached = index.get(_LOOKUP_KEY)
+        if isinstance(cached, dict):
+            return cached
+        lookup: dict[str, Any] = {}
         for row in index.get("rows") or []:
             for key in _row_tmdb_keys(row):
                 lookup.setdefault(key, []).append(row)
+        lookup[_IMDB_MEDIA_KEY] = {key.split(":", 1)[0] for key in lookup if ":imdb:" in key}
         index[_LOOKUP_KEY] = lookup
+    return lookup
+
+
+def _pending_imdb(lookup: dict[str, Any], done: set[str], media: str | None) -> list[str]:
+    prefix = f"{media}:imdb:" if media else ""
+    return sorted(key for key in list(lookup) if ":imdb:" in key and key.startswith(prefix) and key not in done)
+
+
+def imdb_resolving(index: dict[str, Any], media: str) -> bool:
+    lookup = _tmdb_lookup(index)
     wanted = "movie" if str(media or "").strip().lower() == "movie" else "show"
-    return list(lookup.get(f"{wanted}:{str(tmdb or '').strip()}") or [])
+    state = lookup.get(_IMDB_STATE_KEY)
+    if wanted not in lookup[_IMDB_MEDIA_KEY] or not state or state["future"] is None or state["future"].done():
+        return False
+    return bool(_pending_imdb(lookup, state["done"], wanted))
 
 
-def title_presence(index: dict[str, Any], media: str, tmdb: Any) -> dict[str, Any] | None:
-    rows = rows_for_tmdb(index, media, tmdb)
+def has_imdb_only_rows(index: dict[str, Any], media: str) -> bool:
+    wanted = "movie" if str(media or "").strip().lower() == "movie" else "show"
+    return wanted in _tmdb_lookup(index)[_IMDB_MEDIA_KEY]
+
+
+def _resolve_pending(lookup: dict[str, Any], state: dict[str, Any], pending: list[str], resolve: Callable[[str, str], Any]) -> None:
+    def attempt(key: str) -> tuple[bool, Any]:
+        media, _, imdb = key.split(":", 2)
+        try:
+            return True, resolve(media, imdb)
+        except Exception:
+            return False, None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(attempt, pending))
+    with _RESOLVE_LOCK:
+        for key, (ok, tmdb) in zip(pending, results):
+            if not ok:
+                state["retry_at"] = time.time() + _IMDB_RETRY_SECONDS
+                continue
+            state["done"].add(key)
+            token = str(tmdb or "").strip()
+            if token:
+                lookup.setdefault(f"{key.split(':', 1)[0]}:{token}", []).extend(lookup[key])
+
+
+def resolve_imdb_rows(index: dict[str, Any], resolve: Callable[[str, str], Any], *, media: str | None = None, wait: float = 2.0) -> None:
+    lookup = _tmdb_lookup(index)
+    if not lookup[_IMDB_MEDIA_KEY]:
+        return
+    with _RESOLVE_LOCK:
+        state = lookup.setdefault(_IMDB_STATE_KEY, {"done": set(), "future": None, "retry_at": 0.0})
+        future = state["future"]
+        if future is None or future.done():
+            pending = _pending_imdb(lookup, state["done"], media)
+            if not pending or time.time() < state["retry_at"]:
+                return
+            future = state["future"] = _RESOLVER.submit(_resolve_pending, lookup, state, pending, resolve)
+    try:
+        future.result(timeout=wait)
+    except Exception:
+        return
+
+
+def rows_for_tmdb(index: dict[str, Any], media: str, tmdb: Any, imdb: Any = "") -> list[dict[str, Any]]:
+    lookup = _tmdb_lookup(index)
+    wanted = "movie" if str(media or "").strip().lower() == "movie" else "show"
+    rows = list(lookup.get(f"{wanted}:{str(tmdb or '').strip()}") or [])
+    imdb = _imdb_token(imdb)
+    if imdb:
+        seen = {id(row) for row in rows}
+        rows.extend(row for row in lookup.get(f"{wanted}:imdb:{imdb}") or [] if id(row) not in seen)
+    return rows
+
+
+def _rating_lookup(index: dict[str, Any]) -> dict[str, Any]:
+    lookup = index.get(_RATING_LOOKUP_KEY)
+    if not isinstance(lookup, dict):
+        lookup = {}
+        for row in index.get("rows") or []:
+            if row.get("rating") is None:
+                continue
+            for alias in dw._rating_aliases(row):
+                lookup.setdefault(alias, row["rating"])
+        index[_RATING_LOOKUP_KEY] = lookup
+    return lookup
+
+
+def _show_rating_row(item: Mapping[str, Any]) -> dict[str, Any]:
+    raw_ids = item.get("ids")
+    ids: Mapping[str, Any] = raw_ids if isinstance(raw_ids, Mapping) else {}
+    raw_show = ids.get("show_ids")
+    show_ids: Mapping[str, Any] = raw_show if isinstance(raw_show, Mapping) else {}
+    return {"type": "show", "title": item.get("title"), "ids": dict(show_ids)}
+
+
+def attach_user_ratings(items: Any, ratings_index: dict[str, Any]) -> None:
+    lookup = _rating_lookup(ratings_index)
+    if not lookup:
+        return
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        candidates = [item]
+        if str(item.get("type") or "").lower() in {"episode", "season"}:
+            candidates.append(_show_rating_row(item))
+        for row in candidates:
+            found = next((lookup[alias] for alias in dw._rating_aliases(row) if alias in lookup), None)
+            if found is not None:
+                item["user_rating"] = found
+                break
+
+
+def title_presence(index: dict[str, Any], media: str, tmdb: Any, imdb: Any = "") -> dict[str, Any] | None:
+    rows = rows_for_tmdb(index, media, tmdb, imdb)
     if not rows:
         return None
     source = normalize_source(index.get("source"))
@@ -540,10 +672,10 @@ def title_presence(index: dict[str, Any], media: str, tmdb: Any) -> dict[str, An
     return out
 
 
-def title_watch_history(indices: list[dict[str, Any]], media: str, tmdb: Any) -> list[dict[str, Any]]:
+def title_watch_history(indices: list[dict[str, Any]], media: str, tmdb: Any, imdb: Any = "") -> list[dict[str, Any]]:
     watches: dict[tuple[int | None, int | None], list[int]] = {}
     for index in indices:
-        for row in rows_for_tmdb(index, media, tmdb):
+        for row in rows_for_tmdb(index, media, tmdb, imdb):
             season = dw._as_int(row.get("season")) if media != "movie" else None
             episode = dw._as_int(row.get("episode")) if media != "movie" else None
             if media != "movie" and (season is None or episode is None):
@@ -570,18 +702,25 @@ def _undated_watch(item: Mapping[str, Any]) -> bool:
     return item.get("_cw_watched_state") is True or item.get("_wetrakr_watched_at_unknown") is True
 
 
-def title_plays(state: Any, tracker_items: Any, user_filter: Mapping[str, Any] | None, tmdb: Any) -> list[dict[str, Any]]:
-    return title_play_summary(state, tracker_items, user_filter, tmdb)["plays"]
+def title_plays(state: Any, tracker_items: Any, user_filter: Mapping[str, Any] | None, tmdb: Any, imdb: Any = "") -> list[dict[str, Any]]:
+    return title_play_summary(state, tracker_items, user_filter, tmdb, imdb)["plays"]
 
 
-def _title_watches(state: Any, tracker_items: Any, user_filter: Mapping[str, Any] | None, tmdb: Any) -> list[tuple[int, tuple[str, str], str, dict[str, Any]]]:
+def _title_watches(state: Any, tracker_items: Any, user_filter: Mapping[str, Any] | None, tmdb: Any, imdb: Any = "") -> list[tuple[int, tuple[str, str], str, dict[str, Any]]]:
     wanted = str(tmdb or "").strip()
+    wanted_imdb = _imdb_token(imdb)
     found: dict[tuple[Any, ...], tuple[int, tuple[str, str], str, dict[str, Any]]] = {}
     if not wanted:
         return []
 
+    def matches(item: dict[str, Any]) -> bool:
+        own = str(dw._tmdb_id(item) or "").strip()
+        if own:
+            return own == wanted
+        return bool(wanted_imdb) and _imdb_token(dw._ids(item).get("imdb")) == wanted_imdb
+
     def add(raw_key: Any, item: dict[str, Any], sources: list[dict[str, str]]) -> None:
-        if dw._media_type(item) != "movie" or str(dw._tmdb_id(item) or "").strip() != wanted:
+        if dw._media_type(item) != "movie" or not matches(item):
             return
         if str(item.get("_stremio_watched_at_fallback") or "").strip():
             return
@@ -609,8 +748,8 @@ def _title_watches(state: Any, tracker_items: Any, user_filter: Mapping[str, Any
     return list(found.values())
 
 
-def title_play_summary(state: Any, tracker_items: Any, user_filter: Mapping[str, Any] | None, tmdb: Any) -> dict[str, Any]:
-    found = _title_watches(state, tracker_items, user_filter, tmdb)
+def title_play_summary(state: Any, tracker_items: Any, user_filter: Mapping[str, Any] | None, tmdb: Any, imdb: Any = "") -> dict[str, Any]:
+    found = _title_watches(state, tracker_items, user_filter, tmdb, imdb)
     holders: dict[tuple[str, str], dict[str, Any]] = {}
     for epoch, endpoint, _raw_key, _item in found:
         holder = holders.setdefault(endpoint, {**_ref(endpoint), "watches": 0, "dated": 0, "undated": 0})
@@ -639,7 +778,7 @@ def title_play_summary(state: Any, tracker_items: Any, user_filter: Mapping[str,
 
 
 SELECTION_MAX = 1000
-_SELECTION_FIELDS = ("type", "title", "year", "season", "episode", "ids")
+_SELECTION_FIELDS = ("id", "type", "title", "year", "season", "episode", "ids")
 
 
 def selection_entry(row: Mapping[str, Any]) -> dict[str, Any]:

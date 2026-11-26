@@ -304,6 +304,23 @@ def _number(value: Any) -> Any:
     return value if isinstance(value, (int, float, str)) and not isinstance(value, bool) else None
 
 
+def _current_progress_clause(alias: str = "items") -> str:
+    newer = (
+        f"h.scope={alias}.scope AND h.feature='history' AND h.kind={alias}.kind "
+        f"AND julianday(h.when_at) >= coalesce(julianday(json_extract({alias}.data, '$.progress_at')), 0)"
+    )
+    base = f"CASE WHEN instr({alias}.item_key, '@') > 0 THEN substr({alias}.item_key, 1, instr({alias}.item_key, '@') - 1) ELSE {alias}.item_key END"
+    movie_matches = [(f"h.{ident}={alias}.{ident}", f" INDEXED BY items_{ident}") for ident in ("tmdb", "imdb")]
+    movie_matches.append((f"h.item_key=({base})", ""))
+    movie_matches.append((f"h.item_key >= ({base}) || '@' AND h.item_key < ({base}) || 'A'", ""))
+    movie = " AND ".join(f"NOT EXISTS (SELECT 1 FROM items h{index} WHERE {match} AND {newer})" for match, index in movie_matches)
+    episode = (
+        "NOT EXISTS (SELECT 1 FROM items h INDEXED BY items_show WHERE "
+        f"h.show_key={alias}.show_key AND h.season={alias}.season AND h.episode={alias}.episode AND {newer})"
+    )
+    return f"(coalesce({alias}.kind, '') != 'movie' OR ({movie})) AND (coalesce({alias}.kind, '') != 'episode' OR {episode})"
+
+
 def _columns(key: str, data: Any) -> tuple[Any, ...]:
     item = _map_of(data)
     ids = _map_of(item.get("ids"))
@@ -1330,7 +1347,7 @@ class TrackerStore(TrackerAutomation):
                 out.append((feature, row[1] if row else 0, int(count)))
             return out
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, *, current_progress: bool = False) -> dict[str, int]:
         out = {feature: 0 for feature in FEATURES}
         with self._db() as conn:
             if conn is not None:
@@ -1339,6 +1356,8 @@ class TrackerStore(TrackerAutomation):
                 ).fetchall())):
                     if feature in out:
                         out[str(feature)] = int(count)
+                if current_progress:
+                    out["progress"] = self.query("progress", current_progress=True, limit=1)[0]
         return out
 
     def query(
@@ -1357,8 +1376,11 @@ class TrackerStore(TrackerAutomation):
         tag: str = "",
         duplicates: bool = False,
         shelf: Iterable[str] | None = None,
+        current_progress: bool = False,
     ) -> tuple[int, list[tuple[str, Any]]]:
         where, args = self._filters(feature, text=text, media=media, attention=attention, health=health, duplicates=duplicates)
+        if feature == "progress" and current_progress:
+            where.append(_current_progress_clause())
         note_where, note_args = self._note_filters(status=status, tag=tag)
         where.extend(note_where)
         args.extend(note_args)
@@ -1437,8 +1459,10 @@ class TrackerStore(TrackerAutomation):
         except Exception:
             raise TrackerUnreadable("history", [DB_NAME])
 
-    def months(self, feature: str, *, text: str = "", media: str = "", status: str = "", tag: str = "", duplicates: bool = False) -> list[dict[str, Any]]:
+    def months(self, feature: str, *, text: str = "", media: str = "", status: str = "", tag: str = "", duplicates: bool = False, current_progress: bool = False) -> list[dict[str, Any]]:
         where, args = self._filters(feature, text=text, media=media, duplicates=duplicates)
+        if feature == "progress" and current_progress:
+            where.append(_current_progress_clause())
         note_where, note_args = self._note_filters(status=status, tag=tag)
         where.extend(note_where)
         args.extend(note_args)
@@ -1600,17 +1624,18 @@ class TrackerStore(TrackerAutomation):
                     out[str(key)] = (str(code), parsed if isinstance(parsed, dict) else {}, int(checked_ns))
         return out
 
-    def health_counts(self) -> dict[str, dict[str, int]]:
+    def health_counts(self, *, current_progress: bool = False) -> dict[str, dict[str, int]]:
         out = {feature: {"ok": 0, "attention": 0, "unchecked": 0} for feature in FEATURES}
         marks = ", ".join("?" for _ in ATTENTION_CODES)
+        progress_filter = f" AND (i.feature != 'progress' OR ({_current_progress_clause('i')}))" if current_progress else ""
         with self._db() as conn:
             if conn is None:
                 return out
-            rows = self._cached(conn, "health", (), lambda: tuple(conn.execute(
+            rows = self._cached(conn, "health", (current_progress,), lambda: tuple(conn.execute(
                 "SELECT i.feature, CASE WHEN c.code IS NULL THEN 'unchecked'"
                 f" WHEN c.code IN ({marks}) THEN 'attention' ELSE 'ok' END AS bucket, COUNT(*)"
                 " FROM items i LEFT JOIN checks c ON c.scope=i.scope AND c.feature=i.feature AND c.item_key=i.item_key"
-                " WHERE i.scope='' GROUP BY i.feature, bucket",
+                f" WHERE i.scope='' {progress_filter} GROUP BY i.feature, bucket",
                 ATTENTION_CODES,
             ).fetchall()))
         for feature, bucket, count in rows:
@@ -1618,14 +1643,15 @@ class TrackerStore(TrackerAutomation):
                 out[str(feature)][str(bucket)] = int(count)
         return out
 
-    def attention_counts(self) -> dict[str, int]:
+    def attention_counts(self, *, current_progress: bool = False) -> dict[str, int]:
         out = {feature: 0 for feature in FEATURES}
+        progress_filter = f" AND (i.feature != 'progress' OR ({_current_progress_clause('i')}))" if current_progress else ""
         with self._db() as conn:
             if conn is not None:
-                for feature, count in self._cached(conn, "attention", (), lambda: tuple(conn.execute(
+                for feature, count in self._cached(conn, "attention", (current_progress,), lambda: tuple(conn.execute(
                     "SELECT c.feature, COUNT(*) FROM checks c JOIN items i ON i.scope=c.scope AND i.feature=c.feature"
                     " AND i.item_key=c.item_key WHERE c.scope='' AND c.code IN ("
-                    + ", ".join("?" for _ in ATTENTION_CODES) + ") GROUP BY c.feature",
+                    + ", ".join("?" for _ in ATTENTION_CODES) + f") {progress_filter} GROUP BY c.feature",
                     ATTENTION_CODES,
                 ).fetchall())):
                     if feature in out:
@@ -1852,6 +1878,57 @@ class TrackerStore(TrackerAutomation):
             out.append((feature, key, value))
         return out
 
+    _TITLE_SHOWS = "scope='' AND feature='history' AND kind='episode' AND show_key >= 'title:' AND show_key < 'title;'"
+
+    def has_title_shows(self) -> bool:
+        with self._db() as conn:
+            if conn is None:
+                return False
+            try:
+                return conn.execute(f"SELECT 1 FROM items WHERE {self._TITLE_SHOWS} LIMIT 1").fetchone() is not None
+            except sqlite3.Error as exc:
+                raise TrackerUnreadable("history", [DB_NAME]) from exc
+
+    def title_show_rows(self, imdb: str) -> list[tuple[str, str, Any]]:
+        with self._db() as conn:
+            if conn is None:
+                return []
+            try:
+                rows = conn.execute(
+                    f"SELECT feature, item_key, data FROM items WHERE {self._TITLE_SHOWS} AND json_extract(data, '$.show_ids.imdb')=?", (imdb,),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise TrackerUnreadable("history", [DB_NAME]) from exc
+        out = []
+        for feature, key, data in rows:
+            value = _safe_loads(data)
+            if isinstance(value, Mapping):
+                out.append((str(feature), str(key), value))
+        return out
+
+    def title_show_imdbs(self, show_keys: Iterable[str] | None = None) -> dict[str, set[str]]:
+        found: dict[str, set[str]] = {}
+        with self._db() as conn:
+            if conn is None:
+                return found
+            try:
+                if show_keys is None:
+                    for key, imdb in conn.execute(f"SELECT DISTINCT show_key, json_extract(data, '$.show_ids.imdb') FROM items WHERE {self._TITLE_SHOWS}"):
+                        found.setdefault(key, set()).add(str(imdb or ""))
+                    return found
+                keys = [key for key in dict.fromkeys(show_keys) if key.startswith("title:")]
+                for offset in range(0, len(keys), 200):
+                    batch = keys[offset:offset + 200]
+                    marks = ",".join("?" for _ in batch)
+                    rows = conn.execute(
+                        f"SELECT DISTINCT show_key, json_extract(data, '$.show_ids.imdb') FROM items WHERE {self._TITLE_SHOWS} AND show_key IN ({marks})", batch,
+                    )
+                    for key, imdb in rows:
+                        found.setdefault(key, set()).add(str(imdb or ""))
+            except sqlite3.Error as exc:
+                raise TrackerUnreadable("history", [DB_NAME]) from exc
+        return found
+
     def watched_episodes(self, show_keys: Iterable[str]) -> dict[str, set[tuple[int, int]]]:
         keys = list(dict.fromkeys(show_keys))
         found: dict[str, set[tuple[int, int]]] = {}
@@ -1878,8 +1955,12 @@ class TrackerStore(TrackerAutomation):
                 return set()
             return {str(k) for (k,) in conn.execute("SELECT title_key FROM notes WHERE status=?", (status,)).fetchall()}
 
-    def show_summaries(self, *, text: str = "", offset: int = 0, limit: int = 50, exclude: Iterable[str] = (), status: str = "", tag: str = "") -> tuple[int, list[dict[str, Any]]]:
+    def show_summaries(
+        self, *, text: str = "", offset: int = 0, limit: int = 50, exclude: Iterable[str] = (), status: str = "", tag: str = "",
+        aliases: Mapping[str, str] | None = None,
+    ) -> tuple[int, list[dict[str, Any]]]:
         skip = {str(k) for k in exclude}
+        merge = tuple(sorted((str(k), str(v)) for k, v in (aliases or {}).items() if k != v))
         needle = text.strip().lower()
         clause = "scope='' AND feature='history' AND show_key IS NOT NULL AND kind='episode'"
         search = []
@@ -1916,10 +1997,17 @@ class TrackerStore(TrackerAutomation):
                         row[1] += 1
                         if when > row[2]:
                             row[2:5] = [when, season, episode]
+                    for alias, target in merge:
+                        if alias in shows and target in shows:
+                            source, kept = shows.pop(alias), shows[target]
+                            kept[0] |= source[0]
+                            kept[1] += source[1]
+                            if source[2] > kept[2]:
+                                kept[2:5] = source[2:5]
                     ordered = sorted(shows.items(), key=lambda kv: (kv[1][2], kv[0]), reverse=True)
                     return tuple((k, len(v[0]), v[1], v[2], v[3], v[4]) for k, v in ordered)
 
-                summary = self._cached(conn, "shows", (needle,), compute)
+                summary = self._cached(conn, "shows", (needle, merge), compute)
                 note_where, note_args = self._note_filters(status=status, tag=tag, key="'show:' || show_key")
                 if note_where:
                     matched = {str(key) for (key,) in conn.execute(
@@ -1936,10 +2024,12 @@ class TrackerStore(TrackerAutomation):
                     ).fetchone()
                     data = _safe_loads(head[0]) if head else None
                     data = data if isinstance(data, Mapping) else {}
+                    show_ids = data.get("show_ids")
                     out.append({
                         "key": str(show_key), "title": data.get("series_title"), "year": data.get("series_year"),
                         "episodes": int(episodes), "plays": int(plays), "last_watched": last or None,
                         "last_season": season, "last_episode": episode,
+                        "show_ids": dict(show_ids) if isinstance(show_ids, Mapping) else {},
                     })
                 return len(summary), out
             except sqlite3.Error as exc:
@@ -2380,9 +2470,19 @@ class TrackerStore(TrackerAutomation):
             "snapshots": [],
             "counts": {"state_files": 0, "snapshots": 0},
         }
-        with self._db() as conn:
-            if conn is None:
-                return out
+        if not self.db_path.is_file():
+            files, snaps = self._legacy_files()
+            for kind, paths in (("state_files", files), ("snapshots", sorted(snaps.rglob("*.json")) if snaps else [])):
+                for path in paths:
+                    if path.is_file():
+                        stat = path.stat()
+                        out[kind].append({"name": path.name, "size": stat.st_size, "mtime": _iso(stat.st_mtime_ns)})
+            out["counts"] = {
+                "state_files": sum(path.name in {f"{feature}.json" for feature in FEATURES} for path in files),
+                "snapshots": len(out["snapshots"]),
+            }
+            return out
+        with closing(sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             state_files = [
                 {"name": _file_name(str(scope), str(feature)), "size": int(size or 0), "mtime": _iso(int(updated))}
                 for scope, feature, updated, size in conn.execute(

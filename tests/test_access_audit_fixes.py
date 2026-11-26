@@ -5,6 +5,7 @@ from typing import Any, cast
 
 import pytest
 from starlette.requests import Request
+from tests.i18n_source import english_source
 
 MANAGED_PROFILE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 OWNED_UID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -339,7 +340,7 @@ def test_details_debug_tab_requires_runtime_debug() -> None:
     import ui_frontend
 
     html = ui_frontend.get_index_html(include_admin=True)
-    details_js = Path("assets/helpers/details-log.js").read_text("utf-8")
+    details_js = english_source(Path("assets/helpers/details-log.js").read_text("utf-8"))
 
     assert 'id="det-tab-debug" class="det-tab" type="button"\n                role="tab" aria-selected="false" aria-controls="det-panel-debug" data-tab="debug" hidden disabled aria-hidden="true" aria-disabled="true"' in html
     assert 'id="det-panel-debug" class="det-panel hidden" role="tabpanel" aria-labelledby="det-tab-debug" hidden aria-hidden="true"' in html
@@ -655,7 +656,7 @@ def test_run_unresolved_allowed_for_write_and_scoped_to_owned_runs(monkeypatch) 
 def test_captures_scheduler_queue_is_hidden_from_managed_users() -> None:
     import pathlib
 
-    src = pathlib.Path("assets/js/snapshots.js").read_text(encoding="utf-8")
+    src = english_source(pathlib.Path("assets/js/snapshots.js").read_text(encoding="utf-8"))
     assert 'const schedulerAvailable = () => !isManagedUser();' in src
     assert "if (schedulerAvailable()) addScheduleBtn?.addEventListener" in src
     assert 'wrap.classList.toggle("hidden", !schedulerAvailable() || !items.length)' in src
@@ -664,7 +665,7 @@ def test_captures_scheduler_queue_is_hidden_from_managed_users() -> None:
 def test_playback_ui_splits_write_actions_from_admin_settings() -> None:
     import pathlib
 
-    src = pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8")
+    src = english_source(pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8"))
     assert 'const canAct = () => !viewingAs() && (!isManaged() || doc?.dataset?.cwPermWrite === "on");' in src
     assert "const canConfigure = () => !isManaged();" in src
     assert 'q("settings")?.toggleAttribute("hidden", !canConfigure());' in src
@@ -673,7 +674,7 @@ def test_playback_ui_splits_write_actions_from_admin_settings() -> None:
 def test_insights_snapshot_picker_is_admin_only() -> None:
     import pathlib
 
-    src = pathlib.Path("assets/js/insights.js").read_text(encoding="utf-8")
+    src = english_source(pathlib.Path("assets/js/insights.js").read_text(encoding="utf-8"))
     idx = src.find("openCrosswatchSnapshotPicker(_feature)")
     assert idx > 0
     assert 'cwRole === "user") return;' in src[max(0, idx - 400):idx]
@@ -760,10 +761,10 @@ def test_editor_state_response_carries_instance_sharing() -> None:
 def test_editor_ui_renders_the_shared_instance_note() -> None:
     import pathlib
 
-    shell = pathlib.Path("assets/js/editor.js").read_text(encoding="utf-8")
+    shell = english_source(pathlib.Path("assets/js/editor.js").read_text(encoding="utf-8"))
     assert 'id="cw-instance-shared"' in shell
 
-    ctrl = pathlib.Path("assets/js/editor/load-controller.js").read_text(encoding="utf-8")
+    ctrl = english_source(pathlib.Path("assets/js/editor/load-controller.js").read_text(encoding="utf-8"))
     assert "function renderInstanceSharingNote(sharing)" in ctrl
     assert "renderInstanceSharingNote(data && data.instance_sharing);" in ctrl
     assert "apply to every user of this instance" in ctrl
@@ -780,7 +781,7 @@ def test_events_clear_is_hidden_from_managed_users() -> None:
     assert 'if _managed_request(request):' in pathlib.Path("api/eventsAPI.py").read_text(encoding="utf-8")
     assert eventsAPI.events_clear.__module__ == "api.eventsAPI"
 
-    modal = pathlib.Path("assets/js/events/index.js").read_text(encoding="utf-8")
+    modal = english_source(pathlib.Path("assets/js/events/index.js").read_text(encoding="utf-8"))
     assert '${isAdmin ? `<button class="ev-tbtn" id="ev-clear"' in modal
     assert 'Q("#ev-clear", root)?.addEventListener' in modal
     assert 'showToast("Clear failed.", null, "error")' in modal
@@ -789,7 +790,7 @@ def test_events_clear_is_hidden_from_managed_users() -> None:
 def test_editor_profile_picker_does_not_invent_a_default_profile() -> None:
     import pathlib
 
-    editor = pathlib.Path("assets/js/editor.js").read_text(encoding="utf-8")
+    editor = english_source(pathlib.Path("assets/js/editor.js").read_text(encoding="utf-8"))
     assert 'norm.unshift({ id: "default", label: "Default" })' not in editor
     assert 'if (!norm.length) norm.push({ id: "default", label: "Default" });' in editor
     assert 'next = ids.includes("default") ? "default" : ids[0];' in editor
@@ -801,13 +802,13 @@ def test_user_shapes_expose_created_at_and_preferences() -> None:
 
     managed = _public_user("a" * 32, {"username": "Pascal", "created_at": 1770000000, "preferences": {"quick_add": False}})
     assert managed["created_at"] == 1770000000
-    assert managed["preferences"] == {"playing_card": True, "quick_add": False, "timezone": "auto", "time_format": "auto"}
+    assert managed["preferences"] == {"playing_card": True, "quick_add": False, "timezone": "auto", "time_format": "auto", "language": "en"}
 
     admin = _admin_identity({"username": "admin", "created_at": 1760000000})
     assert admin["created_at"] == 1760000000
-    assert admin["preferences"] == {"playing_card": True, "quick_add": True, "timezone": "auto", "time_format": "auto"}
+    assert admin["preferences"] == {"playing_card": True, "quick_add": True, "timezone": "auto", "time_format": "auto", "language": "en"}
 
-    assert clean_user_preferences(None) == {"playing_card": True, "quick_add": True, "timezone": "auto", "time_format": "auto"}
+    assert clean_user_preferences(None) == {"playing_card": True, "quick_add": True, "timezone": "auto", "time_format": "auto", "language": "en"}
 
 
 def test_managed_user_creation_stamps_created_at() -> None:
@@ -847,7 +848,7 @@ def test_settings_oidc_security_form_uses_two_column_layout() -> None:
 def test_profile_page_hosts_the_main_widget_grid() -> None:
     import ui_frontend
 
-    html = ui_frontend.get_profile_html(
+    html = ui_frontend.get_hub_html(
         {"is_admin": False, "username": "P", "permissions": {"dashboard": True, "watchlist": True, "playback": True, "write": True}}
     )
     main_html = ui_frontend.get_index_html(include_admin=True)
@@ -861,8 +862,8 @@ def test_profile_page_hosts_the_main_widget_grid() -> None:
 def test_profile_widget_layout_is_stored_separately_from_main() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
-    preview_js = pathlib.Path("assets/helpers/watchlist-preview.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8"))
+    preview_js = english_source(pathlib.Path("assets/helpers/watchlist-preview.js").read_text(encoding="utf-8"))
     assert 'const ON_PROFILE_PAGE = !!document.getElementById("profile-hero");' in js
     assert 'ON_PROFILE_PAGE ? "cw.profileWidgets.layout.v3" : "cw.dashboardWidgets.layout.v3"' in js
     assert 'const ALL_WIDGETS = [' in js
@@ -880,7 +881,7 @@ def test_profile_widget_layout_is_stored_separately_from_main() -> None:
 def _profile_html() -> str:
     import ui_frontend
 
-    return ui_frontend.get_profile_html(
+    return ui_frontend.get_hub_html(
         {"is_admin": False, "username": "P", "created_at": 1770000000,
          "permissions": {"dashboard": True, "watchlist": True, "playback": True, "write": True}}
     )
@@ -906,7 +907,7 @@ def test_profile_overview_has_media_sections_and_statistics() -> None:
     assert "Continue watching" in html
     assert "Recently added to watchlist" in html
     assert 'id="profile-activity"' in html
-    assert 'id="profile-quick-stats"' in html
+    assert 'id="profile-hub-summary"' in html
     assert 'class="cw-hub-secondary"' in html
     # the old duplicated blocks are gone, the Main widget grid took over
     assert 'id="profile-history"' not in html
@@ -916,9 +917,10 @@ def test_profile_overview_has_media_sections_and_statistics() -> None:
 
 
 def test_profile_settings_tab_and_panel_exist() -> None:
-    html = _profile_html()
+    import ui_frontend
 
-    assert 'data-profile-tab="account"' in html
+    html = ui_frontend.get_profile_html({"is_admin": True, "username": "admin"})
+    assert 'data-profile-tab="account"' not in html
     assert 'id="profile-panel-account"' in html
     assert 'data-profile-tab="security"' not in html
     assert 'data-profile-tab="preferences"' not in html
@@ -931,7 +933,7 @@ def test_profile_settings_tab_and_panel_exist() -> None:
 def test_profile_js_wires_hero_scrobble_and_preferences() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8"))
     assert "/api/watch/currently_watching" in js
     assert "function renderNowPlaying(payload)" in js
     assert "function renderMemberSince(user)" in js
@@ -957,7 +959,7 @@ def test_profile_css_defines_the_crossover() -> None:
 def test_widgets_are_not_suppressed_on_the_profile_page() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8"))
     body = js[js.index("function isOnMain()"):js.index("function widgetSettings")]
     assert "if (ON_PROFILE_PAGE) return true;" in body
 
@@ -967,7 +969,7 @@ def test_profile_reuses_the_real_activity_feed() -> None:
 
     import pathlib
 
-    js = pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8"))
     assert 'id="recent-activity-block"' in html
     assert 'id="recent-activity"' in html
     assert "/assets/js/activity.js" in html
@@ -979,7 +981,7 @@ def test_profile_reuses_the_real_activity_feed() -> None:
 def test_services_chip_counts_connected_instances_only() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/profile-page.js").read_text(encoding="utf-8"))
     assert "function connectedServices(status)" in js
     assert 'api("/api/status")' in js
     assert "providerCount(" not in js
@@ -989,7 +991,7 @@ def test_services_chip_counts_connected_instances_only() -> None:
 def test_widget_layout_toolbar_offers_reset() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8"))
     body = js[js.index("function updateLayoutToolbar()"):js.index("function ensureLayoutToolbar()")]
     assert "card.prepend(bar)" in body
     assert "if (!ON_PROFILE_PAGE)" not in body
@@ -1001,7 +1003,7 @@ def test_widget_layout_toolbar_offers_reset() -> None:
 def test_widget_layout_controls_are_available_on_main_too() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8"))
     css = pathlib.Path("assets/crosswatch.css").read_text(encoding="utf-8")
     body = js[js.index("function ensureWidgetControls()"):js.index("function syncControlIcons()")]
 
@@ -1015,7 +1017,7 @@ def test_widget_layout_controls_are_available_on_main_too() -> None:
 def test_profile_widget_items_open_the_profile_preview_drawer() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/dashboard-widgets.js").read_text(encoding="utf-8"))
     helper = js[js.index("function openProfileWidgetPreview"):js.index("function historyCard")]
     click = js[js.index('const itemLink = event.target?.closest?.("[data-cw-widget-item]")'):js.index('document.addEventListener("tab-changed", (event) => {')]
 
@@ -1088,7 +1090,7 @@ def test_latest_ratings_age_badges_are_not_hard_clipped() -> None:
 def test_sync_hub_watcher_tooltip_stays_inside_viewport() -> None:
     import pathlib
 
-    js = pathlib.Path("assets/js/schedulerbanner.js").read_text(encoding="utf-8")
+    js = english_source(pathlib.Path("assets/js/schedulerbanner.js").read_text(encoding="utf-8"))
 
     assert ":is(#chip-watch,#chip-hook) .cw-hub-tip" in js
     assert "left:0;right:auto;width:min(360px,calc(100vw - 32px));min-width:0;max-width:calc(100vw - 32px)" in js
@@ -1113,12 +1115,12 @@ def test_settings_interface_limits_read_only_users_to_display_preferences() -> N
 
     for html in (page(is_admin=True, username="a"),
                  page(is_admin=False, username="f", permissions=full)):
-        assert 'data-profile-tab="account"' in html
+        assert 'id="profile-panel-account"' in html
         assert 'id="settings-interface"' in html
         assert 'data-settings-nav="interface"' in html
 
     ro = page(is_admin=False, username="r", permissions=readonly)
-    assert 'data-profile-tab="account"' in ro
+    assert 'id="profile-panel-account"' in ro
     assert 'id="settings-security"' in ro
     assert 'id="settings-interface"' in ro
     assert 'data-settings-nav="interface"' in ro
@@ -1132,8 +1134,8 @@ def test_profile_view_as_is_admin_only() -> None:
     import ui_frontend
 
     full = {"dashboard": True, "watchlist": True, "playback": True, "write": True}
-    admin = ui_frontend.get_profile_html({"is_admin": True, "username": "a"})
-    user = ui_frontend.get_profile_html({"is_admin": False, "username": "u", "permissions": full})
+    admin = ui_frontend.get_hub_html({"is_admin": True, "username": "a"})
+    user = ui_frontend.get_hub_html({"is_admin": False, "username": "u", "permissions": full})
 
     assert 'id="cw-view-as-select"' not in admin
     assert 'id="profile-view-as-banner"' in admin

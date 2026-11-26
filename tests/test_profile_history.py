@@ -127,6 +127,64 @@ def test_synced_history_counts_rewatches_once_per_viewing() -> None:
     assert profile_history.title_presence(index, "movie", 20)["count"] == 1
 
 
+def test_title_presence_matches_imdb_only_rows_by_imdb() -> None:
+    def episode(number: int, show_ids: dict[str, Any]) -> dict[str, Any]:
+        return {"type": "episode", "series_title": "Devil in the Family", "season": 1, "episode": number,
+                "ids": dict(show_ids), "show_ids": show_ids, "watched_at": f"2025-03-12T22:1{number}:00Z"}
+
+    stremio = {f"imdb:tt35309276#s01e0{n}": episode(n, {"imdb": "tt35309276"}) for n in (1, 2, 3)}
+    movie = {"imdb:tt33764258": {"type": "movie", "title": "Odyssey", "ids": {"imdb": "tt33764258"}, "watched_at": "2026-01-01T00:00:00Z"}}
+    state = {"providers": {"STREMIO": _history({**stremio, **movie})}}
+    index = profile_history.build_history_index("synced", state=state, tracker_items={})
+
+    assert profile_history.title_presence(index, "show", 271563) is None
+    show = profile_history.title_presence(index, "show", 271563, "tt35309276")
+    assert show is not None
+    assert [(row["season"], row["episode"]) for row in show["episodes"]] == [(1, 1), (1, 2), (1, 3)]
+    assert show["present"] == [{"provider": "STREMIO", "instance": "default"}]
+    assert len(profile_history.title_watch_history([index], "show", 271563, "tt35309276")) == 3
+    assert (profile_history.title_presence(index, "movie", 1368337, "tt33764258") or {})["count"] == 1
+    assert profile_history.title_presence(index, "movie", 271563, "tt35309276") is None
+    assert profile_history.title_presence(index, "movie", 1368337) is None
+
+    asked: list[tuple[str, str]] = []
+    down = {"on": True}
+
+    def resolve(media: str, imdb: str) -> Any:
+        asked.append((media, imdb))
+        if media == "show" and down["on"]:
+            raise TimeoutError()
+        return {"tt33764258": "1368337", "tt35309276": "271563"}.get(imdb)
+
+    assert not profile_history.imdb_resolving(index, "movie")
+    profile_history.resolve_imdb_rows(index, resolve, media="movie", wait=10)
+    assert asked == [("movie", "tt33764258")]
+    assert not profile_history.imdb_resolving(index, "movie")
+    profile_history.resolve_imdb_rows(index, resolve, wait=10)
+    assert sorted(asked) == [("movie", "tt33764258"), ("show", "tt35309276")]
+    assert not profile_history.imdb_resolving(index, "show")
+    assert (profile_history.title_presence(index, "movie", 1368337) or {})["count"] == 1
+    assert (profile_history.title_presence(index, "movie", 1368337, "tt33764258") or {})["count"] == 1
+    assert len(profile_history.rows_for_tmdb(index, "movie", 1368337, "tt33764258")) == 1
+    assert profile_history.title_presence(index, "show", 271563) is None
+    profile_history.resolve_imdb_rows(index, resolve, wait=10)
+    assert len(asked) == 2
+    down["on"] = False
+    profile_history._tmdb_lookup(index)[profile_history._IMDB_STATE_KEY]["retry_at"] = 0.0
+    profile_history.resolve_imdb_rows(index, resolve, wait=10)
+    assert asked[2:] == [("show", "tt35309276")]
+    gate = __import__("threading").Event()
+    slow = lambda media, imdb: gate.wait(10) and None
+    fresh = profile_history.build_history_index("synced", state=state, tracker_items={})
+    profile_history.resolve_imdb_rows(fresh, slow, wait=0)
+    assert profile_history.imdb_resolving(fresh, "movie")
+    gate.set()
+    profile_history.resolve_imdb_rows(fresh, slow, wait=10)
+    assert not profile_history.imdb_resolving(fresh, "movie")
+    assert len((profile_history.title_presence(index, "show", 271563) or {})["episodes"]) == 3
+    assert len(profile_history.rows_for_tmdb(index, "show", 271563, "tt35309276")) == 3
+
+
 def test_synced_history_keeps_same_title_shows_apart() -> None:
     def episode(show_ids: dict[str, Any], watched_at: str) -> dict[str, Any]:
         return {"type": "episode", "series_title": "Doctor Who", "season": 1, "episode": 1,
@@ -215,6 +273,19 @@ def test_scrobble_history_keeps_route_and_hours(monkeypatch) -> None:
     assert [target["provider"] for target in item["targets"]] == ["TRAKT", "SIMKL"]
     assert "present" not in item
     assert payload["stats"]["hours"] == pytest.approx(2.8)
+
+
+def test_synced_history_shows_the_user_rating_for_movies_and_shows() -> None:
+    show_rating = {"type": "show", "title": "Ted Lasso", "year": 2020, "ids": {"tmdb": 97546}, "rating": 9, "rated_at": "2026-09-01T10:00:00Z"}
+    movie_rating = {"type": "movie", "title": "Turning Point", "year": 2026, "ids": {"tmdb": 10}, "rating": 6, "rated_at": "2026-09-14T10:00:00Z"}
+    state = {"providers": {"TRAKT": _ratings({"tmdb:97546": show_rating, "tmdb:10": movie_rating})}}
+    ratings = profile_history.build_history_index("ratings", state=state, tracker_items={}, user_filter={})
+    payload = profile_history.build_history_payload(_synced_index(), resolve_art=False)
+
+    profile_history.attach_user_ratings(payload["items"], ratings)
+
+    by_title = {item["title"]: item.get("user_rating") for item in payload["items"]}
+    assert by_title == {"Turning Point": 6, "Ted Lasso": 9, "Kusama: Infinity": None}
 
 
 def test_ratings_keep_each_provider_score_and_flag_conflicts() -> None:
@@ -324,9 +395,9 @@ def test_profile_timeline_ui_is_registered() -> None:
     js = (root / "assets/js/profile-page.js").read_text(encoding="utf-8")
     css = (root / "assets/css/profile-page.css").read_text(encoding="utf-8")
     widgets = (root / "assets/js/dashboard-widgets.js").read_text(encoding="utf-8")
-    from ui_frontend import get_profile_html
+    from ui_frontend import get_hub_html
 
-    html = get_profile_html(user={"is_admin": True, "username": "admin"})
+    html = get_hub_html(user={"is_admin": True, "username": "admin"})
 
     assert 'data-profile-tab="history"' in html
     assert 'data-profile-tab="ratings"' in html
@@ -336,16 +407,16 @@ def test_profile_timeline_ui_is_registered() -> None:
     assert 'data-timeline-source="scrobble"' in html
     assert 'id="profile-ratings-scores"' in html
     assert 'value="mismatch"' in html
-    assert 'data-cw-profile-menu-action="ratings"' in html
+    assert 'data-cw-profile-menu-action="account"' in html
     assert "/api/profile/history" in js
     assert "/api/profile/ratings" in js
     assert "historyPanel.wire();" in js
     assert "ratingsPanel.wire();" in js
     assert ".cw-hist-timeline" in css
-    assert ".cw-hist-scores" in css
-    assert "/profile#history/synced" in widgets
-    assert "/profile#history/scrobble" in widgets
-    assert "/profile#ratings" in widgets
+    assert ".cw-hist-scores" in (root / "assets/css/pages.css").read_text(encoding="utf-8")
+    assert "/hub#history/synced" in widgets
+    assert "/hub#history/scrobble" in widgets
+    assert "/hub#ratings" in widgets
 
 
 @pytest.mark.parametrize("provider", ["NUVIO", "MDBLIST", "TRAKT", "PLEX", "SIMKL", "WETRAKR"])

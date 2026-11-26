@@ -184,6 +184,7 @@ def _env_truthy(name: str) -> bool:
 _WEBUI_PATHS = {
     "/",
     "/profile",
+    "/hub",
     "/login",
     "/logout",
     "/favicon.ico",
@@ -419,10 +420,18 @@ def _compute_next_run_from_cfg(scfg: dict[str, Any] | None, now_ts: int | None =
         return int(target.timestamp())
     return now + 3600
 
+
+class _ArtSkippingGZipMiddleware(GZipMiddleware):
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") == "http" and str(scope.get("path") or "").startswith("/art/"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
 # API
 _apply_auth_reset_env_once()
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
+app.add_middleware(_ArtSkippingGZipMiddleware, minimum_size=1000, compresslevel=5)
 
 from api.scrobbleAPI import WebhookAuthError
 
@@ -724,8 +733,8 @@ async def app_auth_gate(request: Request, call_next):
             if not _managed_api_allowed(cfg, user, request, path):
                 if path.startswith("/api/"):
                     return JSONResponse({"ok": False, "error": "Administrator access required"}, status_code=403, headers={"Cache-Control": "no-store"})
-                if path != "/profile":
-                    return RedirectResponse(url="/profile", status_code=302)
+                if path not in {"/profile", "/hub"}:
+                    return RedirectResponse(url="/hub", status_code=302)
                 return PlainTextResponse("Forbidden", status_code=403, headers={"Cache-Control": "no-store"})
         response = await call_next(request)
         _audit_api_action(request, response, user)
@@ -1037,6 +1046,9 @@ def _get_orchestrator() -> Orchestrator:
 # Startup sequence
 @asynccontextmanager
 async def _lifespan(app: Any) -> AsyncIterator[None]:
+    from services.view_cache import CACHES
+    for view_cache in CACHES:
+        view_cache.start()
     app.state.watch_groups = {}
     app.state.watch_manager = None
     _apply_debug_env_from_config()
@@ -1172,9 +1184,27 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
     from services import backup_manager
     backup_manager.start()
     try:
+        from services.notification_push import start as _start_notification_push
+
+        _start_notification_push(load_config)
+    except Exception as e:
+        try:
+            _UIHostLogger("SYNC")(f"notification push startup error: {e}", level="ERROR")
+        except Exception:
+            pass
+    try:
         yield
     finally:
         backup_manager.stop()
+        from services.view_cache import CACHES
+        for view_cache in CACHES:
+            view_cache.stop()
+        try:
+            from services.notification_push import stop as _stop_notification_push
+
+            _stop_notification_push()
+        except Exception:
+            pass
         try:
             from services.tracker_storage_maintenance import stop as _stop_tracker_storage
             from services.tracker_month import stop as _stop_tracker_month
@@ -1224,6 +1254,13 @@ app.router.lifespan_context = _lifespan
 async def cache_headers_for_api(request: Request, call_next):
     resp = await call_next(request)
     path = request.url.path
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and resp.status_code < 400 and not path.endswith("/preview") and path.startswith(("/api/tracker/", "/api/manual/", "/api/profile/shelf", "/api/maintenance/", "/api/backups/restore", "/api/editor", "/api/watchlist/")):
+        from services.view_cache import CACHES
+        for view_cache in CACHES:
+            if path.startswith(("/api/maintenance/", "/api/backups/restore")):
+                view_cache.invalidate(CONFIG_DIR)
+            else:
+                view_cache.mark_stale()
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "same-origin")

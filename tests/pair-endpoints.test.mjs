@@ -8,6 +8,7 @@ import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import { parse } from "acorn";
 import { statusMappingPayload } from "../assets/js/modals/pair-config/status-mapping.js";
+import './i18n-vm-setup.mjs';
 
 const index = readFileSync(new URL("../assets/js/modals/pair-config/index.js", import.meta.url), "utf8");
 const librarySource = readFileSync(new URL("../assets/js/modals/pair-config/libraries.js", import.meta.url), "utf8");
@@ -150,6 +151,7 @@ for (const scenario of [
   {name: "CrossWatch source", src: "CROSSWATCH", dst: "TRAKT", expected: true},
   {name: "SIMKL target", src: "PLEX", dst: "SIMKL", expected: true},
   {name: "AniList target", src: "PLEX", dst: "ANILIST", expected: true},
+  {name: "WeTrakr target", src: "TRAKT", dst: "WETRAKR", expected: true},
   {name: "no anime provider", src: "PLEX", dst: "TRAKT", expected: false},
   {name: "global mapping disabled", src: "PLEX", dst: "CROSSWATCH", global: false, expected: false},
 ]) {

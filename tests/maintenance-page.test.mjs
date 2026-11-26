@@ -4,11 +4,12 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import {pageBackLink} from '../assets/js/page-return.js';
+import './i18n-vm-setup.mjs';
 
 const source=readFileSync(new URL('../assets/js/maintenance/index.js',import.meta.url),'utf8');
 const catalog=source.slice(source.indexOf('const SIMPLE_OPS'),source.indexOf('let activeRoot, syncRoute;'));
 
-test('Maintenance keeps its caller and category, including the old entry point',()=>{
+test('Maintenance keeps its caller and category, including the old entry point',async()=>{
   const modals=readFileSync(new URL('../assets/js/modals.js',import.meta.url),'utf8');
   const script=modals.slice(modals.indexOf('window.openMaintenance ='),modals.indexOf('window.openManualWatchedModal ='));
   const location=new URL('http://localhost/?main=1#settings/maintenance');
@@ -16,11 +17,11 @@ test('Maintenance keeps its caller and category, including the old entry point',
   const context={location,URLSearchParams,ModalRegistry:{close(){}},document:{getElementById:()=>({})},
     window:{showTab:tab=>navigations.push(tab)},history:{pushState(_state,_title,hash){location.hash=hash;}}};
   vm.runInNewContext(script,context);
-  context.window.openMaintenance({group:'events'});
+  await context.window.openMaintenance({group:'events'});
   const first=new URLSearchParams(location.hash.split('?')[1]);
   assert.equal(first.get('group'),'events');
   assert.equal(first.get('returnTo'),'/?main=1#settings/maintenance');
-  context.window.openMaintenanceModal({target:'sync'});
+  await context.window.openMaintenanceModal({target:'sync'});
   const next=new URLSearchParams(location.hash.split('?')[1]);
   assert.equal(next.get('returnTo'),first.get('returnTo'));
   assert.equal(next.get('group'),'sync');
@@ -29,24 +30,13 @@ test('Maintenance keeps its caller and category, including the old entry point',
   assert.equal(pageBackLink('https://example.com',location.href,'maintenance').href,'#main');
 });
 
-test('all existing tools have one category and bulk recommendations exclude resets',()=>{
+test('all tools remain available and sections follow the approved order',()=>{
   const ctx={};
-  vm.runInNewContext(catalog+';globalThis.ops=OPS;globalThis.groups=GROUPS;globalThis.recommended=recommendedKeys([]);',ctx);
+  vm.runInNewContext(catalog+';globalThis.ops=OPS;globalThis.groups=GROUPS;globalThis.quick=QUICK_TASKS;globalThis.sections=SECTIONS;',ctx);
   assert.equal(ctx.ops.length,18);
   for (const op of ctx.ops) assert.equal(ctx.groups.filter(group=>group.keys.includes(op.key)).length,1,op.key);
-  assert.deepEqual(Array.from(ctx.recommended),['cache','database-health','playing']);
-});
-
-test('successful individual usage promotes safe tools without promoting destructive or batch actions',()=>{
-  const ctx={};
-  vm.runInNewContext(catalog+';globalThis.rank=recommendedKeys;',ctx);
-  const runs=(key,status='success',batch=false)=>Array.from({length:5},()=>({key,status,batch}));
-  assert.deepEqual(Array.from(ctx.rank(runs('defaults'))),['cache','database-health','playing']);
-  assert.deepEqual(Array.from(ctx.rank(runs('events-health','error'))),['cache','database-health','playing']);
-  assert.deepEqual(Array.from(ctx.rank(runs('events-health','issues'))),['cache','database-health','playing']);
-  assert.deepEqual(Array.from(ctx.rank(runs('events-health','success',true))),['cache','database-health','playing']);
-  assert.deepEqual(Array.from(ctx.rank(runs('events-health'))),['events-health','cache','database-health']);
-  assert.deepEqual(Array.from(ctx.rank([...runs('events-health'),...runs('cache')])),['cache','events-health','database-health']);
+  assert.deepEqual(Array.from(ctx.quick),['meta','playing','database-health']);
+  assert.deepEqual(Array.from(ctx.sections,row=>row[1]),['Quick fixes','Sync issues','CW Tracker','Advanced']);
 });
 
 test('saved history is bounded and validated, and account keys stay separate',()=>{
@@ -58,8 +48,50 @@ test('saved history is bounded and validated, and account keys stay separate',()
   assert.equal(cleaned[0].at,105);
   assert.equal(cleaned[99].at,6);
   assert.equal(ctx.clean({}).length,0);
+  assert.equal(ctx.clean([{key:'cache',status:'success',at:1,jobId:'job-1'}])[0].jobId,'job-1');
+  assert.equal(ctx.clean([{key:'cache',status:'success',at:1,jobId:{}}])[0].jobId,undefined);
   assert.notEqual(ctx.key({user:{id:'a'}}),ctx.key({user:{id:'b'}}));
   assert.equal(ctx.key({user:{id:'a',username:'old'}}),ctx.key({user:{id:'a',username:'new'}}));
+});
+
+test('legacy job history gains an ID without merging distinct runs',()=>{
+  for (const delay of [0,850,5000]) {
+    const at=1795269602500;
+    const legacy={key:'database-health',status:'success',at:at+delay,batch:false};
+    const other=[
+      {...legacy,at:at-2000},
+      {...legacy,status:'issues'},
+      {...legacy,key:'playing'},
+      {...legacy,jobId:'another-job'},
+      {...legacy,batch:true},
+    ];
+    let saved=JSON.stringify([legacy,...other]);
+    const context={entries:[],results:new Map(),storageKey:'history',Date,
+      localStorage:{getItem:()=>saved,setItem:(_,value)=>{saved=value;}}};
+    vm.runInNewContext(catalog+source.slice(source.indexOf('    function saveResult('),source.indexOf('    function updateRows(')),context);
+    for(let visit=0;visit<2;visit++) {
+      context.saveResult('database-health','success',{jobId:'existing-job',at});
+      const entries=JSON.parse(saved);
+      assert.equal(entries.length,6);
+      assert.deepEqual(entries.find(entry=>entry.jobId==='existing-job'),{key:'database-health',status:'success',at,batch:false,jobId:'existing-job'});
+      for(const entry of other) assert.ok(entries.some(item=>JSON.stringify(item)===JSON.stringify(entry)));
+    }
+  }
+});
+
+test('legacy history is preserved when the job match is ambiguous or outside the completion window',()=>{
+  const at=1795269602500;
+  for(const times of [[at+200,at+800],[at-200],[at+5001]]) {
+    const original=times.map(time=>({key:'database-health',status:'success',at:time,batch:false}));
+    let saved=JSON.stringify(original);
+    const context={entries:[],results:new Map(),storageKey:'history',Date,
+      localStorage:{getItem:()=>saved,setItem:(_,value)=>{saved=value;}}};
+    vm.runInNewContext(catalog+source.slice(source.indexOf('    function saveResult('),source.indexOf('    function updateRows(')),context);
+    context.saveResult('database-health','success',{jobId:'new-job',at});
+    const entries=JSON.parse(saved);
+    assert.equal(entries.length,original.length+1);
+    assert.deepEqual(entries.filter(entry=>!entry.jobId).sort((a,b)=>a.at-b.at),original);
+  }
 });
 
 test('managed users cannot open Maintenance even with write permission',()=>{
@@ -72,33 +104,9 @@ test('managed users cannot open Maintenance even with write permission',()=>{
   assert.equal(context.canUseRouteTab('maintenance'),true);
 });
 
-test('recommended batch runs card actions despite filters, excludes unsafe actions and stops on an unhealthy result',async()=>{
-  let click;
-  const calls=[];
-  const rows=[['database-health',true],['events-health',false],['events-optimize',false],['defaults',false]]
-    .map(([key,hidden])=>({hidden,dataset:{op:key,kind:key},querySelector:()=>({})}));
-  const context={rows,operationBusy:false,batchRunning:false,recommended:['events-health','events-optimize','defaults'],
-    $:()=>({addEventListener:(_event,handler)=>{click=handler;}}),root:{},
-    setOperationBusy:value=>{context.operationBusy=value;},
-    runOp:async kind=>{calls.push(kind);return {ok:true,healthy:false};},
-    setStatus(){},completionReceipt(){},plural(){},
-  };
-  const start=source.indexOf('    $("#cxm-run-recommended", root).addEventListener');
-  vm.runInNewContext(catalog+source.slice(start,source.indexOf('    syncRoute();',start)),context);
-  await click();
-  assert.deepEqual(calls,['events-health']);
-  assert.equal(context.operationBusy,false);
-  assert.equal(context.batchRunning,false);
-  context.runOp=async kind=>{calls.push(kind);return {ok:true,healthy:true};};
-  calls.length=0;
-  await click();
-  assert.deepEqual(calls,['events-health','events-optimize']);
-  assert.equal(context.batchRunning,false);
-});
-
 function runner({confirmed=true,typed='RESET',response={ok:true},reject=false}={}) {
   const posts=[],feedback=[],messages=[];
-  const context={window:{},console,Date,URLSearchParams,operationBusy:false,selectedInsightKind:null,
+  const context={window:{confirm:()=>confirmed,prompt:()=>typed},console,Date,URLSearchParams,operationBusy:false,selectedInsightKind:null,
     confirm:()=>confirmed,prompt:()=>typed,root:{isConnected:true},
     post:async(url,body)=>{posts.push({url,body});if(reject)throw new Error('offline');return response;},
     setOperationBusy(value){context.operationBusy=value;},startActionFeedback(){},finishActionFeedback:(_button,status)=>feedback.push(status),
@@ -106,7 +114,7 @@ function runner({confirmed=true,typed='RESET',response={ok:true},reject=false}={
     eventsReceipt:()=>null,databaseReceipt:()=>null,stateFileReceipt:()=>null,statePruneReceipt:()=>null,
     completionReceipt:()=> 'Done',returnToCaller(){},setTimeout(){},followJob:async()=>response,
   };
-  vm.runInNewContext(catalog+source.slice(source.indexOf('    async function runOp('),source.indexOf('    OPS.forEach(')),context);
+  vm.runInNewContext(catalog+source.slice(source.indexOf('    async function runOp('),source.indexOf('    root.querySelector("#cxm-cw-export")')),context);
   return {context,posts,feedback,messages,run:kind=>context.runOp(kind,{dataset:{}})};
 }
 
@@ -152,82 +160,9 @@ test('unhealthy diagnostics show issues and failed requests release the operatio
   assert.match(failed.messages.at(-1),/offline/);
 });
 
-function categoryRunner(options={}) {
-  const fixture=runner(options);
-  const {context}=fixture;
-  vm.runInNewContext('globalThis.categoryOps=OPS;',context);
-  context.rows=Array.from(context.categoryOps,op=>({hidden:false,dataset:{op:op.key,kind:op.kind},querySelector:()=>({dataset:{}})}));
-  context.batchRunning=false;
-  context.plural=(count,noun)=>`${count} ${noun}s`;
-  context.setArchiveOpen=value=>{context.archiveOpen=value;};
-  const label={textContent:'Run all'};
-  const details={open:false};
-  const button={closest:()=>details,querySelector:()=>label,setAttribute(){},removeAttribute(){}};
-  return {...fixture,label,details,runGroup:id=>context.runCategory(id,button)};
-}
-
-test('category batches run visible tasks sequentially and block another batch',async()=>{
-  const fixture=categoryRunner();
-  let release;
-  fixture.context.post=async url=>{
-    fixture.posts.push({url});
-    if(fixture.posts.length===1) await new Promise(resolve=>{release=resolve;});
-    return {ok:true};
-  };
-  const pending=fixture.runGroup('sync');
-  assert.equal(fixture.posts.length,1);
-  assert.equal(fixture.context.operationBusy,true);
-  assert.equal(fixture.context.batchRunning,true);
-  assert.equal(fixture.label.textContent,'1/2');
-  assert.equal(fixture.details.open,true);
-  await fixture.runGroup('playback');
-  assert.equal(fixture.posts.length,1);
-  release();
-  await pending;
-  assert.deepEqual(fixture.posts.map(item=>item.url),['/api/maintenance/jobs','/api/maintenance/clear-cache']);
-  assert.equal(fixture.context.operationBusy,false);
-  assert.equal(fixture.context.batchRunning,false);
-  assert.equal(fixture.label.textContent,'Run all');
-  fixture.posts.length=0;
-  fixture.context.post=async url=>{fixture.posts.push({url});return {ok:true};};
-  fixture.context.rows.find(row=>row.dataset.op==='state').hidden=true;
-  await fixture.runGroup('sync');
-  assert.deepEqual(fixture.posts.map(item=>item.url),['/api/maintenance/clear-cache']);
-});
-
-test('category cancellation and unhealthy checks stop later tasks',async()=>{
-  const cancelled=categoryRunner({confirmed:false});
-  await cancelled.runGroup('sync');
-  assert.equal(cancelled.posts.length,0);
-  const unhealthy=categoryRunner({response:{ok:true,healthy:false}});
-  await unhealthy.runGroup('events');
-  assert.deepEqual(unhealthy.posts.map(item=>item.body.action),['events-health']);
-  assert.equal(unhealthy.context.operationBusy,false);
-  const failed=categoryRunner({reject:true});
-  await failed.runGroup('sync');
-  assert.equal(failed.posts.length,1);
-  assert.equal(failed.context.operationBusy,false);
-});
-
-test('category batches retain destructive task confirmation and archive configuration',async()=>{
-  const fixture=categoryRunner();
-  const prompts=[];
-  fixture.context.confirm=message=>{prompts.push(message);return prompts.length===1;};
-  await fixture.runGroup('events');
-  assert.match(prompts[0],/Clear event data/);
-  assert.match(prompts[1],/Clear all event data/);
-  assert.deepEqual(fixture.posts.map(item=>item.body.action),['events-health','events-optimize']);
-  assert.equal(fixture.context.operationBusy,false);
-  fixture.posts.length=0;
-  await fixture.runGroup('archive');
-  assert.equal(fixture.context.archiveOpen,true);
-  assert.equal(fixture.posts.length,0);
-});
-
-
 test('maintenance polling continues beyond the old request deadline',async()=>{
   let polls=0, elapsed=0;
-  const context={window:{setTimeout:fn=>{elapsed+=1000;fn();}},setStatus(){},
+  const context={window:{setTimeout:fn=>{elapsed+=1000;fn();}},setStatus(){},recordJobResult(){},
     fjson:async()=>({id:'job',action:'events-optimize',state:++polls>60?'completed':'running',result:{ok:true}})};
   vm.runInNewContext(source.slice(source.indexOf('    async function followJob('),source.indexOf('    async function runOp(')),context);
   const result=await context.followJob({id:'job',action:'events-optimize',state:'queued'});
@@ -237,15 +172,46 @@ test('maintenance polling continues beyond the old request deadline',async()=>{
 
 test('refresh reconnects to maintenance and restart reports interruption',async()=>{
   const messages=[],locks=[];
-  let state='running';
-  const context={window:{setTimeout:fn=>fn()},setStatus:message=>messages.push(message),
+  let state='running', outcome='completed';
+  const context={window:{setTimeout:fn=>fn()},setStatus:message=>messages.push(message),recordJobResult(){},
     setOperationBusy:value=>locks.push(value),eventsReceipt:()=>'Optimization completed',databaseReceipt:()=>null,
-    fjson:async()=>{const current=state;state='completed';return {id:'job',action:'events-optimize',state:current,result:{ok:current!=='interrupted',error:'server_restarted'}};}};
+    fjson:async()=>{const current=state;state=outcome;return {id:'job',action:'events-optimize',state:current,result:{ok:current!=='interrupted',error:'server_restarted'}};}};
   vm.runInNewContext(source.slice(source.indexOf('    async function followJob('),source.indexOf('    async function runOp(')),context);
   await context.resumeJob();
   assert.equal(messages.at(-1),'Optimization completed');
   assert.deepEqual(locks,[true,false]);
-  state='interrupted';
+  state='running';
+  outcome='interrupted';
   await context.resumeJob();
   assert.match(messages.at(-1),/server_restarted/);
+});
+
+test('opening maintenance does not replay completed jobs or announce a new result',async()=>{
+  for (const state of ['idle','completed']) {
+    const requests=[],messages=[],events=[],locks=[];
+    const context={window:{dispatchEvent:event=>events.push(event)},CustomEvent:class {},
+      setStatus:message=>messages.push(message),setOperationBusy:value=>locks.push(value),recordJobResult(){},
+      eventsReceipt:()=>null,databaseReceipt:()=>null,
+      fjson:async url=>{requests.push(url);return {id:'old-job',action:'state-file',state,started_at:1,result:{ok:state==='completed'}};}};
+    vm.runInNewContext(source.slice(source.indexOf('    async function followJob('),source.indexOf('    async function runOp(')),context);
+    await context.resumeJob();
+    assert.deepEqual(requests,['/api/maintenance/jobs/current']);
+    assert.deepEqual(messages,[],state);
+    assert.deepEqual(events,[],state);
+    assert.deepEqual(locks,[true,false]);
+  }
+});
+
+test('confirmation holds the operation lock against duplicate requests',async()=>{
+  const fixture=runner();
+  let release;
+  fixture.context.window.confirm=()=>new Promise(resolve=>{release=resolve;});
+  const pending=fixture.run('events-purge');
+  assert.equal(fixture.context.operationBusy,true);
+  await fixture.run('events-purge');
+  assert.equal(fixture.posts.length,0);
+  release(true);
+  await pending;
+  assert.equal(fixture.posts.length,1);
+  assert.equal(fixture.context.operationBusy,false);
 });

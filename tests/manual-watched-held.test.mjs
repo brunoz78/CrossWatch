@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import './i18n-vm-setup.mjs';
 
 const source = readFileSync(new URL("../assets/js/modals/manual-watched/index.js", import.meta.url), "utf8");
 const helper = source.slice(source.indexOf("const providerKey ="), source.indexOf("\n", source.indexOf("const providerKey =")));
@@ -79,15 +80,15 @@ test("a one-off add names the feature in the sync pair note", () => {
   assert.match(context.oneOffNote(["history"]), /sync pair for history\./);
 });
 
-async function mountQuickAdd(props, providers, remembered = []) {
+async function mountQuickAdd(props, providers, remembered = [], memory = null) {
   const root = { innerHTML: "", style: { setProperty() {}, removeProperty() {} }, closest: () => null, addEventListener(name, handler) { this[name] = handler; }, querySelector: () => null, querySelectorAll: () => [] };
   const page = {
     window: { CW: {}, addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout },
     document: { getElementById: () => ({}), documentElement: { dataset: {}, clientHeight: 800 }, addEventListener() {}, removeEventListener() {} },
-    localStorage: { getItem: () => JSON.stringify(remembered), setItem() {} },
+    localStorage: { getItem: (key) => key === "cw.manualWatched.actions" ? (memory ? JSON.stringify(memory) : null) : JSON.stringify(remembered), setItem() {} },
     URLSearchParams,
     AbortSignal,
-    fetch: async (url) => ({ ok: true, json: async () => (url.includes("/api/manual/providers") ? { providers } : {}) }),
+    fetch: async (url) => ({ ok: true, json: async () => (url.includes("/api/manual/providers") ? { providers } : url.includes("/api/manual/episodes") ? { seasons: [{ season: 1, name: "Season 1", episode_count: 6, episodes: [1, 2, 3, 4, 5, 6].map((episode) => ({ episode, name: `Part ${episode}`, air_date: `2002-06-0${episode}` })) }] } : {}) }),
   };
   vm.runInNewContext(source.replace("export default {", "globalThis.quickAdd = {"), page);
   await page.quickAdd.mount(root, props);
@@ -217,4 +218,101 @@ test("no stored data means no note", () => {
 
 test("several actions give one note each", () => {
   assert.equal(heldNotes(held, ["history", "rating"], [trakt]).length, 2);
+});
+
+const michael = { tmdb: "1", type: "movie", title: "Michael" };
+const watchedAndRated = { actions: { history: true, rating: true }, date_mode: "release" };
+
+test("Quick add opens on the actions saved last time without picking a score", async () => {
+  const root = await mountQuickAdd({ item: michael }, [both], ["MDBLIST:default"], watchedAndRated);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-action="history"/);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-action="rating"/);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-date-mode="release"/);
+  assert.doesNotMatch(root.innerHTML, /is-lit/);
+  assert.match(root.innerHTML, /data-role="send" disabled/);
+  const star = { getAttribute: () => "7", closest: selector => selector.includes("[data-rating]") ? star : null };
+  root.click({ target: star, preventDefault() {}, stopPropagation() {} });
+  assert.match(root.innerHTML, /data-rating="7" aria-pressed="true"/);
+  assert.doesNotMatch(root.innerHTML, /data-role="send" disabled/);
+});
+
+test("Quick add keeps saved actions when they include the requested one", async () => {
+  const root = await mountQuickAdd({ action: "rating", item: michael }, [both], ["MDBLIST:default"], watchedAndRated);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-action="history"/);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-action="rating"/);
+});
+
+test("Quick add opens on the requested action alone when saved actions leave it out", async () => {
+  const root = await mountQuickAdd({ action: "watchlist", item: michael }, [both], ["MDBLIST:default"], watchedAndRated);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-action="watchlist"/);
+  assert.doesNotMatch(root.innerHTML, /cw-mw-chip active" data-action="(history|rating)"/);
+});
+
+test("a locked Quick add ignores saved actions", async () => {
+  const root = await mountQuickAdd(locked("watchlist"), [both], [], watchedAndRated);
+  assert.ok(root.innerHTML.includes("Not in a sync pair for watchlist."));
+  assert.doesNotMatch(root.innerHTML, /cw-mw-stars/);
+});
+
+const tap = (root, attr, value) => {
+  const target = { getAttribute: () => value, closest: selector => selector.includes(`[${attr}]`) ? target : null };
+  root.click({ target, preventDefault() {}, stopPropagation() {} });
+};
+const typeDate = (root, role, value) => root.input({ target: { matches: selector => selector === `[data-role=${role}]`, value } });
+const footer = (root) => {
+  const status = { className: "", textContent: "" };
+  const send = { disabled: false, textContent: "" };
+  root.querySelector = selector => selector === ".cw-mw-status" ? status : selector === "[data-role=send]" ? send : null;
+  return { status, send };
+};
+const trekShow = { tmdb: "655", type: "show", title: "Star Trek" };
+
+test("Quick add offers a date range only while picking episodes", async () => {
+  const movie = await mountQuickAdd({ item: michael }, [both], ["MDBLIST:default"]);
+  assert.doesNotMatch(movie.innerHTML, /data-date-mode="range"/);
+  const root = await mountQuickAdd({ item: trekShow }, [both], ["MDBLIST:default"]);
+  assert.doesNotMatch(root.innerHTML, /data-date-mode="range"/);
+  tap(root, "data-scope", "episodes");
+  assert.match(root.innerHTML, /data-date-mode="range"/);
+  tap(root, "data-date-mode", "range");
+  assert.match(root.innerHTML, /data-role="range-end"/);
+  assert.match(root.innerHTML, /Episodes are spread evenly over these days\./);
+  tap(root, "data-scope", "show");
+  assert.doesNotMatch(root.innerHTML, /data-role="range-end"/);
+  assert.match(root.innerHTML, /cw-mw-chip active" data-date-mode="custom"/);
+});
+
+test("Quick add refuses a date range that ends before it starts", async () => {
+  const root = await mountQuickAdd({ item: trekShow }, [both], ["MDBLIST:default"]);
+  tap(root, "data-scope", "episodes");
+  tap(root, "data-date-mode", "range");
+  const html = root.innerHTML;
+  const { status, send } = footer(root);
+  typeDate(root, "custom-date", "2024-03-05");
+  typeDate(root, "range-end", "2024-03-01");
+  assert.equal(root.innerHTML, html);
+  assert.equal(status.textContent, "The end date is before the start date.");
+  assert.equal(send.disabled, true);
+  typeDate(root, "range-end", "2024-03-09");
+  assert.notEqual(status.textContent, "The end date is before the start date.");
+});
+
+test("Quick add shows the watch date each picked episode gets from a date range", async () => {
+  const root = await mountQuickAdd({ item: trekShow }, [both], ["MDBLIST:default"]);
+  tap(root, "data-scope", "episodes");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  tap(root, "data-date-mode", "range");
+  typeDate(root, "custom-date", "2024-03-01");
+  typeDate(root, "range-end", "2024-03-05");
+  for (const key of ["1:6", "1:1", "1:3"]) tap(root, "data-ep", key);
+  const shown = [...root.innerHTML.matchAll(/data-ep="(1:\d)"[\s\S]*?cw-mw-ep-date([^"]*)"[^>]*>([\s\S]*?)<\/span>\s*<\/button>/g)]
+    .map(([, key, planned, html]) => [key, planned.trim(), html.slice(html.lastIndexOf(">") + 1).trim()]);
+  assert.deepEqual(shown, [
+    ["1:1", "is-planned", "Watched 2024-03-01"],
+    ["1:2", "", "2002-06-02"],
+    ["1:3", "is-planned", "Watched 2024-03-03"],
+    ["1:4", "", "2002-06-04"],
+    ["1:5", "", "2002-06-05"],
+    ["1:6", "is-planned", "Watched 2024-03-05"],
+  ]);
 });

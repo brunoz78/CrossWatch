@@ -2,22 +2,82 @@
 /* CrossWatch - Shared media card action menus */
 /* Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch) */
 (function () {
+  const T = (key, vars) => (window.CW?.I18n || window.__cwI18n)?.t?.(key, vars) ?? key;
+  const TH = (key, vars) => (window.CW?.I18n || window.__cwI18n)?.html?.(key, vars) ?? key;
   const esc = value => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
 
   let activeCardMenu = null;
+  const touchLayout = matchMedia('(max-width:760px), (pointer:coarse) and (max-height:600px)');
+  let press = null, held = null, openingFromHold = false;
+  const cancelPress = () => { clearTimeout(press?.timer); press = null; };
+  const coverAction = target => {
+    if (!(target instanceof Element) || !target.closest('#page-tracker,.cw-profile-shell')) return null;
+    if (target.closest('input,select,textarea,label,.cw-card-actions,[data-provider-overflow]')) return null;
+    const cover = target.closest('.trk-grid-art,.trk-overview-art,.cw-hist-art,.cw-collection-poster,.cw-cw-open');
+    const card = cover?.closest('.trk-grid-card,.trk-overview-card,.cw-hist-card,.cw-collection-card,.cw-cw-card');
+    const button = card?.querySelector('button.cw-card-actions');
+    return button && !button.disabled && button.checkVisibility() ? {card,button,open:() => button.click()} : null;
+  };
+  document.addEventListener('pointerdown', event => {
+    cancelPress();
+    held = null;
+    if (!event.isPrimary || !['touch','pen'].includes(event.pointerType) || event.button !== 0) return;
+    const action = coverAction(event.target);
+    if (!action || !touchLayout.matches && !action.card.matches('#profile-progress .cw-cw-card')) return;
+    const gesture = {...action, id:event.pointerId, x:event.clientX, y:event.clientY};
+    press = gesture;
+    gesture.timer = setTimeout(() => {
+      cancelPress();
+      if (!gesture.card.isConnected || gesture.button.disabled || !gesture.button.checkVisibility() || document.hidden) return;
+      held = {...gesture, until:performance.now()+10000};
+      openingFromHold = true;
+      try { gesture.open(); } finally { openingFromHold = false; }
+      window.CW?.MobileUI?.feedback?.();
+    }, 400);
+  }, {capture:true,passive:true});
+  document.addEventListener('pointermove', event => {
+    if (press && event.pointerId === press.id && Math.hypot(event.clientX-press.x,event.clientY-press.y)>10) cancelPress();
+  }, {capture:true,passive:true});
+  document.addEventListener('pointerup', event => {
+    if (event.pointerId === press?.id) cancelPress();
+    if (event.pointerId === held?.id) {
+      held.until = performance.now()+800;
+      event.preventDefault();
+    }
+  }, {capture:true,passive:false});
+  document.addEventListener('pointercancel', event => {
+    if (event.pointerId === press?.id) cancelPress();
+    if (event.pointerId === held?.id) held.until = performance.now()+800;
+  }, {capture:true,passive:true});
+  document.addEventListener('click', event => {
+    if (!held || !event.detail || performance.now()>held.until) return;
+    if (event.pointerId === held.id || held.card.contains(event.target) || Math.hypot(event.clientX-held.x,event.clientY-held.y)<16) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      held = null;
+    }
+  }, true);
+  document.addEventListener('contextmenu', event => {
+    if (press || held && performance.now()<held.until) event.preventDefault();
+  }, true);
+  document.addEventListener('scroll', cancelPress, {capture:true,passive:true});
+  document.addEventListener('visibilitychange', cancelPress);
+  window.addEventListener('blur', cancelPress);
+  window.addEventListener('resize', cancelPress);
 
   function open(anchor, entries, options = {}) {
     activeCardMenu?.hidePopover();
     const menu = document.createElement("div");
     const mobile = matchMedia("(max-width:760px), (pointer:coarse) and (max-height:600px)").matches;
-    const card = anchor.closest(".trk-grid-card,.trk-overview-card,[data-playback-key],[data-timeline-key],[data-collection-key]");
-    const title = options.title || card?.querySelector("strong,h3,.cw-collection-name")?.textContent || "Actions";
+    const card = anchor.closest(".trk-grid-card,.trk-overview-card,.cw-cw-card,[data-playback-key],[data-timeline-key],[data-collection-key]");
+    const title = options.title || card?.querySelector("strong,h3,.cw-collection-name")?.textContent || T("common.cardActions.actions");
     menu.className = `cw-card-action-menu${mobile ? " is-sheet" : ""}`;
-    menu.setAttribute("popover", "auto");
+    const holdMenu = openingFromHold;
+    menu.setAttribute("popover", holdMenu ? "manual" : "auto");
     menu.setAttribute("role", mobile ? "dialog" : "menu");
     menu.tabIndex = -1;
     if (mobile) menu.setAttribute("aria-modal", "true");
-    menu.setAttribute("aria-label", anchor.getAttribute("aria-label") || "Actions");
+    menu.setAttribute("aria-label", anchor.getAttribute("aria-label") || T("common.cardActions.actions"));
     const heading = mobile ? `<header class="cw-card-action-heading"><span class="cw-card-action-grip" aria-hidden="true"></span><h2>${esc(title)}</h2>${options.subtitle ? `<p>${esc(options.subtitle)}</p>` : ""}</header>` : "";
     menu.innerHTML = heading + `<div role="${mobile ? "menu" : "presentation"}" class="cw-card-action-items">` + entries.map((entry, index) => `<button type="button" role="menuitem" data-card-command="${index}"${entry.attrs || ""}${entry.disabled ? " disabled" : ""}${entry.danger ? ' class="is-danger"' : ""}><span class="material-symbols-rounded" aria-hidden="true">${esc(entry.icon || "chevron_right")}</span><span>${esc(entry.label)}</span></button>`).join("") + "</div>";
     let pendingAction = null, closed = false, historyPending = false;
@@ -48,13 +108,22 @@
     }
     activeCardMenu = menu;
     anchor.setAttribute("aria-expanded", "true");
-    const dismiss = (event) => { if (!menu.contains(event.target)) menu.hidePopover(); };
+    const dismiss = (event) => {
+      if (event.target instanceof Node && menu.contains(event.target)) return;
+      if (holdMenu && event.type === 'pointerdown') {
+        event.preventDefault();
+        held = {id:event.pointerId,card:menu,x:event.clientX,y:event.clientY,until:performance.now()+10000};
+      }
+      menu.hidePopover();
+    };
     window.addEventListener("resize", dismiss);
+    if (holdMenu) document.addEventListener('pointerdown', dismiss);
     menu.addEventListener("beforetoggle", (event) => {
       if (event.newState !== "closed" || closed) return;
       closed = true;
       anchor.setAttribute("aria-expanded", "false");
       for (const node of inert) node.inert = false;
+      anchor.focus({preventScroll:true});
       if (mobile && !locked) document.documentElement.classList.remove("cw-card-sheet-open");
       if (mobile && history.state?.cwCardActions === marker) {
         historyPending = true;
@@ -67,6 +136,7 @@
     menu.addEventListener("toggle", () => {
       if (menu.matches(":popover-open")) return;
       window.removeEventListener("resize", dismiss);
+      document.removeEventListener('pointerdown', dismiss);
       anchor.setAttribute("aria-expanded", "false");
       if (activeCardMenu === menu) activeCardMenu = null;
       menu.remove();

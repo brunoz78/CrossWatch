@@ -6,7 +6,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
+import './i18n-vm-setup.mjs';
 globalThis.window={addEventListener(){}};
+const {englishI18n}=await import('./i18n-test-helper.mjs');
+globalThis.window ??= {};
+globalThis.window.__cwI18n ??= englishI18n();
 const {highlight,logsBackLink,savedLogList}=await import('../assets/js/logs.js');
 
 test('session list shows selection and diagnostic metadata',()=>{
@@ -54,7 +58,7 @@ test('direct links and invalid return destinations fall back to Main',()=>{
   }
 });
 
-test('opening Logs captures the caller before navigation and preserves it when reopened',()=>{
+test('opening Logs captures the caller before navigation and preserves it when reopened',async()=>{
   const source=readFileSync(new URL('../assets/js/modals.js',import.meta.url),'utf8');
   const start=source.indexOf('window.openLogs =');
   const script=source.slice(start,source.indexOf('window.openEvents =',start));
@@ -65,15 +69,15 @@ test('opening Logs captures the caller before navigation and preserves it when r
   const context={location,URLSearchParams,ModalRegistry:{close(){}},document:{getElementById(){return {}; }},
     window:{showTab(tab){assert.equal(tab,'logs');}},history:{pushState(_state,_title,hash){location.hash=hash;}}};
   vm.runInNewContext(script,context);
-  context.window.openLogs({pairId:'pair 5',latest:true});
+  await context.window.openLogs({pairId:'pair 5',latest:true});
   let route=new URLSearchParams(location.hash.split('?')[1]);
   assert.equal(route.get('returnTo'),'/?main=1#settings/sync');
   assert.equal(route.get('pairId'),'pair 5');
-  context.window.openLogs({channel:'debug'});
+  await context.window.openLogs({channel:'debug'});
   route=new URLSearchParams(location.hash.split('?')[1]);
   assert.equal(route.get('returnTo'),'/?main=1#settings/sync');
   location.href='http://localhost/profile';
   context.document.getElementById=()=>null;
-  context.window.openLogs();
+  await context.window.openLogs();
   assert.equal(new URLSearchParams(location.hash.split('?')[1]).get('returnTo'),'/profile');
 });
