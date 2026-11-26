@@ -486,5 +486,19 @@
  "Trakt Developer",
  "&outcome=failed",
  "&pair={0}",
- "/art/lookup/{0}?{1}"
+ "/art/lookup/{0}?{1}",
+ "${cls}",
+ "${src}",
+ "${String(T(",
+ "${TH(",
+ "&force_refresh=true",
+ "&retry_view=1",
+ "']/g, (ch) => ESCAPES[ch]);",
+ ", { name: k })).replace(/",
+ "; Secure",
+ "IMG",
+ "label, div, section",
+ "ZIP, JSON, CSV {0} TXT ·",
+ "{0}={1}; Path=/; Max-Age=31536000; SameSite=Lax{2}",
+ "{0}?profile={1}&view_profile={2}"
 ]
