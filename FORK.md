@@ -7,12 +7,18 @@ Lizenz wie das Original: AGPL-3.0. Geändert ab Oktober 2026.
 ## Was anders ist
 
 **Deutsche Oberfläche, umschaltbar**
-- Die Sprache stellst du im Profil unter *Einstellungen → Anzeige → Sprache* um (Englisch oder
-  Deutsch). Sie gilt pro Browser. Ohne Auswahl richtet sie sich nach `CW_UI_LANG`, sonst nach
-  der Browsersprache.
-- Technik: `assets/i18n/i18n.js` ersetzt die englischen Texte beim Anzeigen anhand von
-  `assets/i18n/de.js`. Die Originaldateien bleiben unverändert. Neue Texte aus dem Original
-  findet `tools/i18n/extract.py`, `tools/i18n/translate.py` übersetzt sie über die Claude-API.
+- Seit v0.15.0 hat CrossWatch selbst ein Sprachsystem (`assets/locales/<code>/`). Der Fork
+  ergänzt dort **Deutsch** (`assets/locales/de/`, Eintrag in `languages.json`). Umschalten in
+  den Einstellungen unter *Sprache*; die Wahl gilt fürs Konto und den Browser. Ohne Auswahl
+  richtet sie sich nach `CW_UI_LANG`, sonst nach der Browsersprache.
+- Neue Texte des Originals: `tools/i18n/locale_sync.py` ergänzt fehlende Schlüssel in
+  `assets/locales/de` (aus `assets/i18n/de.js`, wo der englische Text bekannt ist) und listet den
+  Rest; übersetzte Texte mit `--apply datei.json` eintragen.
+- Die ältere Laufzeit-Übersetzung (`assets/i18n/i18n.js` mit `assets/i18n/de.js`) bleibt als
+  Rückfall für Texte, die das Original noch nicht über Schlüssel führt. `tools/i18n/extract.py`
+  findet dort neue Texte, `tools/i18n/translate.py` übersetzt sie über die Claude-API.
+- Kleine Eingriffe ins Original dafür: `cw_platform/i18n.py` (ohne eigene Kontoeinstellung gilt
+  das Sprach-Cookie statt Englisch) und `tests/test_i18n_catalogs.py` (Deutsch mitprüfen).
 
 **Sicherheit** (zum Teil aus [jabrown93/CrossWatch](https://github.com/jabrown93/CrossWatch) übernommen)
 - Einmal-Link für die Ersteinrichtung (`setup_guard.py`): Das erste Admin-Konto kann nur
@@ -48,7 +54,7 @@ Repo. Nur nötig, wenn das Original seine eigenen Workflow-Dateien ändert.
 | Datei | Zweck |
 |---|---|
 | `fork_addons.py` | einziger Einhängepunkt in `crosswatch.py` |
-| `i18n_frontend.py`, `assets/i18n/` | Übersetzung |
+| `i18n_frontend.py`, `assets/i18n/`, `assets/locales/de/` | Übersetzung |
 | `tools/i18n/` | Texte finden und übersetzen |
 | `setup_guard.py` | Einmal-Link für die Ersteinrichtung |
 | `cw_platform/url_validation.py` | SSRF-Schutz |

@@ -104,7 +104,28 @@ jobs:
             fi
           fi
           python tools/i18n/extract.py
-          git add assets/i18n tools/i18n
+          # Built-in translation: new keys of assets/locales/en get German texts from
+          # the runtime dictionary; the rest stays English and is reported.
+          python tools/i18n/locale_sync.py > locale-open.txt
+          OPEN_KEYS=$(grep -c . locale-open.txt || true)
+          echo "Open keys in assets/locales/de: $OPEN_KEYS"
+          if [ "$OPEN_KEYS" != "0" ]; then
+            {
+              echo "In \`assets/locales/de\` sind nach dem Abgleich mit ${{ steps.merge.outputs.tag }} $OPEN_KEYS Texte noch englisch. Erledigen: in einer Claude-Sitzung «CrossWatch übersetzen» sagen."
+              echo
+              echo '```'
+              head -c 60000 locale-open.txt
+              echo '```'
+            } > locale-issue.md
+            OPEN=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "Übersetzung in:title" --json number -q '.[0].number')
+            if [ -n "$OPEN" ]; then
+              gh issue comment "$OPEN" --repo "$GITHUB_REPOSITORY" --body-file locale-issue.md || true
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "Übersetzung: $OPEN_KEYS Texte in assets/locales/de" \
+                --assignee "${{ github.repository_owner }}" --body-file locale-issue.md || true
+            fi
+          fi
+          git add assets/i18n assets/locales tools/i18n
           git diff --cached --quiet || git commit -q -m "Übersetzung: neue Texte ergänzt"
 
       - name: Smoke test
